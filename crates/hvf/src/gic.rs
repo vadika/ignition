@@ -44,9 +44,19 @@ impl HvfGicV3 {
         }
         let redist_size = redist_each as u64 * vcpu_count;
 
-        let dist_base = mmio_mem_start - dist_size - redist_size;
-        let redist_base = mmio_mem_start - redist_size;
+        // Place dist+redist just below the MMIO window; guard against a
+        // mmio_mem_start too small to hold them rather than underflow-panicking.
+        let redist_base = mmio_mem_start
+            .checked_sub(redist_size)
+            .ok_or(Error::GicCreate)?;
+        let dist_base = redist_base
+            .checked_sub(dist_size)
+            .ok_or(Error::GicCreate)?;
 
+        // Retained OS object; Apple says os_release when done. We intentionally
+        // leak it (process-lifetime, single GIC) — matches hv_vm_config_create
+        // in lib.rs. TODO: a Drop wrapper calling os_release if GICs become
+        // dynamic.
         let config = unsafe { hv_gic_config_create() };
         let ret = unsafe { hv_gic_config_set_distributor_base(config, dist_base) };
         if ret != HV_SUCCESS {
