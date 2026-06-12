@@ -1,0 +1,20 @@
+[package]
+name = "ignition-vmnet"
+version = "0.0.0"
+edition = "2024"
+description = "vmnet.framework shared-mode backend via a C shim"
+license = "Apache-2.0"
+
+[lib]
+name = "ignition_vmnet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vmnet-smoke"
+path = "src/bin/vmnet-smoke.rs"
+
+[dependencies]
+devices = { package = "ignition-devices", path = "../devices" }
+
+[build-dependencies]
+cc = "1"

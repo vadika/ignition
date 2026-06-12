@@ -5,6 +5,7 @@ members = [
     "crates/hvf",
     "crates/devices",
     "crates/vmm",
+    "crates/vmnet",
     "spike",
 ]
 # Reference clones (libkrun, firecracker) live here but are not part of the build.
