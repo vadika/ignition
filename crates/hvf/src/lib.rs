@@ -377,8 +377,10 @@ impl HvfVcpu<'_> {
             return Err(Error::VcpuCreate);
         }
 
-        // We write vcpuid to Aff1 as otherwise it won't match the redistributor ID
-        // when using HVF in-kernel GICv3.
+        // Set MPIDR_EL1 to the caller's linear MPIDR (Aff0 = cpu index, via
+        // VcpuManager::mpidr_for). HVF's in-kernel GICv3 matches this affinity to
+        // the per-cpu redistributor; verified across --smp 2/4 with no CPU_ON
+        // mismatch. (libkrun shifted the id into Aff1; Aff0 works here.)
         let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, hv_sys_reg_t_HV_SYS_REG_MPIDR_EL1, mpidr) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuCreate);
