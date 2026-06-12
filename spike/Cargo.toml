@@ -8,8 +8,14 @@ description = "Smoke test: boot a minimal guest on the ignition hvf crate (macOS
 name = "hvf-spike"
 path = "src/main.rs"
 
+[[bin]]
+name = "uart-echo"
+path = "src/bin/uart-echo.rs"
+
 [dependencies]
 hvf = { package = "ignition-hvf", path = "../crates/hvf" }
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
+vmm = { package = "ignition-vmm", path = "../crates/vmm" }
+devices = { package = "ignition-devices", path = "../crates/devices" }
