@@ -15,12 +15,12 @@ virtio-mmio transport only handled 32-bit accesses and dropped the rest (log:
 [u8])` fills the requested bytes from the device's config image (commit `d99dce4`).
 Blk was unaffected because its capacity is read 4-byte-aligned.
 
-## Remaining (guest-side, not VMM)
+## Guest-side auto-config — DONE
 
-The rootfs should bring up `eth0` + run a DHCP client automatically on boot (so the
-manual `ip`/`udhcpc` isn't needed) — kimage's responsibility, like the SMP kernel
-config and the getty. On alpine this is e.g. `/etc/network/interfaces`:
-`auto eth0` / `iface eth0 inet dhcp`, plus the networking OpenRC service enabled.
+The rootfs now brings up `eth0` + DHCPs automatically on boot (alpine
+`/etc/network/interfaces` `auto eth0` / `iface eth0 inet dhcp` + the networking
+service), so `sudo boot --net …` reaches the internet with no manual `ip`/`udhcpc`
+steps. Verified working (kimage side, 2026-06-12).
 
 ## What landed
 
