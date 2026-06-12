@@ -38,6 +38,14 @@ all matter once a real aarch64 Linux kernel boots.
 - **`hv_gic_config_t` is leaked** (retained OS object, never `os_release`d) —
   matches `hv_vm_config_t`. Fine at process scope; add a Drop wrapper if GICs
   ever become dynamic.
+- **`set_spi` reuses `Error::GicCreate`** on failure (single-variant choice).
+  When `set_spi` moves onto the hot IRQ-injection path in 2d, split out
+  `Error::GicSetSpi` — the "creating GIC" Display string misleads for a runtime
+  injection failure.
+- **`HvfGicV3::new(vcpu_count, gic_top)`**: `gic_top` = the address the GIC sits
+  just below (in the smoke, guest RAM base `0x4000_0000`). When the 2c layout
+  module lands, pass the real value (likely RAM base) — not the serial MMIO
+  address.
 
 ## FDT interface (milestone 2a) — evolve as consumers land
 

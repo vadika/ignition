@@ -27,9 +27,10 @@ impl HvfGicV3 {
     /// Create the in-kernel GICv3.
     ///
     /// MUST be called after `hv_vm_create` and BEFORE any vCPU is created.
-    /// Places the distributor and redistributors immediately below
-    /// `mmio_mem_start`, distributor lowest.
-    pub fn new(vcpu_count: u64, mmio_mem_start: u64) -> Result<Self, Error> {
+    /// Places the distributor and redistributors immediately below `gic_top`
+    /// (the address just above the GIC region — in practice the guest RAM base),
+    /// distributor lowest.
+    pub fn new(vcpu_count: u64, gic_top: u64) -> Result<Self, Error> {
         let mut dist_size: usize = 0;
         let ret = unsafe { hv_gic_get_distributor_size(&mut dist_size) };
         if ret != HV_SUCCESS {
@@ -44,9 +45,9 @@ impl HvfGicV3 {
         }
         let redist_size = redist_each as u64 * vcpu_count;
 
-        // Place dist+redist just below the MMIO window; guard against a
-        // mmio_mem_start too small to hold them rather than underflow-panicking.
-        let redist_base = mmio_mem_start
+        // Place dist+redist just below `gic_top`; guard against a `gic_top` too
+        // small to hold them rather than underflow-panicking.
+        let redist_base = gic_top
             .checked_sub(redist_size)
             .ok_or(Error::GicCreate)?;
         let dist_base = redist_base
