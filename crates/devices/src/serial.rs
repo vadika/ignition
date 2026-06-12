@@ -57,6 +57,15 @@ impl<W: Write + Send> Serial<W> {
     pub fn with_irq(out: W, irq: Arc<dyn IrqLine>) -> Self {
         Self { inner: vm_superio::Serial::new(SerialIrq::Gic(irq), out) }
     }
+
+    /// Feed host input into the RX FIFO. Sets the LSR data-ready bit and raises
+    /// the RX interrupt (via the wired Trigger) if the guest enabled it. Returns
+    /// the number of bytes accepted.
+    pub fn enqueue(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner
+            .enqueue_raw_bytes(bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serial enqueue: {e:?}")))
+    }
 }
 
 impl<W: Write + Send> BusDevice for Serial<W> {
@@ -111,5 +120,25 @@ mod tests {
     #[test]
     fn noop_trigger_never_errors() {
         assert!(SerialIrq::Noop.trigger().is_ok());
+    }
+
+    #[test]
+    fn enqueue_sets_data_ready_and_reads_back() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut serial = Serial::new(SharedSink(buf));
+        let n = serial.enqueue(b"hi").unwrap();
+        assert_eq!(n, 2);
+
+        // LSR is register offset 5; data-ready is bit 0x01.
+        let mut lsr = [0u8; 1];
+        serial.read(0, 5, &mut lsr);
+        assert_ne!(lsr[0] & 0x01, 0, "data-ready bit should be set after enqueue");
+
+        // RBR is register offset 0; bytes come out in order.
+        let mut b = [0u8; 1];
+        serial.read(0, 0, &mut b);
+        assert_eq!(b[0], b'h');
+        serial.read(0, 0, &mut b);
+        assert_eq!(b[0], b'i');
     }
 }
