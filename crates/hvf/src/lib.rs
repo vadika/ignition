@@ -398,7 +398,11 @@ impl HvfVcpu<'_> {
         })
     }
 
-    pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
+    /// Full initial register/system-register setup shared by the primary
+    /// (`set_initial_state`, X0 = FDT address) and secondaries
+    /// (`set_secondary_state`, X0 = PSCI context id). Sets EL2/GICv3/SME/CPSR,
+    /// `PC = entry_addr`, and `X0 = x0`.
+    fn setup_registers(&self, entry_addr: u64, x0: u64) -> Result<(), Error> {
         if self.nested_enabled {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
@@ -485,12 +489,24 @@ impl HvfVcpu<'_> {
             return Err(Error::VcpuInitialRegisters);
         }
 
-        let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_X0, fdt_addr) };
+        let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_X0, x0) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuInitialRegisters);
         }
 
         Ok(())
+    }
+
+    /// Primary vCPU initial state: `PC = entry_addr`, `X0 = fdt_addr`.
+    pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
+        self.setup_registers(entry_addr, fdt_addr)
+    }
+
+    /// Secondary vCPU initial state on PSCI CPU_ON: `PC = entry_addr`,
+    /// `X0 = context_id` (the value the guest passed in X3, returned in X0 to
+    /// `__secondary_switched`).
+    pub fn set_secondary_state(&self, entry_addr: u64, context_id: u64) -> Result<(), Error> {
+        self.setup_registers(entry_addr, context_id)
     }
 
     pub fn id(&self) -> u64 {
