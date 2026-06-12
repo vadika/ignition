@@ -106,8 +106,10 @@ impl<B: NetBackend> VirtioDevice for VirtioNet<B> {
             self.dropped_rx += 1;
             return false;
         };
-        // Write [zeroed 12-byte hdr | frame] across the chain's writable buffers.
+        // Write [virtio_net_hdr | frame] across the chain's writable buffers.
+        // num_buffers (offset 10-11, LE) must be 1 for a VERSION_1 single-buffer RX.
         let mut payload = vec![0u8; NET_HDR_LEN];
+        payload[10] = 1; // virtio_net_hdr.num_buffers = 1 (single-buffer RX, LE)
         payload.extend_from_slice(frame);
         let mut written = 0usize;
         let mut off = 0usize;
@@ -216,10 +218,12 @@ mod tests {
         let mut vq = Virtqueue::new(8, desc, avail, used);
         let frame = [0x11, 0x22, 0x33];
         assert!(net.inject_rx(&mut vq, &m, &frame));
-        // Buffer holds [12 zero bytes | frame].
+        // Header is zeroed except num_buffers = 1 (offset 10).
         let mut out = [0u8; 15];
         m.read_slice(buf, &mut out);
-        assert_eq!(&out[..12], &[0u8; 12]);
+        assert_eq!(&out[..10], &[0u8; 10]);
+        assert_eq!(out[10], 1);
+        assert_eq!(out[11], 0);
         assert_eq!(&out[12..15], &frame);
         // used.len = hdr + frame = 15.
         assert_eq!(m.read_u32(used + 8), Some(15));

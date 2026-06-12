@@ -71,15 +71,16 @@ Generic over `NetBackend`; implements `VirtioDevice`. Two queues: **RX = 0**,
 **TX = 1**. Minimal features: `VIRTIO_NET_F_MAC` only (no checksum/GSO/mergeable-rx
 offload — vmnet handles raw ethernet, so each packet is one buffer).
 
-- Every packet carries a 12-byte `virtio_net_hdr` (with `num_buffers`); with offload
-  off it is zeroed.
+- Every packet carries a 12-byte `virtio_net_hdr`; with offload off, bytes 0–9 are
+  zeroed and `num_buffers` (bytes 10–11, LE) is set to 1 (single-buffer RX per
+  VERSION_1 spec).
 - **TX** (`handle_notify(1)`, vcpu thread): drain each TX chain — read the
   descriptors, skip the 12-byte header, `backend.write_frame(frame)`, push to the
   used ring. Returns `true` to pulse the IRQ.
 - **RX** (`inject_rx(frame)`, RX thread): pop a free RX (queue 0) descriptor chain;
-  write `[zeroed virtio_net_hdr | frame]` into the guest buffers; push to the used
-  ring; signal that the IRQ must be raised. If the RX queue has no free buffers,
-  drop the frame and bump a counter.
+  write `[virtio_net_hdr (zeroed except num_buffers=1) | frame]` into the guest
+  buffers; push to the used ring; signal that the IRQ must be raised. If the RX queue
+  has no free buffers, drop the frame and bump a counter.
 - `config_read` returns the 6-byte MAC (from `backend.mac()`).
 
 ### `crates/devices/src/virtio/mmio.rs` (refactor) — `VirtioDevice` trait
@@ -143,8 +144,8 @@ the device).
   - TX: enqueue a `[hdr | frame]` chain, `handle_notify(1)` → assert `FakeBackend`
     received the frame with the 12-byte header stripped; used ring advanced.
   - RX: `inject_rx(frame)` against a programmed RX queue → assert the guest buffer
-    holds `[zeroed virtio_net_hdr | frame]`, the used ring advanced, and the IRQ was
-    signalled. RX-queue-empty → frame dropped, counter bumped.
+    holds `[virtio_net_hdr (zeroed except num_buffers=1) | frame]`, the used ring
+    advanced, and the IRQ was signalled. RX-queue-empty → frame dropped, counter bumped.
   - `features() == 1 << VIRTIO_NET_F_MAC`; `config_read` returns `backend.mac()`.
 - **Unit (transport):** existing blk-via-mmio tests pass after the `VirtioDevice`
   generalization; add a net-via-mmio `QueueNotify` test with `FakeBackend`.
@@ -159,7 +160,7 @@ like the SMP kernel config and the getty).
 ## Out of scope
 
 - **Offloads** (checksum, TSO/GSO, mergeable RX buffers) — `VIRTIO_NET_F_MAC` only;
-  one buffer per packet, zeroed header.
+  one buffer per packet, header zeroed except `num_buffers=1`.
 - **Multiple NICs / bridged or host-only vmnet modes** — single shared-mode NIC.
 - **Inbound port forwarding** and throughput tuning — outbound NAT reachability is
   the bar.
