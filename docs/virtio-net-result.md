@@ -1,9 +1,26 @@
-# virtio-net milestone — implementation complete; live run pending
+# virtio-net milestone — DONE (verified live)
 
-Date: 2026-06-12. Status: **code complete, reviewed, builds + unit-tests green.**
-The final `sudo` networking integration (DHCP + ping + DNS) must be run by hand
-(passwordless sudo is unavailable to the automation, and the rootfs DHCP client is
-kimage-side).
+Date: 2026-06-12. Status: **working end-to-end.** `sudo boot --net` brings up the
+guest NIC; after `ip link set eth0 up && udhcpc -i eth0` the guest gets a lease and
+`ping` reaches out through vmnet NAT. The full virtio-net data path (TX → vmnet →
+RX → IRQ on SPI 34 → guest) is proven on real hardware.
+
+## The bug the live run caught (fixed)
+
+The guest saw `eth0` but with MAC `00:00:00:00:00:00`: Linux reads the 6-byte
+virtio-net MAC from config space **byte-by-byte (1-byte reads)**, but the
+virtio-mmio transport only handled 32-bit accesses and dropped the rest (log:
+`non-32-bit read at 0x100 len 1` ×6). Fixed by making config space (offset >= 0x100)
+**byte-addressable for any access width** — `VirtioDevice::config_read(offset, &mut
+[u8])` fills the requested bytes from the device's config image (commit `d99dce4`).
+Blk was unaffected because its capacity is read 4-byte-aligned.
+
+## Remaining (guest-side, not VMM)
+
+The rootfs should bring up `eth0` + run a DHCP client automatically on boot (so the
+manual `ip`/`udhcpc` isn't needed) — kimage's responsibility, like the SMP kernel
+config and the getty. On alpine this is e.g. `/etc/network/interfaces`:
+`auto eth0` / `iface eth0 inet dhcp`, plus the networking OpenRC service enabled.
 
 ## What landed
 
