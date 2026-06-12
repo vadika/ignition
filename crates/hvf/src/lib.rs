@@ -109,6 +109,12 @@ pub struct VcpuState {
     /// CPU-interface state (interrupt enable/mask). Restored after the GIC + vCPU
     /// exist.
     pub icc: Vec<(u32, u64)>,
+    /// The host physical counter (`mach_absolute_time`) at snapshot time. On
+    /// restore the vtimer offset is adjusted by the elapsed host counter so the
+    /// guest's virtual time (CNTVCT) continues from here instead of jumping to the
+    /// host's much-larger uptime — which would otherwise bury the guest in expired
+    /// timer interrupts and spin it forever.
+    pub host_counter: u64,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -628,6 +634,11 @@ impl HvfVcpu<'_> {
         self.vcpuid
     }
 
+    /// The current program counter (debug/sampling aid).
+    pub fn read_pc(&self) -> Result<u64, Error> {
+        self.read_reg(hv_reg_t_HV_REG_PC)
+    }
+
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
@@ -713,7 +724,10 @@ impl HvfVcpu<'_> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset, simd, fpcr, fpsr, icc })
+        let host_counter = unsafe { mach_absolute_time() };
+        Ok(VcpuState {
+            gp, sysregs, vtimer_mask, vtimer_offset, simd, fpcr, fpsr, icc, host_counter,
+        })
     }
 
     /// Restore all snapshot state onto a freshly-created vCPU. MUST run on the
@@ -725,7 +739,13 @@ impl HvfVcpu<'_> {
         for &(r, v) in &s.sysregs {
             self.write_sys_reg(r as u16, v)?;
         }
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, s.vtimer_offset) };
+        // Keep the guest's virtual counter continuous across the snapshot gap: add
+        // the host-counter elapsed since snapshot to the saved offset. Without this
+        // CNTVCT jumps to the host's uptime and the guest spins on a flood of
+        // already-expired vtimer interrupts.
+        let elapsed = unsafe { mach_absolute_time() }.wrapping_sub(s.host_counter);
+        let vtimer_offset = s.vtimer_offset.wrapping_add(elapsed);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, vtimer_offset) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
         }
@@ -1042,6 +1062,7 @@ mod snapshot_tests {
             fpcr: 0x00_00_00_00,
             fpsr: 0x0000_0000,
             icc: vec![(1, 0x11), (2, 0x22)],
+            host_counter: 0,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: VcpuState = serde_json::from_str(&json).unwrap();

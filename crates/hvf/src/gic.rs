@@ -172,7 +172,7 @@ impl HvfGicV3 {
             return Err(Error::GicCreate);
         }
 
-        // Now restore the captured distributor/redistributor/ICC state into it.
+        // Now restore the captured distributor/redistributor state into it.
         let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
         if ret != HV_SUCCESS {
             return Err(Error::GicRestore);

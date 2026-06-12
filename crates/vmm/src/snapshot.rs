@@ -128,6 +128,7 @@ mod tests {
                 fpcr: 0,
                 fpsr: 0,
                 icc: vec![(1, 2)],
+                host_counter: 0,
             },
             DeviceState {
                 blk: VirtioMmioState {

@@ -42,33 +42,55 @@ Each was confirmed by the guest's failure mode changing:
    distributor/redistributor `hv_gic_state` blob. Added `hv_gic_get/set_icc_reg`
    capture/restore. (Did not change the livelock — see below.)
 
-## The open problem
+## The open problem — narrowed by systematic debugging
 
-After (1)+(2) the guest no longer crashes; after (3) it still **livelocks**: 100%
-CPU, the vCPU spins inside guest code and never exits to the host (an exit trace
-showed zero MMIO/WFI/timer exits). Independent of the snapshot↔restore time gap
-(reproduces back-to-back), so it is not vtimer drift / expired-timer backlog. The
-captured PC is in kernel text with CPSR `…c5` (EL1h, IRQs masked at the snapshot
-instant).
+After (1)+(2) the guest no longer crashes; after (3) it still **livelocks** at 100%
+CPU. Also added (4) a **vtimer-offset continuity fix** (capture `mach_absolute_time`
+at snapshot; on restore set `vtimer_offset += elapsed_host_counter` so the guest's
+`CNTVCT` continues instead of jumping to host uptime) — correct and necessary, but
+did NOT resolve the spin.
 
-### Candidate next steps (for whoever picks this up)
+### What the systematic debugging established (tools: a gated PC sampler —
+`IGNITION_SAMPLE` — that kicks the vCPU to read its PC, plus decoding instructions
+straight out of `memory.bin`)
 
-- **ICH list registers / in-flight interrupt state.** `hv_gic_get/set_ich_reg`
-  (LR0–15, HCR_EL2, VMCR) hold virtual interrupts mid-injection. If the snapshot
-  caught the vCPU with an interrupt in a list register, not restoring it could leave
-  the guest waiting on an interrupt that never re-fires. **Most likely next thing to
-  try.**
-- **Snapshot capture point.** The snapshot is taken by `hv_vcpus_exit` at an
-  arbitrary instruction boundary (`Canceled`). HVF may need a cleaner quiesce, or
-  the captured CPSR-IRQs-masked instant may be mid-critical-section. Try snapshotting
-  while the guest runs a deterministic loop (`while :; do :; done`) and see if it
-  resumes (rules out idle/WFI-specific issues).
-- **A remaining vCPU register.** The sysreg set is generous but not exhaustive;
-  diff against what HVF resets a fresh vCPU to. Consider OSLAR/OSDLR, the debug
-  regs, or a trap-control reg.
-- **Verify TX path on restore** by snapshotting a guest that is actively printing,
-  to rule out "running fine but serial output not wired" (less likely — 100% CPU
-  indicates busy, not idle).
+- **The spin is the kernel idle loop.** The PC sits at `0xffff800008b1182c` (~38/40
+  samples). The instructions there (read from `memory.bin` at the matching offset)
+  are `paciasp ; dsb sy ; wfi ; autiasp ; ret` — i.e. `arch_cpu_idle`. **WFI is
+  returning immediately and the idle loop spins.**
+- **Normal idle parks; restore idle spins.** A normally-booted guest left idle at
+  the login prompt sits at **0.0% CPU** (WFI traps → host parks). The restored guest
+  at the same idle loop is **100% CPU** (WFI does not trap). This is the core
+  anomaly.
+- **It is NOT the vtimer.** Force-masking the vtimer (`hv_vcpu_set_vtimer_mask(true)`)
+  AND the offset-continuity fix both leave it spinning.
+- **It is NOT interrupt delivery at the CPU interface.** Forcing `ICC_IGRPEN0/1 = 0`
+  on restore does not stop the spin (IGRPEN gates *delivery as an exception*, not the
+  WFI *wake*, which is at the redistributor/distributor pending level).
+- **It is NOT the restored GIC blob.** Restoring with a *fresh* GIC
+  (`hv_gic_create` only, skipping `hv_gic_set_state`) still spins. So no
+  restored-pending-interrupt is the cause.
+- **Independent of the snapshot↔restore time gap** (reproduces back-to-back).
+
+### Conclusion + next step
+
+Same fresh GIC, the difference between "parks" (normal boot) and "spins" (restore)
+must be in the **restored vCPU register state** — one forced register differs from
+what a naturally-running guest holds and changes WFI/wakeup behavior (HVF only traps
+WFI when nothing is pending; on restore HVF behaves as if something is always
+pending). Captured CPSR is `…c5` = EL1h with IRQs masked.
+
+**Recommended next step — binary-search the restored registers.** Restore only
+half of `SAVED_SYSREGS` (or skip groups: timer regs, debug `MDSCR_EL1`, the PAC
+keys, etc.), and see which subset makes WFI park again. Strong individual suspects:
+`MDSCR_EL1` (debug/halting — bit interactions can change WFI), the `CNTKCTL_EL1` /
+timer-control set, and any reg whose restored value differs from a fresh vCPU's
+reset value in a WFI-relevant way. Also worth trying: **do NOT restore the
+`CNTV_*`/`CNTP_*` timer comparators** (let the kernel re-arm) — a comparator left
+"already expired" can keep the PPI perpetually pending at the redistributor even
+with the vtimer masked, which would explain WFI-never-traps while IGRPEN/mask don't
+help. The `IGNITION_SAMPLE` PC sampler + `HvfVcpu::read_pc` are left in (gated) for
+this.
 
 ## Tests / gate
 
