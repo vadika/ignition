@@ -54,11 +54,16 @@ fn main() {
     // Load the kernel; entry is where the vCPU's PC starts.
     let entry = kernel::load_kernel(ram, layout::RAM_BASE, &kernel_image).expect("load_kernel failed");
 
-    // Optional initrd, copied in after the kernel.
+    // The FDT occupies the top FDT_MAX_SIZE of RAM; the kernel and initrd must
+    // stay below it. Computed early so the initrd copy can assert against it.
+    let fdt_addr = layout::fdt_addr(RAM_SIZE);
+    let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
+
+    // Optional initrd, copied in after the kernel, below the FDT region.
     let initrd = if let Some(ref bytes) = initrd_bytes {
         let off = INITRD_OFFSET as usize;
         let end = off + bytes.len();
-        assert!(end <= ram.len(), "initrd does not fit in RAM");
+        assert!(end <= fdt_off, "initrd overlaps the FDT region");
         ram[off..end].copy_from_slice(bytes);
         Some((layout::RAM_BASE + INITRD_OFFSET, bytes.len() as u64))
     } else {
@@ -84,8 +89,6 @@ fn main() {
         initrd,
     };
     let dtb = fdt::generate(&cfg).expect("fdt generate failed");
-    let fdt_addr = layout::fdt_addr(RAM_SIZE);
-    let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
     assert!(fdt_off + dtb.len() <= ram.len(), "DTB does not fit in RAM");
     ram[fdt_off..fdt_off + dtb.len()].copy_from_slice(&dtb);
 
