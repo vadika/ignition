@@ -87,9 +87,11 @@ impl Vcpu {
                 // Idle/timer exits. Earlycon-grade parking: bounded sleeps keep
                 // the CPU off the floor and let wall-clock advance toward the
                 // next CNTV deadline. Proper channel parking that wakes on an
-                // injected IRQ is a later milestone. The vtimer is already masked
-                // by HvfVcpu::run; the in-kernel GIC redelivers it on re-entry.
+                // injected IRQ is a later milestone. On re-entry hvf_sync_vtimer
+                // unmasks the vtimer and sets the IRQ; when a GIC is present (the
+                // boot harness creates the in-kernel hv_gic) it redelivers it.
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
+                // TODO(phase1-smp): wake on a sibling vCPU's SEV instead of polling.
                 VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
                 VcpuExit::WaitForEventExpired | VcpuExit::VtimerActivated => {}
                 other => log::debug!("unhandled vCPU exit: {other:?}"),
