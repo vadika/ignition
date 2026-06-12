@@ -59,6 +59,11 @@ const SAVED_GP: &[hv_reg_t] = &[
 ];
 
 /// Serializable vCPU state for snapshot/restore.
+///
+/// Captures EL1 guest state for the **non-nested** configuration (the only one
+/// the boot harness uses). Nested-mode EL2 control registers (HCR_EL2,
+/// CNTHCTL_EL2) are not captured here because non-nested boot does not program
+/// them through the snapshot path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VcpuState {
     /// One value per `SAVED_GP` entry, in order.
@@ -67,6 +72,13 @@ pub struct VcpuState {
     pub sysregs: Vec<(u32, u64)>,
     pub vtimer_mask: bool,
     pub vtimer_offset: u64,
+    /// NEON/FP Q0..Q31 registers, stored as 128-bit little-endian values.
+    /// 32 entries in order Q0..Q31.
+    pub simd: Vec<u128>,
+    /// Floating-point Control Register (FPCR).
+    pub fpcr: u64,
+    /// Floating-point Status Register (FPSR).
+    pub fpsr: u64,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -169,6 +181,8 @@ pub enum Error {
     VcpuSetVtimerMask,
     VmCreate,
     GicCreate,
+    GicSaveState,
+    GicRestore,
     GicSetSpi,
 }
 
@@ -200,6 +214,8 @@ impl Display for Error {
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
             GicCreate => write!(f, "Error creating in-kernel HVF GIC"),
+            GicSaveState => write!(f, "Error saving HVF GIC state"),
+            GicRestore => write!(f, "Error restoring HVF GIC state"),
             GicSetSpi => write!(f, "Error setting HVF GIC SPI level"),
         }
     }
@@ -640,7 +656,22 @@ impl HvfVcpu<'_> {
         if ret != HV_SUCCESS {
             return Err(Error::VcpuReadRegister);
         }
-        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset })
+        let fpcr = self.read_reg(hv_reg_t_HV_REG_FPCR)?;
+        let fpsr = self.read_reg(hv_reg_t_HV_REG_FPSR)?;
+        let simd = (0u32..32)
+            .map(|q| -> Result<u128, Error> {
+                let mut val: hv_simd_fp_uchar16_t = 0;
+                let ret = unsafe {
+                    hv_vcpu_get_simd_fp_reg(self.vcpuid, q, &mut val)
+                };
+                if ret != HV_SUCCESS {
+                    Err(Error::VcpuReadRegister)
+                } else {
+                    Ok(val)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset, simd, fpcr, fpsr })
     }
 
     /// Restore all snapshot state onto a freshly-created vCPU. MUST run on the
@@ -659,6 +690,16 @@ impl HvfVcpu<'_> {
         let ret = unsafe { hv_vcpu_set_vtimer_mask(self.vcpuid, s.vtimer_mask) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetVtimerMask);
+        }
+        self.write_reg(hv_reg_t_HV_REG_FPCR, s.fpcr)?;
+        self.write_reg(hv_reg_t_HV_REG_FPSR, s.fpsr)?;
+        for (q, &val) in s.simd.iter().enumerate() {
+            let ret = unsafe {
+                hv_vcpu_set_simd_fp_reg(self.vcpuid, q as u32, val)
+            };
+            if ret != HV_SUCCESS {
+                return Err(Error::VcpuSetRegister);
+            }
         }
         Ok(())
     }
@@ -923,6 +964,16 @@ mod error_tests {
             Error::GicCreate.to_string(),
             "GicSetSpi must not reuse the GicCreate message"
         );
+        assert_ne!(
+            Error::GicSaveState.to_string(),
+            Error::GicCreate.to_string(),
+            "GicSaveState must not reuse the GicCreate message"
+        );
+        assert_ne!(
+            Error::GicRestore.to_string(),
+            Error::GicCreate.to_string(),
+            "GicRestore must not reuse the GicCreate message"
+        );
     }
 }
 
@@ -937,9 +988,15 @@ mod snapshot_tests {
             sysregs: vec![(1, 0xaaaa), (2, 0xbbbb)],
             vtimer_mask: true,
             vtimer_offset: 0x1234,
+            simd: (0u128..32).map(|i| i * 0x0101_0101_0101_0101_0101_0101_0101_0101).collect(),
+            fpcr: 0x00_00_00_00,
+            fpsr: 0x0000_0000,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: VcpuState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+        assert_eq!(back.simd.len(), 32);
+        assert_eq!(back.fpcr, s.fpcr);
+        assert_eq!(back.fpsr, s.fpsr);
     }
 }

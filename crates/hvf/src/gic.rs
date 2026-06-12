@@ -10,7 +10,7 @@ use crate::bindings::{
     HV_SUCCESS, hv_gic_config_create, hv_gic_config_set_distributor_base,
     hv_gic_config_set_redistributor_base, hv_gic_create, hv_gic_get_distributor_size,
     hv_gic_get_redistributor_size, hv_gic_set_spi, hv_gic_set_state, hv_gic_state_create,
-    hv_gic_state_get_data, hv_gic_state_get_size,
+    hv_gic_state_get_data, hv_gic_state_get_size, os_release,
 };
 
 /// The maintenance interrupt PPI for GICv3 (matches FC/libkrun).
@@ -100,22 +100,26 @@ impl HvfGicV3 {
 
     /// Capture the in-kernel GIC state as an opaque blob (for snapshot).
     pub fn save_state(&self) -> Result<Vec<u8>, Error> {
-        // SAFETY: the state object is created, queried for size, copied out, and
-        // dropped within this call.
+        // SAFETY: state is created here, queried, copied out, and released via
+        // os_release before return on every path (success and both error paths).
         unsafe {
             let state = hv_gic_state_create();
             if state.is_null() {
-                return Err(Error::GicCreate);
+                return Err(Error::GicSaveState);
             }
-            let mut size: usize = 0;
-            if hv_gic_state_get_size(state, &mut size) != HV_SUCCESS {
-                return Err(Error::GicCreate);
-            }
-            let mut buf = vec![0u8; size];
-            if hv_gic_state_get_data(state, buf.as_mut_ptr() as *mut _) != HV_SUCCESS {
-                return Err(Error::GicCreate);
-            }
-            Ok(buf)
+            let result = (|| {
+                let mut size: usize = 0;
+                if hv_gic_state_get_size(state, &mut size) != HV_SUCCESS {
+                    return Err(Error::GicSaveState);
+                }
+                let mut buf = vec![0u8; size];
+                if hv_gic_state_get_data(state, buf.as_mut_ptr() as *mut _) != HV_SUCCESS {
+                    return Err(Error::GicSaveState);
+                }
+                Ok(buf)
+            })();
+            os_release(state as *mut std::os::raw::c_void);
+            result
         }
     }
 
@@ -160,7 +164,7 @@ impl HvfGicV3 {
         // Restore the in-kernel GIC state (replaces hv_gic_create on the restore path).
         let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
         if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
+            return Err(Error::GicRestore);
         }
 
         Ok(Self { dist_base, dist_size, redist_base, redist_size })
@@ -176,7 +180,7 @@ impl HvfGicV3 {
 pub fn gic_restore(blob: &[u8]) -> Result<(), Error> {
     let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
     if ret != HV_SUCCESS {
-        Err(Error::GicCreate)
+        Err(Error::GicRestore)
     } else {
         Ok(())
     }
