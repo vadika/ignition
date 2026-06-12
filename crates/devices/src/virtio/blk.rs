@@ -19,6 +19,10 @@ const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 const DEVICE_ID: &[u8] = b"ignition-vda";
 
+/// Reject a single descriptor larger than this (guest-controlled `len` is u32;
+/// an unbounded allocation would OOM the host). 1 MiB is generous for block bios.
+const MAX_DESC_LEN: u32 = 1 << 20;
+
 pub struct VirtioBlk {
     file: File,
     capacity_sectors: u64,
@@ -58,7 +62,8 @@ impl VirtioBlk {
             VIRTIO_BLK_T_IN => self.read_to_guest(mem, data, sector),
             VIRTIO_BLK_T_OUT => (self.write_from_guest(mem, data, sector), 0),
             VIRTIO_BLK_T_FLUSH => {
-                let s = if self.file.flush().is_ok() { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR };
+                // sync_all() actually persists; Write::flush is a no-op on File.
+                let s = if self.file.sync_all().is_ok() { VIRTIO_BLK_S_OK } else { VIRTIO_BLK_S_IOERR };
                 (s, 0)
             }
             VIRTIO_BLK_T_GET_ID => self.get_id(mem, data),
@@ -69,9 +74,14 @@ impl VirtioBlk {
     }
 
     fn read_to_guest(&mut self, mem: &GuestRam, data: &[Desc], sector: u64) -> (u8, u32) {
+        let Some(mut off) = sector.checked_mul(SECTOR_SIZE) else {
+            return (VIRTIO_BLK_S_IOERR, 0);
+        };
         let mut written = 0u32;
-        let mut off = sector * SECTOR_SIZE;
         for d in data {
+            if d.len > MAX_DESC_LEN {
+                return (VIRTIO_BLK_S_IOERR, written);
+            }
             let mut buf = vec![0u8; d.len as usize];
             if self.file.seek(SeekFrom::Start(off)).is_err() || self.file.read_exact(&mut buf).is_err() {
                 return (VIRTIO_BLK_S_IOERR, written);
@@ -79,15 +89,20 @@ impl VirtioBlk {
             if !mem.write_slice(d.addr, &buf) {
                 return (VIRTIO_BLK_S_IOERR, written);
             }
-            written += d.len;
-            off += u64::from(d.len);
+            written = written.saturating_add(d.len);
+            off = off.saturating_add(u64::from(d.len));
         }
         (VIRTIO_BLK_S_OK, written)
     }
 
     fn write_from_guest(&mut self, mem: &GuestRam, data: &[Desc], sector: u64) -> u8 {
-        let mut off = sector * SECTOR_SIZE;
+        let Some(mut off) = sector.checked_mul(SECTOR_SIZE) else {
+            return VIRTIO_BLK_S_IOERR;
+        };
         for d in data {
+            if d.len > MAX_DESC_LEN {
+                return VIRTIO_BLK_S_IOERR;
+            }
             let mut buf = vec![0u8; d.len as usize];
             if !mem.read_slice(d.addr, &mut buf) {
                 return VIRTIO_BLK_S_IOERR;
@@ -95,13 +110,16 @@ impl VirtioBlk {
             if self.file.seek(SeekFrom::Start(off)).is_err() || self.file.write_all(&buf).is_err() {
                 return VIRTIO_BLK_S_IOERR;
             }
-            off += u64::from(d.len);
+            off = off.saturating_add(u64::from(d.len));
         }
         VIRTIO_BLK_S_OK
     }
 
     fn get_id(&self, mem: &GuestRam, data: &[Desc]) -> (u8, u32) {
         if let Some(d) = data.first() {
+            if d.len > MAX_DESC_LEN {
+                return (VIRTIO_BLK_S_IOERR, 0);
+            }
             let mut buf = vec![0u8; d.len as usize];
             let n = (d.len as usize).min(DEVICE_ID.len());
             buf[..n].copy_from_slice(&DEVICE_ID[..n]);
@@ -205,5 +223,17 @@ mod tests {
     fn capacity_is_file_len_over_512() {
         let blk = VirtioBlk::new(disk()).unwrap();
         assert_eq!(blk.capacity_sectors(), 2);
+    }
+
+    #[test]
+    fn overflowing_sector_is_ioerr_not_panic() {
+        let mut backing = vec![0u8; 0x1000];
+        let m = mem(&mut backing);
+        header(&m, VIRTIO_BLK_T_IN, 0x0080_0000_0000_0000); // sector*512 overflows u64
+        let mut blk = VirtioBlk::new(disk()).unwrap();
+        blk.process(&chain(512, true), &m);
+        let mut s = [0u8; 1];
+        m.read_slice(STATUS, &mut s);
+        assert_eq!(s[0], VIRTIO_BLK_S_IOERR);
     }
 }
