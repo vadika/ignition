@@ -42,3 +42,51 @@ target/debug/hvf-spike
 ```
 
 Requires: Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024).
+
+## Boot a Linux guest
+
+The `boot` binary loads an aarch64 kernel + rootfs, runs the vCPU(s), and gives an
+interactive 16550 console. **Re-sign after every build** — relinking strips the
+hypervisor entitlement.
+
+```sh
+cargo build -p hvf-spike --bin boot
+scripts/sign.sh target/debug/boot
+
+# boot to a shell (log in as root); console keys: Ctrl-A s = snapshot, Ctrl-A x = quit
+target/debug/boot kimage/out/Image kimage/out/rootfs.ext4
+
+target/debug/boot --smp 4 kimage/out/Image kimage/out/rootfs.ext4   # multi-vCPU (SMP)
+target/debug/boot --net  kimage/out/Image kimage/out/rootfs.ext4    # vmnet NAT networking
+```
+
+## Snapshot & restore
+
+Single-vCPU only (do not combine with `--smp`). A snapshot dir holds
+`memory.bin` + `gic.bin` + `disk.img` + `vmstate.json`.
+
+```sh
+# 1. boot with an output dir, then press Ctrl-A s in the console to snapshot
+#    (guest keeps running afterwards)
+target/debug/boot --snap-dir mysnap kimage/out/Image kimage/out/rootfs.ext4
+ls -la mysnap/
+
+# 2. restore — resumes from the saved PC (no kernel re-boot); press Enter for a prompt
+target/debug/boot --restore mysnap
+
+# 3. confirm it idles (~0% CPU, not spinning)
+target/debug/boot --restore mysnap & BP=$!; sleep 3; ps -o pid,%cpu,command -p $BP; kill $BP
+
+# 4. clone — restore the same snapshot into N independent guests (private disk copy each)
+target/debug/boot --restore mysnap   # run in separate terminals
+```
+
+Headless drivers that run the whole cycle:
+
+```sh
+python3 scripts/restore_test.py        # boot -> snapshot -> restore; prints CPU% + responsive
+python3 scripts/restore_clone_test.py  # login + run a command + two clones
+```
+
+Restore expects the same `RAM_SIZE` the snapshot was taken with. `/snapshot/` and
+`/snapshot2/` are gitignored; any other `--snap-dir` name is tracked unless you ignore it.
