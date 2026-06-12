@@ -317,7 +317,6 @@ pub enum VcpuExit<'a> {
 }
 
 struct MmioRead {
-    addr: u64,
     len: usize,
     srt: u32,
 }
@@ -337,6 +336,7 @@ pub struct HvfVcpu<'a> {
 /// buffer). `len` is `1 << sas` from the data-abort syndrome, so it is always one
 /// of 1, 2, 4, 8.
 fn encode_mmio_le(buf: &mut [u8], val: u64, len: usize) {
+    debug_assert!(matches!(len, 1 | 2 | 4 | 8), "mmio len must be 1/2/4/8, got {len}");
     let bytes = val.to_le_bytes();
     buf[..len].copy_from_slice(&bytes[..len]);
 }
@@ -344,6 +344,7 @@ fn encode_mmio_le(buf: &mut [u8], val: u64, len: usize) {
 /// Read `len` little-endian bytes from `buf` as a zero-extended `u64`. `len` is
 /// `1 << sas`, always one of 1, 2, 4, 8.
 fn decode_mmio_le(buf: &[u8], len: usize) -> u64 {
+    debug_assert!(matches!(len, 1 | 2 | 4 | 8), "mmio len must be 1/2/4/8, got {len}");
     let mut bytes = [0u8; 8];
     bytes[..len].copy_from_slice(&buf[..len]);
     u64::from_le_bytes(bytes)
@@ -650,7 +651,7 @@ impl HvfVcpu<'_> {
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
                 } else {
-                    self.pending_mmio_read = Some(MmioRead { addr: pa, srt, len });
+                    self.pending_mmio_read = Some(MmioRead { srt, len });
                     Ok(VcpuExit::MmioRead(pa, &mut self.mmio_buf[0..len]))
                 }
             }
