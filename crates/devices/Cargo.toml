@@ -12,3 +12,6 @@ path = "src/lib.rs"
 [dependencies]
 log = "0.4"
 vm-superio = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
