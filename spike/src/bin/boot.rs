@@ -136,6 +136,42 @@ impl Drop for TermiosGuard {
     }
 }
 
+/// Spawn a thread that reads host stdin one byte at a time, runs the escape
+/// state machine, and feeds forwarded bytes into the serial's RX FIFO. On
+/// Ctrl-A x it restores the terminal and exits the process. On EOF/error it
+/// stops reading and leaves the guest running.
+fn spawn_stdin_reader(
+    serial: Arc<Mutex<Serial<FlushWriter>>>,
+    saved_termios: Option<libc::termios>,
+) {
+    std::thread::spawn(move || {
+        let mut state = EscState::Normal;
+        let mut byte = [0u8; 1];
+        loop {
+            // SAFETY: reading 1 byte from STDIN_FILENO into a stack buffer.
+            let n = unsafe {
+                libc::read(libc::STDIN_FILENO, byte.as_mut_ptr() as *mut libc::c_void, 1)
+            };
+            if n <= 0 {
+                return; // EOF or error: stop reading; the guest keeps running.
+            }
+            match step(&mut state, byte[0]) {
+                Action::Pending => {}
+                Action::Forward(buf, len) => {
+                    if let Err(e) = serial.lock().unwrap().enqueue(&buf[..len]) {
+                        log::warn!("serial RX dropped byte: {e}");
+                    }
+                }
+                Action::Quit => {
+                    restore_termios(&saved_termios);
+                    eprintln!("\n[console detached]");
+                    process::exit(0);
+                }
+            }
+        }
+    });
+}
+
 /// Adapts the in-kernel GIC to the device `IrqLine`. The virtio SPI index is the
 /// bare FDT index; hv_gic_set_spi wants the absolute INTID (32 + index).
 struct GicIrq {
@@ -244,9 +280,10 @@ fn main() {
     // otherwise sit forever in stdout's line buffer, looking like a hang.
     let mut bus = Bus::new();
     let serial_irq = Arc::new(GicIrq { gic: gic.clone(), intid: layout::SERIAL_SPI + 32 });
-    let serial: Arc<Mutex<dyn BusDevice>> =
+    let serial: Arc<Mutex<Serial<FlushWriter>>> =
         Arc::new(Mutex::new(Serial::with_irq(FlushWriter, serial_irq)));
-    bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial);
+    let serial_bus: Arc<Mutex<dyn BusDevice>> = serial.clone();
+    bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial_bus);
 
     if let Some(path) = &disk_path {
         let file = fs::OpenOptions::new()
@@ -268,6 +305,13 @@ fn main() {
         eprintln!("virtio : /dev/vda backed by {path}");
     }
     let bus = Arc::new(bus);
+
+    // Raw terminal + host stdin reader for the interactive console. The guard
+    // restores the terminal on drop (guest-initiated exit); the reader restores
+    // it before process::exit on Ctrl-A x.
+    let termios = TermiosGuard::new();
+    spawn_stdin_reader(serial.clone(), termios.saved());
+    eprintln!("--- console attached (quit: Ctrl-A x) ---");
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
     let vcpu = Vcpu::new(0, entry, fdt_addr, bus);
