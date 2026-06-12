@@ -2,35 +2,60 @@
 // Firecracker uses on aarch64 (FDT `compatible = "ns16550a"`).
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use vm_superio::Trigger;
 use vm_superio::serial::NoEvents;
 
 use crate::bus::BusDevice;
+use crate::virtio::IrqLine;
 
-/// No-op IRQ trigger. With no interrupt controller yet, the 16550 TX-ready
-/// interrupt has nowhere to go. Replaced when a GIC lands.
-#[derive(Debug, Default)]
-pub struct NoopTrigger;
+/// The 16550's interrupt line. Either discarded (no GIC — used by smoke tests)
+/// or pulsed on the GIC's serial SPI. `vm_superio` calls `trigger()` when the
+/// UART raises an interrupt (e.g. TX FIFO empty / RX data available); the kernel's
+/// interrupt-driven 8250 tty path blocks on the TX-empty interrupt, so this must
+/// be wired for anything beyond the FIFO's worth of output.
+#[derive(Clone)]
+pub enum SerialIrq {
+    /// No interrupt controller — the interrupt is dropped.
+    Noop,
+    /// Pulse the (edge-triggered) serial SPI on the in-kernel GIC.
+    Gic(Arc<dyn IrqLine>),
+}
 
-impl Trigger for NoopTrigger {
+impl Trigger for SerialIrq {
     type E = io::Error;
 
     fn trigger(&self) -> io::Result<()> {
+        if let SerialIrq::Gic(irq) = self {
+            // Edge-rising SPI: assert then deassert; the GIC latches the edge.
+            irq.set_spi(true);
+            irq.set_spi(false);
+        }
         Ok(())
     }
 }
 
+/// Back-compat alias for the smoke tests / output-only harnesses.
+pub type NoopTrigger = SerialIrq;
+
 /// MMIO 16550 UART writing to sink `W` (e.g. `io::Stdout`, or a captured
 /// buffer in tests).
-#[derive(Debug)]
 pub struct Serial<W: Write + Send> {
-    inner: vm_superio::Serial<NoopTrigger, NoEvents, W>,
+    inner: vm_superio::Serial<SerialIrq, NoEvents, W>,
 }
 
 impl<W: Write + Send> Serial<W> {
+    /// A serial with no interrupt line (output only; smoke tests).
     pub fn new(out: W) -> Self {
-        Self { inner: vm_superio::Serial::new(NoopTrigger, out) }
+        Self { inner: vm_superio::Serial::new(SerialIrq::Noop, out) }
+    }
+
+    /// A serial whose interrupt pulses the given GIC line — required for the
+    /// kernel's interrupt-driven tty (it blocks on the TX-empty interrupt once
+    /// the 16-byte FIFO fills).
+    pub fn with_irq(out: W, irq: Arc<dyn IrqLine>) -> Self {
+        Self { inner: vm_superio::Serial::new(SerialIrq::Gic(irq), out) }
     }
 }
 
@@ -85,6 +110,6 @@ mod tests {
 
     #[test]
     fn noop_trigger_never_errors() {
-        assert!(NoopTrigger.trigger().is_ok());
+        assert!(SerialIrq::Noop.trigger().is_ok());
     }
 }

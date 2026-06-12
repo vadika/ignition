@@ -30,10 +30,14 @@ const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
 
 /// Adapts the in-kernel GIC to the device `IrqLine`. The virtio SPI index is the
 /// bare FDT index; hv_gic_set_spi wants the absolute INTID (32 + index).
-struct GicIrq(Arc<HvfGicV3>);
+struct GicIrq {
+    gic: Arc<HvfGicV3>,
+    /// Absolute GIC INTID (SPI index + 32).
+    intid: u32,
+}
 impl IrqLine for GicIrq {
     fn set_spi(&self, level: bool) {
-        let _ = self.0.set_spi(layout::VIRTIO_SPI + 32, level);
+        let _ = self.gic.set_spi(self.intid, level);
     }
 }
 
@@ -131,7 +135,9 @@ fn main() {
     // Flush each byte: a prompt like "login: " has no trailing newline and would
     // otherwise sit forever in stdout's line buffer, looking like a hang.
     let mut bus = Bus::new();
-    let serial: Arc<Mutex<dyn BusDevice>> = Arc::new(Mutex::new(Serial::new(FlushWriter)));
+    let serial_irq = Arc::new(GicIrq { gic: gic.clone(), intid: layout::SERIAL_SPI + 32 });
+    let serial: Arc<Mutex<dyn BusDevice>> =
+        Arc::new(Mutex::new(Serial::with_irq(FlushWriter, serial_irq)));
     bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial);
 
     if let Some(path) = &disk_path {
@@ -145,7 +151,11 @@ fn main() {
         // during MMIO exits, when the guest is paused.
         let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
         let virtio: Arc<Mutex<dyn BusDevice>> =
-            Arc::new(Mutex::new(VirtioMmio::new(blk, guest_ram, Arc::new(GicIrq(gic.clone())))));
+            Arc::new(Mutex::new(VirtioMmio::new(
+                blk,
+                guest_ram,
+                Arc::new(GicIrq { gic: gic.clone(), intid: layout::VIRTIO_SPI + 32 }),
+            )));
         bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio);
         eprintln!("virtio : /dev/vda backed by {path}");
     }
