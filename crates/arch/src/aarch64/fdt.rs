@@ -202,7 +202,8 @@ fn create_virtio_node(fdt: &mut FdtWriter, dev: &MmioDev) -> Result<(), vm_fdt::
     fdt.property_array_u64("reg", &[dev.addr, dev.size])?;
     fdt.property_null("dma-coherent")?;
     fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, dev.irq, IRQ_TYPE_EDGE_RISING])?;
-    fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+    // interrupt-parent is inherited from the root node (GIC_PHANDLE), like the
+    // serial node — no need to repeat it here.
     fdt.end_node(node)?;
     Ok(())
 }
