@@ -47,6 +47,31 @@ all matter once a real aarch64 Linux kernel boots.
   module lands, pass the real value (likely RAM base) — not the serial MMIO
   address.
 
+## Boot bring-up (milestone 2d) — live-debug checklist for `boot <Image>`
+
+Run: `cargo build -p hvf-spike --bin boot && scripts/sign.sh target/debug/boot &&
+target/debug/boot <Image> [initrd]`. Diagnostics on stderr, guest console on
+stdout (`2>diag.txt` to separate). Expected banner: `entry=0x40000000` for a
+modern defconfig kernel (text_offset=0, loaded at the 2 MiB-aligned RAM_BASE).
+
+Symptom → cause:
+- **No output at all** → DTB/cmdline mismatch or wrong load addr. Check the banner's
+  entry/fdt addrs; confirm the kernel has 8250/16550 earlycon (`CONFIG_SERIAL_8250_*`)
+  and the `uart@9000000` node `compatible="ns16550a"` matches its driver.
+- **Hangs right after `Booting Linux on physical CPU 0x0...`** → missing timer IRQ.
+  `NoIrqVcpus` doesn't inject the vtimer; earlycon prints before the timer is
+  needed, but the kernel stalls once it waits on a tick. That's the 2e work
+  (vtimer PPI delivery via the in-kernel GIC + real channel parking).
+- **Silent stall when the kernel brings up a secondary CPU** → PSCI `CPU_ON`.
+  FDT advertises `psci method="hvc"`; the hvf run loop handles known PSCI fn IDs
+  (VERSION/SYSTEM_OFF/CPU_ON) but an unhandled HVC currently falls through to the
+  `other =>` debug arm with no response. Single-vCPU boot avoids this.
+- **Panic on a halfword MMIO write** → the hvf crate's `MmioWrite` only matches
+  len 1/4/8 (see below); a kernel doing `strh` to the UART would hit it.
+- **earlycon stride:** the cmdline uses `earlycon=uart8250,mmio,0x9000000` (byte
+  stride / MMIO, not MMIO32). If the kernel wants 32-bit register stride, switch
+  to `uart8250,mmio32,...` and widen the Serial access gate (currently 1-byte only).
+
 ## Kernel loader (milestone 2c) — for the 2d boot integration
 
 - **Wiring:** `arch::aarch64::kernel::load_kernel(ram, RAM_BASE, &image)` returns
