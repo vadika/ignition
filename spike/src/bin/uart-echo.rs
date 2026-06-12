@@ -21,8 +21,9 @@ const GUEST_RAM_SIZE: u64 = 0x10_0000; // 1 MiB
 const SERIAL_BASE: u64 = 0x0900_0000;
 const SERIAL_LEN: u64 = 0x1000;
 
-// Hand-assembled aarch64 (clang -target arm64-apple-macos). 11 instructions +
-// the "IGNITION\n" bytes. See docs/superpowers/specs for the asm source:
+// Hand-assembled aarch64 (clang -target arm64-apple-macos): 11 instruction
+// words + 3 u32 words encoding "IGNITION\n" (9 bytes + 3 null pad). Asm source
+// is in docs/superpowers/specs/2026-06-12-phase1-uart-echo-design.md:
 //   movz x1,#0x0900,lsl#16 ; adr x2,msg ; mov x3,#9
 //   loop: ldrb w0,[x2],#1 ; strb w0,[x1] ; subs x3,#1 ; b.ne loop
 //   movz x0,#0x0008 ; movk x0,#0x8400,lsl#16 ; hvc #0 ; b .
@@ -51,7 +52,8 @@ fn main() {
 
     let vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
 
-    // Allocate + populate guest RAM.
+    // Allocate + populate guest RAM. No munmap: the process exits right after
+    // and the OS reclaims the mapping.
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -82,6 +84,7 @@ fn main() {
     let bus = Arc::new(bus);
 
     // Run the vCPU to shutdown.
+    // Vcpu::new(mpidr, entry, fdt_addr, bus); this guest ignores X0/fdt_addr.
     let vcpu = Vcpu::new(0, GUEST_RAM_BASE, 0, bus);
     vcpu.start()
         .join()
