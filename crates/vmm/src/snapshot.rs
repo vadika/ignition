@@ -78,13 +78,19 @@ pub fn write_snapshot(
     gic_blob: &[u8],
     disk_src: &Path,
 ) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let p = paths(dir);
+    // Write into a temp dir, then atomically rename into place, so an interrupted
+    // write never leaves a half-written snapshot that --restore would read.
+    let tmp = dir.with_extension("tmp");
+    let _ = fs::remove_dir_all(&tmp); // clear any prior aborted attempt
+    fs::create_dir_all(&tmp)?;
+    let p = paths(&tmp);
     fs::File::create(&p.memory)?.write_all(ram)?;
     fs::File::create(&p.gic)?.write_all(gic_blob)?;
     fs::copy(disk_src, &p.disk)?;
     let json = serde_json::to_vec_pretty(snap).map_err(io::Error::other)?;
     fs::write(&p.state, json)?;
+    let _ = fs::remove_dir_all(dir); // replace any existing snapshot
+    fs::rename(&tmp, dir)?;
     Ok(())
 }
 

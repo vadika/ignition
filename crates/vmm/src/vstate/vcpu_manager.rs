@@ -216,7 +216,12 @@ impl VcpuManager {
                 VcpuExit::Canceled => {
                     if self.snapshot_req.swap(false, Ordering::AcqRel) {
                         if let Some(h) = &self.snapshot_handler {
-                            h(&vcpu);
+                            // A panic in the handler must not unwind the vCPU thread —
+                            // log and resume.
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&vcpu)));
+                            if r.is_err() {
+                                log::error!("snapshot handler panicked; guest resumed");
+                            }
                         }
                         continue; // resume the guest after snapshotting
                     }

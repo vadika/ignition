@@ -429,12 +429,18 @@ fn main() {
 
     if smp == 1 && !net {
         // Build a closure capturing all state needed to write the snapshot.
-        // Clone Arcs and scalars; `host` raw pointer is captured as usize for Send.
+        // Clone Arcs and scalars; raw pointer is captured as usize for Send+Sync.
         let gic_snap = gic.clone();
         let serial_snap = serial.clone();
         let blk_snap = virtio_blk_mmio.clone();
         let disk_path_snap = disk_path.clone();
         let snap_dir_snap = snap_dir.clone();
+        // The guest RAM base pointer captured as usize: raw *const u8 is neither
+        // Send nor Sync, but usize is. Sound because the closure only reads the
+        // slice at a Canceled exit, when the (single, non-net) vCPU is paused
+        // and is the sole RAM writer. Rust 2021 partial-capture would see through
+        // a newtype wrapper and capture the *const u8 field directly, defeating
+        // the unsafe impl — so usize is the correct approach here.
         let host_usize = host as usize;
 
         manager.set_snapshot_handler(Box::new(move |vcpu: &HvfVcpu| {
@@ -481,7 +487,7 @@ fn main() {
             };
             let snap = VmSnapshot::new(config, vcpu_state, devices_state);
 
-            // The RAM slice — pointer was captured as usize for Send.
+            // The RAM slice — host_usize round-trip avoids capturing *const u8.
             let ram_slice: &[u8] = unsafe {
                 std::slice::from_raw_parts(host_usize as *const u8, RAM_SIZE as usize)
             };
@@ -576,7 +582,7 @@ fn run_restore(dir: &Path) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
 
     // 6. Copy disk.img to a private instance so clones are independent.
-    let instance_disk = dir.join(format!("instance-{}.img", process::id()));
+    let instance_disk = std::env::temp_dir().join(format!("ignition-instance-{}.img", process::id()));
     fs::copy(&paths.disk, &instance_disk)?;
     let disk_file = fs::OpenOptions::new()
         .read(true)
