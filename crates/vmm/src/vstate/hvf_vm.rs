@@ -32,8 +32,9 @@ impl Vm {
 
     /// Map a host range into the guest and record it. Same argument order as
     /// `hvf::HvfVm::map_memory` (host, guest, size). No dedup/overlap check here:
-    /// HVF rejects overlapping maps, so a recorded region implies a successful,
-    /// non-overlapping map.
+    /// the region is recorded only after HVF accepts the map, but the caller is
+    /// responsible for not requesting overlapping guest ranges (HVF rejects
+    /// re-mapping the same IPA but does not guarantee rejecting every overlap).
     pub fn map_memory(&mut self, host_addr: u64, guest_addr: u64, size: u64) -> Result<(), hvf::Error> {
         self.hvf.map_memory(host_addr, guest_addr, size)?;
         self.regions.push(MappedRegion { host_addr, guest_addr, size });
