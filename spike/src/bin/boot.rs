@@ -144,6 +144,7 @@ fn spawn_stdin_reader(
     serial: Arc<Mutex<Serial<FlushWriter>>>,
     saved_termios: Option<libc::termios>,
 ) {
+    // Detached: the reader lives for the process lifetime.
     std::thread::spawn(move || {
         let mut state = EscState::Normal;
         let mut byte = [0u8; 1];
@@ -152,8 +153,16 @@ fn spawn_stdin_reader(
             let n = unsafe {
                 libc::read(libc::STDIN_FILENO, byte.as_mut_ptr() as *mut libc::c_void, 1)
             };
-            if n <= 0 {
-                return; // EOF or error: stop reading; the guest keeps running.
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                // EINTR (e.g. SIGWINCH on resize): retry the read.
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return; // real error: stop reading; the guest keeps running.
+            }
+            if n == 0 {
+                return; // EOF on stdin.
             }
             match step(&mut state, byte[0]) {
                 Action::Pending => {}
@@ -163,6 +172,9 @@ fn spawn_stdin_reader(
                     }
                 }
                 Action::Quit => {
+                    // process::exit skips destructors: an in-flight virtio-blk
+                    // write on the vCPU thread may be truncated. Acceptable for
+                    // this spike harness.
                     restore_termios(&saved_termios);
                     eprintln!("\n[console detached]");
                     process::exit(0);
