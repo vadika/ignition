@@ -20,17 +20,23 @@ pub const VIRTIO_SIZE: u64 = 0x200;
 pub const VIRTIO_SPI: u32 = 1;
 /// Reserved size for the flattened device tree.
 pub const FDT_MAX_SIZE: u64 = 0x20_0000; // 2 MiB
+/// The kernel maps the first 512 MiB of RAM early in boot, so the DTB must live
+/// within that window (it is read before the full linear map exists).
+pub const DTB_EARLY_MAP_LIMIT: u64 = 0x2000_0000; // 512 MiB
 
-/// Address where the DTB is placed: the top `FDT_MAX_SIZE` of RAM, rounded down
-/// to an 8-byte boundary. Within `[RAM_BASE, RAM_BASE + ram_size)` and clear of
-/// a kernel at `RAM_BASE` while the kernel stays smaller than
-/// `ram_size - FDT_MAX_SIZE`. `ram_size` must be >= `FDT_MAX_SIZE`.
+/// Address where the DTB is placed: the top `FDT_MAX_SIZE` of `min(ram_size,
+/// 512 MiB)` of RAM, rounded down to an 8-byte boundary. The 512 MiB cap keeps
+/// the DTB within the kernel's early-mapped window even for large RAM configs.
+/// Within `[RAM_BASE, RAM_BASE + ram_size)` and clear of a kernel at `RAM_BASE`
+/// while the kernel stays smaller than `ram_size - FDT_MAX_SIZE`.
+/// `ram_size` must be >= `FDT_MAX_SIZE`.
 pub fn fdt_addr(ram_size: u64) -> u64 {
     debug_assert!(ram_size >= FDT_MAX_SIZE, "ram_size must be >= FDT_MAX_SIZE");
-    // TODO(larger-ram): the DTB must stay within the first 512 MiB of RAM (the
-    // kernel maps it early). Top-of-RAM placement satisfies this only while
-    // ram_size <= 512 MiB; add a guard/placement policy when larger RAM lands.
-    (RAM_BASE + ram_size - FDT_MAX_SIZE) & !0x7
+    // Place the DTB at the top of usable low RAM: the top of RAM, but never above
+    // the kernel's early-map window, so for ram_size > 512 MiB it sits just below
+    // that limit instead of beyond it.
+    let window = ram_size.min(DTB_EARLY_MAP_LIMIT);
+    (RAM_BASE + window - FDT_MAX_SIZE) & !0x7
 }
 
 /// Default kernel command line, with the earlycon MMIO address kept in sync with
@@ -67,6 +73,20 @@ mod tests {
     fn fdt_addr_panics_below_minimum() {
         // Guards against passing e.g. bytes where MiB were intended.
         let _ = fdt_addr(FDT_MAX_SIZE - 1);
+    }
+
+    #[test]
+    fn fdt_addr_large_ram_stays_within_early_map() {
+        // For RAM larger than the 512 MiB early-map window, the DTB must sit
+        // within the first 512 MiB, not at the top of RAM.
+        let ram_size = 0x8000_0000; // 2 GiB
+        let addr = fdt_addr(ram_size);
+        assert_eq!(addr & 0x7, 0, "fdt addr must be 8-byte aligned");
+        assert!(addr >= RAM_BASE, "fdt addr must be within RAM");
+        assert!(
+            addr < RAM_BASE + 0x2000_0000,
+            "DTB must stay within the kernel's early-mapped first 512 MiB"
+        );
     }
 
     #[test]
