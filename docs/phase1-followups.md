@@ -12,6 +12,15 @@ all matter once a real aarch64 Linux kernel boots.
   `debug_assert` on size); removed the dead `MmioRead::addr` field. See the
   hardening plan `docs/superpowers/plans/2026-06-12-phase1-hardening.md`.
 
+- **Unknown PSCI/HVC function id panics the vCPU.** `crates/hvf/src/lib.rs`
+  `handle_psci_request` ends in `val => panic!("Unexpected val={val}")`, so a guest
+  issuing an unmodeled PSCI call (e.g. `CPU_OFF`, `AFFINITY_INFO`) hard-panics the
+  vCPU thread (and, via panic-on-join, the process) instead of returning
+  `NOT_SUPPORTED` (`0xffff_ffff_ffff_ffff`). Pre-existing, but the SMP milestone
+  widened the guest surface that can reach it (secondaries may probe affinity / try
+  hotplug). Return `NOT_SUPPORTED` for unrecognized ids instead of panicking. Track
+  it. (CPU hotplug / `CPU_OFF` modeling is itself out of scope per the SMP spec.)
+
 ## Layering migrations (do early in the next milestone)
 
 - ✅ **DONE** (2026-06-12, commits `62dcc30`/`4f24978`) — **`Vm` was a no-op
@@ -130,10 +139,12 @@ Symptom → cause:
   `generate` dispatches per kind, so adding RTC/more virtio is a new variant + arm,
   not a new field. All three `FdtConfig` constructions migrated. The serial-console
   expectation is documented on `devices` (caller's responsibility, as in Firecracker).
-- ⏸️ **DEFERRED — SMP-gated.** **mpidr `& 0x7F_FFFF` mask.** Single-vCPU MPIDR is 0,
-  so the mask is a no-op today. Re-validating it against a real MPIDR scheme requires
-  the SMP/vCPU milestone to first wire actual MPIDRs (vcpuid → Aff1) from
-  Hypervisor.framework — nothing meaningful to validate until then. Carry into SMP.
+- ✅ **DONE** (2026-06-12, SMP milestone) — **mpidr `& 0x7F_FFFF` mask.** The SMP
+  milestone introduced `VcpuManager::mpidr_for(index) = index` (linear Aff0 = cpu
+  index, ≤256 cores). FDT `cpu_mpidrs`, `MPIDR_EL1` (`HvfVcpu::new`), and the PSCI
+  `CPU_ON` target all key off this single value, and the `& 0x7F_FFFF` mask is a
+  no-op for index < 2^23. Verified: `--smp 2`/`--smp 4` bring all cores online with
+  no CPU_ON mismatch. See `docs/superpowers/specs/2026-06-12-smp-design.md`.
 
 ## Constraints to remember (not bugs)
 
