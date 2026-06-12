@@ -127,6 +127,7 @@ mod tests {
                 simd: vec![0u128; 32],
                 fpcr: 0,
                 fpsr: 0,
+                icc: vec![(1, 2)],
             },
             DeviceState {
                 blk: VirtioMmioState {

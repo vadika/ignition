@@ -128,18 +128,12 @@ impl HvfGicV3 {
     ///
     /// # Restore mechanism
     ///
-    /// `hv_gic_set_state` is expected to reconstruct the full in-kernel GIC
-    /// (including its interrupt state) WITHOUT a preceding `hv_gic_create` call —
-    /// the state blob encodes all configuration. The placement fields (`dist_base`,
-    /// `redist_base`, sizes) are recomputed from the same `vcpu_count`/`gic_top`
-    /// values used at create time so that `set_spi` and `fdt_info` work after
-    /// restore.
-    ///
-    /// If HVF turns out to require an explicit `hv_gic_create` before
-    /// `hv_gic_set_state`, the restore path should call `HvfGicV3::new(vcpu_count,
-    /// gic_top)` followed by `gic_restore(blob)` instead. At the time of writing
-    /// (macOS 26 / Hypervisor.framework), `hv_gic_set_state` alone is the expected
-    /// path (matching Apple's documented snapshot API pattern).
+    /// `hv_gic_set_state` restores state INTO an existing in-kernel GIC — it does
+    /// not create one. So this creates the GIC with the same config/placement as
+    /// `new` (recomputed from `vcpu_count`/`gic_top`), then applies the snapshot
+    /// blob. The placement fields let `set_spi`/`fdt_info` work after restore.
+    /// (Verified at runtime: `hv_gic_set_state` without a preceding `hv_gic_create`
+    /// returns an error.)
     ///
     /// MUST be called after `hv_vm_create` and before any vCPU is created.
     pub fn from_state(blob: &[u8], vcpu_count: u64, gic_top: u64) -> Result<Self, Error> {
@@ -161,7 +155,24 @@ impl HvfGicV3 {
         let redist_base = gic_top.checked_sub(redist_size).ok_or(Error::GicCreate)?;
         let dist_base = redist_base.checked_sub(dist_size).ok_or(Error::GicCreate)?;
 
-        // Restore the in-kernel GIC state (replaces hv_gic_create on the restore path).
+        // The GIC must be created (same config/placement as `new`) BEFORE its state
+        // can be restored: `hv_gic_set_state` restores into an existing in-kernel
+        // GIC, it does not create one. (Verified at runtime — set_state alone fails.)
+        let config = unsafe { hv_gic_config_create() };
+        let ret = unsafe { hv_gic_config_set_distributor_base(config, dist_base) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+        let ret = unsafe { hv_gic_config_set_redistributor_base(config, redist_base) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+        let ret = unsafe { hv_gic_create(config) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+
+        // Now restore the captured distributor/redistributor/ICC state into it.
         let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
         if ret != HV_SUCCESS {
             return Err(Error::GicRestore);

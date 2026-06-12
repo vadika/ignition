@@ -42,6 +42,14 @@ const SAVED_SYSREGS: &[hv_sys_reg_t] = &[
     hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
     hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1, hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
     hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+    // Pointer-authentication keys: the kernel signs return addresses with these
+    // (pac*/aut* instructions). A restored vCPU with different keys fails `autiasp`
+    // and crashes — these MUST be captured.
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1, hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1, hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1, hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1, hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1, hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
 ];
 
 /// GP registers captured: X0..X30, PC, CPSR (33 entries, in this order).
@@ -56,6 +64,24 @@ const SAVED_GP: &[hv_reg_t] = &[
     hv_reg_t_HV_REG_X24, hv_reg_t_HV_REG_X25, hv_reg_t_HV_REG_X26, hv_reg_t_HV_REG_X27,
     hv_reg_t_HV_REG_X28, hv_reg_t_HV_REG_X29, hv_reg_t_HV_REG_X30,
     hv_reg_t_HV_REG_PC,  hv_reg_t_HV_REG_CPSR,
+];
+
+/// Per-vCPU GIC CPU-interface (ICC) registers captured for snapshot/restore. These
+/// are NOT in the `hv_gic_state` blob (which is the distributor/redistributor global
+/// state) — they live in the vCPU's CPU interface and control whether it can take
+/// interrupts (group enable, priority mask). Without them a restored vCPU has the
+/// interface at reset (interrupts masked) and the guest hangs. RPR (read-only) and
+/// the EL2 SRE (nested-only) are excluded.
+const SAVED_ICC: &[hv_gic_icc_reg_t] = &[
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_SRE_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_CTLR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_PMR_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_BPR1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_IGRPEN1_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP0R0_EL1,
+    hv_gic_icc_reg_t_HV_GIC_ICC_REG_AP1R0_EL1,
 ];
 
 /// Serializable vCPU state for snapshot/restore.
@@ -79,6 +105,10 @@ pub struct VcpuState {
     pub fpcr: u64,
     /// Floating-point Status Register (FPSR).
     pub fpsr: u64,
+    /// (hv_gic_icc_reg_t as u32, value) per `SAVED_ICC` entry — the per-vCPU GIC
+    /// CPU-interface state (interrupt enable/mask). Restored after the GIC + vCPU
+    /// exist.
+    pub icc: Vec<(u32, u64)>,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -671,7 +701,19 @@ impl HvfVcpu<'_> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset, simd, fpcr, fpsr })
+        let icc = SAVED_ICC
+            .iter()
+            .map(|&r| -> Result<(u32, u64), Error> {
+                let mut val: u64 = 0;
+                let ret = unsafe { hv_gic_get_icc_reg(self.vcpuid, r, &mut val) };
+                if ret != HV_SUCCESS {
+                    Err(Error::GicSaveState)
+                } else {
+                    Ok((r as u32, val))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset, simd, fpcr, fpsr, icc })
     }
 
     /// Restore all snapshot state onto a freshly-created vCPU. MUST run on the
@@ -699,6 +741,14 @@ impl HvfVcpu<'_> {
             };
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuSetRegister);
+            }
+        }
+        // Restore the per-vCPU GIC CPU-interface state last (the GIC + vCPU exist by
+        // now). Without this the interface is at reset and the guest takes no IRQs.
+        for &(r, v) in &s.icc {
+            let ret = unsafe { hv_gic_set_icc_reg(self.vcpuid, r as hv_gic_icc_reg_t, v) };
+            if ret != HV_SUCCESS {
+                return Err(Error::GicRestore);
             }
         }
         Ok(())
@@ -991,6 +1041,7 @@ mod snapshot_tests {
             simd: (0u128..32).map(|i| i * 0x0101_0101_0101_0101_0101_0101_0101_0101).collect(),
             fpcr: 0x00_00_00_00,
             fpsr: 0x0000_0000,
+            icc: vec![(1, 0x11), (2, 0x22)],
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: VcpuState = serde_json::from_str(&json).unwrap();
