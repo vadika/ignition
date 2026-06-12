@@ -225,6 +225,8 @@ name = "ignition-devices"
 version = "0.0.0"
 dependencies = [
  "log",
+ "serde",
+ "serde_json",
  "tempfile",
  "vm-superio",
 ]
@@ -236,6 +238,8 @@ dependencies = [
  "ignition-arch",
  "libloading",
  "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -246,6 +250,9 @@ dependencies = [
  "ignition-devices",
  "ignition-hvf",
  "log",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -460,6 +467,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

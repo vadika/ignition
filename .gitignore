@@ -4,3 +4,7 @@ target/
 /refs
 **/*.rs.bk
 .DS_Store
+
+# runtime snapshot output
+/snapshot/
+/snapshot.tmp/
