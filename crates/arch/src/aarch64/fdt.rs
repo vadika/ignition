@@ -25,7 +25,8 @@ const IRQ_TYPE_LEVEL_HI: u32 = 4;
 pub struct MmioDev {
     pub addr: u64,
     pub size: u64,
-    /// Bare GIC SPI index (the DT cell value; the kernel adds the 32 offset).
+    /// GIC SPI index as written into the DT interrupts cell (zero-based within
+    /// the SPI bank). Stored verbatim; Linux computes hwirq = this + 32.
     pub irq: u32,
 }
 
@@ -72,6 +73,8 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
 }
 
 fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), vm_fdt::Error> {
+    // Unit-address is the literal "ram" (QEMU virt convention, as FC uses), not
+    // the numeric base; the kernel keys off device_type="memory", not the name.
     let mem = fdt.begin_node("memory@ram")?;
     fdt.property_string("device_type", "memory")?;
     fdt.property_array_u64("reg", &[base, size])?;
@@ -123,6 +126,7 @@ mod tests {
         let root = dt.find_node("/").unwrap();
         assert_eq!(dt_str(root.property("compatible").unwrap().value), "linux,dummy-virt");
         assert_eq!(be_u32s(root.property("#address-cells").unwrap().value), vec![2]);
+        assert_eq!(be_u32s(root.property("interrupt-parent").unwrap().value), vec![1]);
 
         let mem = dt.find_node("/memory@ram").unwrap();
         assert_eq!(dt_str(mem.property("device_type").unwrap().value), "memory");
