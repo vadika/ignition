@@ -11,3 +11,4 @@
 
 pub mod hvf_vcpu;
 pub mod hvf_vm;
+pub mod vcpu_manager;
