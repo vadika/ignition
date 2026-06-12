@@ -1,0 +1,19 @@
+ignition
+Copyright 2026 Vadim Suraev
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file for the full text.
+
+This project is a research fork that ports AWS Firecracker's microVM VMM to
+macOS on Apple Silicon, replacing KVM with Apple's Hypervisor.framework.
+
+It contains and derives from the following Apache-2.0 works:
+
+  - AWS Firecracker — https://github.com/firecracker-microvm/firecracker
+    Copyright Amazon.com, Inc. or its affiliates. Licensed under Apache-2.0.
+
+  - libkrun — https://github.com/containers/libkrun
+    (itself Firecracker-derived) Licensed under Apache-2.0.
+    The Hypervisor.framework backend (the `hvf` crate) is lifted from libkrun.
+
+Portions of the source retain their original copyright and license notices.
