@@ -40,7 +40,8 @@ enum EscState {
 
 /// What the reader thread should do with one input byte.
 enum Action {
-    /// Forward `Action::Forward(buf, len)` — `buf[..len]` — to the guest RX FIFO.
+    /// Forward `Action::Forward(buf, len)` — `buf[..len]` — to the guest RX
+    /// FIFO. `buf[1]` is unused (zero) when `len == 1`.
     Forward([u8; 2], usize),
     /// Ctrl-A consumed; awaiting the next byte. Forward nothing yet.
     Pending,
@@ -48,7 +49,13 @@ enum Action {
     Quit,
 }
 
-/// Advance the escape state machine by one input byte.
+/// Advance the escape state machine by one input byte. The caller forwards
+/// EXACTLY what the returned `Action` says and nothing else:
+/// `Forward(buf, len)` -> write `buf[..len]` to the guest; `Pending` -> write
+/// nothing (the Ctrl-A was consumed and may be re-emitted by a later call);
+/// `Quit` -> stop. The input byte is never forwarded except via the returned
+/// `Action`, so a Ctrl-A held in `SawCtrlA` is emitted only if the next byte
+/// is not an escape.
 fn step(state: &mut EscState, byte: u8) -> Action {
     match state {
         EscState::Normal if byte == CTRL_A => {
