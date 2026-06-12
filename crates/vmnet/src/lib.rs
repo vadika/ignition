@@ -24,10 +24,14 @@ struct RxCtx {
 }
 
 extern "C" fn on_frame(ctx: *mut c_void, data: *const u8, len: usize) {
-    // SAFETY: ctx is the leaked Box<RxCtx>; data/len describe one frame.
-    let ctx = unsafe { &*(ctx as *const RxCtx) };
-    let frame = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-    let _ = ctx.tx.send(frame);
+    // A panic must not unwind into the C caller (UB). Swallow it.
+    // SAFETY: ctx is the leaked Box<RxCtx>; data/len describe one frame,
+    // bounded by the shim's buffer.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*(ctx as *const RxCtx) };
+        let frame = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        let _ = ctx.tx.send(frame);
+    }));
 }
 
 pub struct VmnetBackend {

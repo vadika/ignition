@@ -48,6 +48,7 @@ struct ig_vmnet *ig_vmnet_start(uint8_t mac_out[6], ig_frame_cb cb, void *ctx) {
             dispatch_semaphore_signal(sem);
         });
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    dispatch_release(sem);
     xpc_release(desc);
     if (h->iface == NULL || start_status != VMNET_SUCCESS) {
         free(h);
@@ -66,7 +67,9 @@ struct ig_vmnet *ig_vmnet_start(uint8_t mac_out[6], ig_frame_cb cb, void *ctx) {
                     .vm_pkt_iov = &iov, .vm_pkt_iovcnt = 1, .vm_flags = 0 };
                 int count = 1;
                 if (vmnet_read(h->iface, &pd, &count) != VMNET_SUCCESS || count < 1) break;
-                h->cb(h->ctx, buf, pd.vm_pkt_size);
+                size_t n = pd.vm_pkt_size;
+                if (n > sizeof(buf)) n = sizeof(buf); // defensive: never exceed the buffer
+                h->cb(h->ctx, buf, n);
             }
         });
     return h;
