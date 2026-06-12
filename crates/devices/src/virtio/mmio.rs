@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::bus::BusDevice;
 
 use super::IrqLine;
@@ -50,6 +52,31 @@ struct QueueState {
     device_lo: u32,
     device_hi: u32,
     vq: Option<Virtqueue>,
+}
+
+/// Serializable snapshot of a single virtqueue's driver-programmed state and ring indices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueSnapshot {
+    pub num: u16,
+    pub ready: u32,
+    pub desc_lo: u32,
+    pub desc_hi: u32,
+    pub driver_lo: u32,
+    pub driver_hi: u32,
+    pub device_lo: u32,
+    pub device_hi: u32,
+    pub last_avail: u16,
+    pub used: u16,
+}
+
+/// Serializable snapshot of the full virtio-mmio transport state (registers + queues).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtioMmioState {
+    pub status: u32,
+    pub queue_sel: u32,
+    pub device_features_sel: u32,
+    pub interrupt_status: u32,
+    pub queues: Vec<QueueSnapshot>,
 }
 
 /// A virtio-mmio transport hosting one `VirtioDevice`.
@@ -211,6 +238,64 @@ impl VirtioMmio {
     }
 }
 
+impl VirtioMmio {
+    /// Capture the transport register + queue state for snapshot.
+    pub fn save(&self) -> VirtioMmioState {
+        let queues = self
+            .queues
+            .iter()
+            .map(|q| {
+                let (la, u) = q.vq.as_ref().map_or((0, 0), |vq| vq.indices());
+                QueueSnapshot {
+                    num: q.num,
+                    ready: q.ready,
+                    desc_lo: q.desc_lo,
+                    desc_hi: q.desc_hi,
+                    driver_lo: q.driver_lo,
+                    driver_hi: q.driver_hi,
+                    device_lo: q.device_lo,
+                    device_hi: q.device_hi,
+                    last_avail: la,
+                    used: u,
+                }
+            })
+            .collect();
+        VirtioMmioState {
+            status: self.status,
+            queue_sel: self.queue_sel,
+            device_features_sel: self.device_features_sel,
+            interrupt_status: self.interrupt_status,
+            queues,
+        }
+    }
+
+    /// Restore transport register + queue state from a snapshot.
+    pub fn restore(&mut self, s: &VirtioMmioState) {
+        self.status = s.status;
+        self.queue_sel = s.queue_sel;
+        self.device_features_sel = s.device_features_sel;
+        self.interrupt_status = s.interrupt_status;
+        for (q, snap) in self.queues.iter_mut().zip(&s.queues) {
+            q.num = snap.num;
+            q.ready = snap.ready;
+            q.desc_lo = snap.desc_lo;
+            q.desc_hi = snap.desc_hi;
+            q.driver_lo = snap.driver_lo;
+            q.driver_hi = snap.driver_hi;
+            q.device_lo = snap.device_lo;
+            q.device_hi = snap.device_hi;
+            if snap.ready != 0 {
+                let desc = (u64::from(snap.desc_hi) << 32) | u64::from(snap.desc_lo);
+                let driver = (u64::from(snap.driver_hi) << 32) | u64::from(snap.driver_lo);
+                let device = (u64::from(snap.device_hi) << 32) | u64::from(snap.device_lo);
+                let mut vq = Virtqueue::new(snap.num, desc, driver, device);
+                vq.set_indices(snap.last_avail, snap.used);
+                q.vq = Some(vq);
+            }
+        }
+    }
+}
+
 impl BusDevice for VirtioMmio {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         // Config space is byte-addressable (any width); registers are 32-bit.
@@ -345,5 +430,21 @@ mod tests {
         wr(&mut d, 0x064, 1);
         assert_eq!(rd(&mut d, 0x060), 0);
         assert_eq!(*irq.0.lock().unwrap().last().unwrap(), false);
+    }
+
+    #[test]
+    fn virtio_mmio_state_round_trips() {
+        let mut backing = vec![0u8; 0x6000];
+        let irq = Arc::new(FakeIrq::default());
+        let mut d = dev(&mut backing, irq);
+        // Set queue 0: num=8, desc_lo=0x1000, ready=1
+        wr(&mut d, 0x080, 0x1000); // QueueDescLow
+        wr(&mut d, 0x038, 8); // QueueNum
+        wr(&mut d, 0x044, 1); // QueueReady
+        let st = d.save();
+        let mut backing2 = vec![0u8; 0x6000];
+        let mut d2 = dev(&mut backing2, Arc::new(FakeIrq::default()));
+        d2.restore(&st);
+        assert_eq!(d2.save(), st); // round-trips
     }
 }

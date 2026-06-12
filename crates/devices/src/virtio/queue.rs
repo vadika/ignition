@@ -80,6 +80,17 @@ impl Virtqueue {
         Some(DescChain { head, descriptors })
     }
 
+    /// Returns `(last_avail_idx, used_idx)` — the consumer/producer positions, for snapshots.
+    pub fn indices(&self) -> (u16, u16) {
+        (self.last_avail_idx, self.used_idx)
+    }
+
+    /// Restore the positions onto a queue rebuilt from the same ring addresses.
+    pub fn set_indices(&mut self, last_avail: u16, used: u16) {
+        self.last_avail_idx = last_avail;
+        self.used_idx = used;
+    }
+
     /// Append a used element and publish it (the `idx` store happens last).
     ///
     /// used ring layout: `{flags: u16, idx: u16, ring: [{id: u32, len: u32}; size]}`.
