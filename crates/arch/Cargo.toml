@@ -10,3 +10,9 @@ license = "Apache-2.0"
 [lib]
 name = "arch"
 path = "src/lib.rs"
+
+[dependencies]
+vm-fdt = "0.3"
+
+[dev-dependencies]
+fdt = "0.1"
