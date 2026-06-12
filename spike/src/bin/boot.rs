@@ -23,7 +23,7 @@ use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use hvf::gic::HvfGicV3;
-use vmm::vstate::vcpu_manager::VcpuManager;
+use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
 
 const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
@@ -216,6 +216,7 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
     // Parse `--smp N` (default 1, capped at 8); kernel/rootfs stay positional.
+    // Cap matches the FDT/GIC sizing we exercise; raise if a guest needs more.
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
     let mut positionals: Vec<String> = Vec::new();
@@ -230,6 +231,10 @@ fn main() {
                     .expect("--smp value must be a number");
                 assert!((1..=MAX_VCPUS).contains(&n), "--smp must be 1..={MAX_VCPUS}");
                 smp = n;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown flag: {other}");
+                process::exit(2);
             }
             other => positionals.push(other.to_string()),
         }
@@ -283,7 +288,7 @@ fn main() {
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
         mem_size: RAM_SIZE,
-        cpu_mpidrs: (0..smp).map(vmm::vstate::vcpu_manager::mpidr_for).collect(),
+        cpu_mpidrs: (0..smp).map(mpidr_for).collect(),
         cmdline: layout::default_cmdline(),
         devices: fdt_devices,
         gic: gic.fdt_info(),
