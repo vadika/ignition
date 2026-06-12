@@ -23,6 +23,7 @@ impl Trigger for NoopTrigger {
 
 /// MMIO 16550 UART writing to sink `W` (e.g. `io::Stdout`, or a captured
 /// buffer in tests).
+#[derive(Debug)]
 pub struct Serial<W: Write + Send> {
     inner: vm_superio::Serial<NoopTrigger, NoEvents, W>,
 }
@@ -37,12 +38,18 @@ impl<W: Write + Send> BusDevice for Serial<W> {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         if let (Ok(off), 1) = (u8::try_from(offset), data.len()) {
             data[0] = self.inner.read(off);
+        } else {
+            log::warn!("serial: ignored read (offset={offset:#x}, len={})", data.len());
         }
     }
 
     fn write(&mut self, _base: u64, offset: u64, data: &[u8]) {
         if let (Ok(off), 1) = (u8::try_from(offset), data.len()) {
-            let _ = self.inner.write(off, data[0]);
+            if let Err(e) = self.inner.write(off, data[0]) {
+                log::warn!("serial: write error at offset {off:#x}: {e}");
+            }
+        } else {
+            log::warn!("serial: ignored write (offset={offset:#x}, len={})", data.len());
         }
     }
 }
