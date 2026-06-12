@@ -97,6 +97,16 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), vm_fdt::E
     Ok(())
 }
 
+fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), vm_fdt::Error> {
+    // Unit-address is the literal "ram" (QEMU virt convention, as FC uses), not
+    // the numeric base; the kernel keys off device_type="memory", not the name.
+    let mem = fdt.begin_node("memory@ram")?;
+    fdt.property_string("device_type", "memory")?;
+    fdt.property_array_u64("reg", &[base, size])?;
+    fdt.end_node(mem)?;
+    Ok(())
+}
+
 fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -133,7 +143,7 @@ fn create_gic_node(fdt: &mut FdtWriter, gic: &GicInfo) -> Result<(), vm_fdt::Err
 fn create_clock_node(fdt: &mut FdtWriter) -> Result<(), vm_fdt::Error> {
     let clock = fdt.begin_node("apb-pclk")?;
     fdt.property_string("compatible", "fixed-clock")?;
-    fdt.property_u32("#clock-cells", 0x0)?;
+    fdt.property_u32("#clock-cells", 0)?;
     fdt.property_u32("clock-frequency", 24_000_000)?;
     fdt.property_string("clock-output-names", "clk24mhz")?;
     fdt.property_u32("phandle", CLOCK_PHANDLE)?;
@@ -145,7 +155,7 @@ fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), vm_fdt::Error> {
     // Fixed PPIs for the arm,armv8-timer (secure/non-secure/virtual/hyp).
     let irqs = [13u32, 14, 11, 10];
     let mut cells = Vec::with_capacity(irqs.len() * 3);
-    for &irq in irqs.iter() {
+    for irq in irqs {
         cells.push(IRQ_TYPE_PPI);
         cells.push(irq);
         cells.push(IRQ_TYPE_LEVEL_HI);
@@ -178,16 +188,6 @@ fn create_serial_node(fdt: &mut FdtWriter, serial: &MmioDev) -> Result<(), vm_fd
         &[IRQ_TYPE_SPI, serial.irq, IRQ_TYPE_EDGE_RISING],
     )?;
     fdt.end_node(uart)?;
-    Ok(())
-}
-
-fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), vm_fdt::Error> {
-    // Unit-address is the literal "ram" (QEMU virt convention, as FC uses), not
-    // the numeric base; the kernel keys off device_type="memory", not the name.
-    let mem = fdt.begin_node("memory@ram")?;
-    fdt.property_string("device_type", "memory")?;
-    fdt.property_array_u64("reg", &[base, size])?;
-    fdt.end_node(mem)?;
     Ok(())
 }
 
@@ -298,6 +298,7 @@ mod tests {
             vec![0x0800_0000, 0x1_0000, 0x080A_0000, 0xC_0000]
         );
         assert_eq!(be_u32s(intc.property("phandle").unwrap().value), vec![1]);
+        assert_eq!(be_u32s(intc.property("interrupts").unwrap().value), vec![1, 9, 4]);
     }
 
     #[test]
@@ -332,5 +333,15 @@ mod tests {
         assert_eq!(be_u32s(uart.property("clocks").unwrap().value), vec![2]);
         // [SPI, irq, EDGE_RISING]
         assert_eq!(be_u32s(uart.property("interrupts").unwrap().value), vec![0, 33, 1]);
+    }
+
+    #[test]
+    fn clock_node_is_24mhz_fixed() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let clk = dt.find_node("/apb-pclk").unwrap();
+        assert_eq!(dt_str(clk.property("compatible").unwrap().value), "fixed-clock");
+        assert_eq!(be_u32s(clk.property("clock-frequency").unwrap().value), vec![24_000_000]);
+        assert_eq!(be_u32s(clk.property("phandle").unwrap().value), vec![2]);
     }
 }
