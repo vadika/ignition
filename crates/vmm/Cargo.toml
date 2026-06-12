@@ -14,3 +14,8 @@ hvf = { package = "ignition-hvf", path = "../hvf" }
 arch = { package = "ignition-arch", path = "../arch" }
 devices = { package = "ignition-devices", path = "../devices" }
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

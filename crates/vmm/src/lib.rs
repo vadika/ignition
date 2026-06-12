@@ -10,4 +10,5 @@
 // device manager / MMIO bus still need to be lifted from libkrun's
 // `macos/vstate.rs` and Firecracker's `device_manager` in Phase 1.
 
+pub mod snapshot;
 pub mod vstate;
