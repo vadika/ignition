@@ -14,15 +14,23 @@ pub trait BusDevice: Send {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BusError {
     /// The requested range overlaps an already-registered device.
-    Overlap { base: u64, len: u64 },
+    Overlap {
+        base: u64,
+        len: u64,
+        existing_base: u64,
+        existing_len: u64,
+    },
 }
 
 impl std::fmt::Display for BusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BusError::Overlap { base, len } => {
-                write!(f, "MMIO range [{base:#x}, {:#x}) overlaps a registered device", base + len)
-            }
+            BusError::Overlap { base, len, existing_base, existing_len } => write!(
+                f,
+                "MMIO range [{base:#x}, {:#x}) overlaps registered [{existing_base:#x}, {:#x})",
+                base.saturating_add(*len),
+                existing_base.saturating_add(*existing_len),
+            ),
         }
     }
 }
@@ -54,11 +62,15 @@ impl Bus {
     ) -> Result<(), BusError> {
         // Two half-open ranges [a, a+alen) and [b, b+blen) overlap iff
         // a < b+blen and b < a+alen.
-        let overlaps = self.devices.iter().any(|(b, blen, _)| {
+        if let Some((existing_base, existing_len, _)) = self.devices.iter().find(|(b, blen, _)| {
             base < b.saturating_add(*blen) && *b < base.saturating_add(len)
-        });
-        if overlaps {
-            return Err(BusError::Overlap { base, len });
+        }) {
+            return Err(BusError::Overlap {
+                base,
+                len,
+                existing_base: *existing_base,
+                existing_len: *existing_len,
+            });
         }
         self.devices.push((base, len, dev));
         Ok(())
@@ -141,7 +153,10 @@ mod tests {
         bus.register(0x1000, 0x100, a).unwrap();
         // [0x1080, 0x10C0) overlaps [0x1000, 0x1100).
         let err = bus.register(0x1080, 0x40, b).unwrap_err();
-        assert_eq!(err, BusError::Overlap { base: 0x1080, len: 0x40 });
+        assert_eq!(
+            err,
+            BusError::Overlap { base: 0x1080, len: 0x40, existing_base: 0x1000, existing_len: 0x100 }
+        );
     }
 
     #[test]
