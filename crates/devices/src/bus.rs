@@ -10,12 +10,15 @@ pub trait BusDevice: Send {
     fn write(&mut self, _base: u64, _offset: u64, _data: &[u8]) {}
 }
 
+/// A registered device and the guest-physical range it occupies.
+type BusEntry = (u64, u64, Arc<Mutex<dyn BusDevice>>); // (base, len, device)
+
 /// Address-routed collection of MMIO devices. Ranges are assumed
 /// non-overlapping. `read`/`write` take `&self` (devices carry their own
 /// `Mutex`), so a fully-built `Bus` can be shared as `Arc<Bus>` across threads.
 #[derive(Default)]
 pub struct Bus {
-    devices: Vec<(u64, u64, Arc<Mutex<dyn BusDevice>>)>, // (base, len, device)
+    devices: Vec<BusEntry>,
 }
 
 impl Bus {
@@ -28,6 +31,7 @@ impl Bus {
     }
 
     fn find(&self, addr: u64) -> Option<(u64, &Arc<Mutex<dyn BusDevice>>)> {
+        // Linear scan is fine at this device count; revisit if the table grows.
         self.devices
             .iter()
             .find(|(base, len, _)| addr.checked_sub(*base).is_some_and(|off| off < *len))
