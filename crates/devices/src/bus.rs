@@ -30,7 +30,7 @@ impl Bus {
     fn find(&self, addr: u64) -> Option<(u64, &Arc<Mutex<dyn BusDevice>>)> {
         self.devices
             .iter()
-            .find(|(base, len, _)| addr >= *base && addr < base + len)
+            .find(|(base, len, _)| addr.checked_sub(*base).is_some_and(|off| off < *len))
             .map(|(base, _, dev)| (*base, dev))
     }
 
@@ -92,5 +92,6 @@ mod tests {
         bus.write(0xdead, &[1]); // must not panic
         let mut b = [0u8; 1];
         bus.read(0xbeef, &mut b); // must not panic
+        assert_eq!(b[0], 0, "read miss must not write the buffer");
     }
 }
