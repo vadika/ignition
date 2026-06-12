@@ -8,6 +8,7 @@
 #[allow(non_upper_case_globals)]
 #[allow(deref_nullptr)]
 pub mod bindings;
+pub mod gic;
 
 #[macro_use]
 extern crate log;
@@ -118,6 +119,7 @@ pub enum Error {
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
     VmCreate,
+    GicCreate,
 }
 
 impl Display for Error {
@@ -147,6 +149,7 @@ impl Display for Error {
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
+            GicCreate => write!(f, "Error creating in-kernel HVF GIC"),
         }
     }
 }

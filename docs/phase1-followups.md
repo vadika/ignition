@@ -24,6 +24,29 @@ all matter once a real aarch64 Linux kernel boots.
   at 1–2 devices. When GIC + virtio land, have `register` return a `Result` with
   an overlap check before the device table grows.
 
+## GIC (milestone 2b) — confirmed facts for 2d integration
+
+- **`hv_gic_set_spi` takes the ABSOLUTE GIC INTID** (SPI = `32 + spi_index`),
+  confirmed by the gic-smoke run: `set_spi(32, true/false)` succeeded. So the
+  serial's FDT `irq` (bare SPI index, e.g. 33) must be passed to `set_spi` as
+  `32 + irq` when wiring the 16550 IRQ in 2d.
+- **Create order works:** `hv_vm_create` → `HvfGicV3::new` (no vCPU yet) is
+  accepted. 2d must create the GIC before spawning vCPU threads.
+- **HVF-reported sizes (macOS 26, Apple Silicon):** distributor `0x10000`,
+  redistributor `0x20000` per vCPU. `HvfGicV3::new(1, 0x4000_0000)` placed
+  dist=`0x3ffd0000`, redist=`0x3ffe0000` — valid IPAs below the MMIO window.
+- **`hv_gic_config_t` is leaked** (retained OS object, never `os_release`d) —
+  matches `hv_vm_config_t`. Fine at process scope; add a Drop wrapper if GICs
+  ever become dynamic.
+- **`set_spi` reuses `Error::GicCreate`** on failure (single-variant choice).
+  When `set_spi` moves onto the hot IRQ-injection path in 2d, split out
+  `Error::GicSetSpi` — the "creating GIC" Display string misleads for a runtime
+  injection failure.
+- **`HvfGicV3::new(vcpu_count, gic_top)`**: `gic_top` = the address the GIC sits
+  just below (in the smoke, guest RAM base `0x4000_0000`). When the 2c layout
+  module lands, pass the real value (likely RAM base) — not the serial MMIO
+  address.
+
 ## FDT interface (milestone 2a) — evolve as consumers land
 
 - **`GicInfo` models a single redistributor region** (`redist_base`/`redist_size`
