@@ -48,8 +48,12 @@ pub struct VcpuManager {
     snapshot_req: AtomicBool,
     /// Installed by the boot harness before `run`; called on the vCPU thread when
     /// `snapshot_req` fires. Single-vCPU only (asserted at install time).
-    snapshot_handler: Option<Box<dyn Fn(&HvfVcpu) + Send + Sync>>,
+    snapshot_handler: Option<SnapshotHandler>,
 }
+
+/// A snapshot handler: runs on the vCPU thread at a `Canceled` exit to capture and
+/// write the snapshot. Reads the vCPU's state via the passed `&HvfVcpu`.
+type SnapshotHandler = Box<dyn Fn(&HvfVcpu) + Send + Sync>;
 
 impl VcpuManager {
     /// Create a manager for `vcpu_count` cpus (MPIDRs `mpidr_for(0..vcpu_count)`).

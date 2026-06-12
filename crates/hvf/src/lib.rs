@@ -674,7 +674,7 @@ impl HvfVcpu<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let sysregs = SAVED_SYSREGS
             .iter()
-            .map(|&r| Ok((r as u32, self.read_sys_reg(r as u16)?)))
+            .map(|&r| Ok((r as u32, self.read_sys_reg(r)?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let mut vtimer_mask = false;
         let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut vtimer_mask) };
