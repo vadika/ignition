@@ -115,7 +115,10 @@ impl TermiosGuard {
             t.c_iflag &= !(libc::IXON | libc::ICRNL);
             t.c_cc[libc::VMIN] = 1;
             t.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+            // TCSAFLUSH: apply on entry after draining any buffered type-ahead.
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &t) != 0 {
+                return Self { original: None };
+            }
             Self { original: Some(original) }
         }
     }
