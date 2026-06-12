@@ -16,6 +16,10 @@ path = "src/bin/uart-echo.rs"
 name = "gic-smoke"
 path = "src/bin/gic-smoke.rs"
 
+[[bin]]
+name = "boot"
+path = "src/bin/boot.rs"
+
 [dependencies]
 hvf = { package = "ignition-hvf", path = "../crates/hvf" }
 log = "0.4"
