@@ -9,7 +9,8 @@ use crate::Error;
 use crate::bindings::{
     HV_SUCCESS, hv_gic_config_create, hv_gic_config_set_distributor_base,
     hv_gic_config_set_redistributor_base, hv_gic_create, hv_gic_get_distributor_size,
-    hv_gic_get_redistributor_size, hv_gic_set_spi,
+    hv_gic_get_redistributor_size, hv_gic_set_spi, hv_gic_set_state, hv_gic_state_create,
+    hv_gic_state_get_data, hv_gic_state_get_size,
 };
 
 /// The maintenance interrupt PPI for GICv3 (matches FC/libkrun).
@@ -95,5 +96,88 @@ impl HvfGicV3 {
         } else {
             Ok(())
         }
+    }
+
+    /// Capture the in-kernel GIC state as an opaque blob (for snapshot).
+    pub fn save_state(&self) -> Result<Vec<u8>, Error> {
+        // SAFETY: the state object is created, queried for size, copied out, and
+        // dropped within this call.
+        unsafe {
+            let state = hv_gic_state_create();
+            if state.is_null() {
+                return Err(Error::GicCreate);
+            }
+            let mut size: usize = 0;
+            if hv_gic_state_get_size(state, &mut size) != HV_SUCCESS {
+                return Err(Error::GicCreate);
+            }
+            let mut buf = vec![0u8; size];
+            if hv_gic_state_get_data(state, buf.as_mut_ptr() as *mut _) != HV_SUCCESS {
+                return Err(Error::GicCreate);
+            }
+            Ok(buf)
+        }
+    }
+
+    /// Restore the in-kernel GIC from a snapshot blob and return a usable
+    /// `HvfGicV3` handle (for `set_spi`/`fdt_info` on the restore path).
+    ///
+    /// # Restore mechanism
+    ///
+    /// `hv_gic_set_state` is expected to reconstruct the full in-kernel GIC
+    /// (including its interrupt state) WITHOUT a preceding `hv_gic_create` call —
+    /// the state blob encodes all configuration. The placement fields (`dist_base`,
+    /// `redist_base`, sizes) are recomputed from the same `vcpu_count`/`gic_top`
+    /// values used at create time so that `set_spi` and `fdt_info` work after
+    /// restore.
+    ///
+    /// If HVF turns out to require an explicit `hv_gic_create` before
+    /// `hv_gic_set_state`, the restore path should call `HvfGicV3::new(vcpu_count,
+    /// gic_top)` followed by `gic_restore(blob)` instead. At the time of writing
+    /// (macOS 26 / Hypervisor.framework), `hv_gic_set_state` alone is the expected
+    /// path (matching Apple's documented snapshot API pattern).
+    ///
+    /// MUST be called after `hv_vm_create` and before any vCPU is created.
+    pub fn from_state(blob: &[u8], vcpu_count: u64, gic_top: u64) -> Result<Self, Error> {
+        // Recompute placement using the same arithmetic as `new`.
+        let mut dist_size: usize = 0;
+        let ret = unsafe { hv_gic_get_distributor_size(&mut dist_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+        let dist_size = dist_size as u64;
+
+        let mut redist_each: usize = 0;
+        let ret = unsafe { hv_gic_get_redistributor_size(&mut redist_each) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+        let redist_size = redist_each as u64 * vcpu_count;
+
+        let redist_base = gic_top.checked_sub(redist_size).ok_or(Error::GicCreate)?;
+        let dist_base = redist_base.checked_sub(dist_size).ok_or(Error::GicCreate)?;
+
+        // Restore the in-kernel GIC state (replaces hv_gic_create on the restore path).
+        let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
+        if ret != HV_SUCCESS {
+            return Err(Error::GicCreate);
+        }
+
+        Ok(Self { dist_base, dist_size, redist_base, redist_size })
+    }
+}
+
+/// Restore the in-kernel GIC from a snapshot blob. Call after `hv_vm_create` and
+/// before any vCPU is created (replaces `HvfGicV3::new`'s create path).
+///
+/// Prefer `HvfGicV3::from_state` for restore paths that also need `set_spi` or
+/// `fdt_info` — this free function is provided for callers that only need to
+/// restore GIC hardware state and manage the `HvfGicV3` handle separately.
+pub fn gic_restore(blob: &[u8]) -> Result<(), Error> {
+    let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
+    if ret != HV_SUCCESS {
+        Err(Error::GicCreate)
+    } else {
+        Ok(())
     }
 }

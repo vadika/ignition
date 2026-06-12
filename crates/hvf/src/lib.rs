@@ -14,6 +14,7 @@ pub mod gic;
 extern crate log;
 
 use bindings::*;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
@@ -22,6 +23,51 @@ use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+/// The sysregs captured for snapshot/restore (EL1 guest-resume set + the EL2 regs
+/// set at boot + the generic timer). MPIDR_EL1 is set at vCPU create, not here.
+const SAVED_SYSREGS: &[hv_sys_reg_t] = &[
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1, hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1, hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1, hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1, hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1, hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1, hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0, hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0, hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1, hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1, hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0, hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1, hv_sys_reg_t_HV_SYS_REG_CNTP_CTL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTP_CVAL_EL0,
+];
+
+/// GP registers captured: X0..X30, PC, CPSR (33 entries, in this order).
+/// SP_EL0/EL1 are captured as sysregs. X29=FP, X30=LR.
+const SAVED_GP: &[hv_reg_t] = &[
+    hv_reg_t_HV_REG_X0,  hv_reg_t_HV_REG_X1,  hv_reg_t_HV_REG_X2,  hv_reg_t_HV_REG_X3,
+    hv_reg_t_HV_REG_X4,  hv_reg_t_HV_REG_X5,  hv_reg_t_HV_REG_X6,  hv_reg_t_HV_REG_X7,
+    hv_reg_t_HV_REG_X8,  hv_reg_t_HV_REG_X9,  hv_reg_t_HV_REG_X10, hv_reg_t_HV_REG_X11,
+    hv_reg_t_HV_REG_X12, hv_reg_t_HV_REG_X13, hv_reg_t_HV_REG_X14, hv_reg_t_HV_REG_X15,
+    hv_reg_t_HV_REG_X16, hv_reg_t_HV_REG_X17, hv_reg_t_HV_REG_X18, hv_reg_t_HV_REG_X19,
+    hv_reg_t_HV_REG_X20, hv_reg_t_HV_REG_X21, hv_reg_t_HV_REG_X22, hv_reg_t_HV_REG_X23,
+    hv_reg_t_HV_REG_X24, hv_reg_t_HV_REG_X25, hv_reg_t_HV_REG_X26, hv_reg_t_HV_REG_X27,
+    hv_reg_t_HV_REG_X28, hv_reg_t_HV_REG_X29, hv_reg_t_HV_REG_X30,
+    hv_reg_t_HV_REG_PC,  hv_reg_t_HV_REG_CPSR,
+];
+
+/// Serializable vCPU state for snapshot/restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcpuState {
+    /// One value per `SAVED_GP` entry, in order.
+    pub gp: Vec<u64>,
+    /// (hv_sys_reg_t as u32, value) per `SAVED_SYSREGS` entry.
+    pub sysregs: Vec<(u32, u64)>,
+    pub vtimer_mask: bool,
+    pub vtimer_offset: u64,
+}
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
@@ -565,6 +611,58 @@ impl HvfVcpu<'_> {
         }
     }
 
+    fn write_sys_reg(&self, reg: u16, val: u64) -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_sys_reg(self.vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetSystemRegister(reg, val))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Capture all snapshot state. MUST be called on the vCPU's own thread.
+    pub fn save_state(&self) -> Result<VcpuState, Error> {
+        let gp = SAVED_GP
+            .iter()
+            .map(|&r| self.read_reg(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sysregs = SAVED_SYSREGS
+            .iter()
+            .map(|&r| Ok((r as u32, self.read_sys_reg(r as u16)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut vtimer_mask = false;
+        let ret = unsafe { hv_vcpu_get_vtimer_mask(self.vcpuid, &mut vtimer_mask) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        let mut vtimer_offset = 0u64;
+        let ret = unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut vtimer_offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        Ok(VcpuState { gp, sysregs, vtimer_mask, vtimer_offset })
+    }
+
+    /// Restore all snapshot state onto a freshly-created vCPU. MUST run on the
+    /// vCPU's own thread, before the first `run()`.
+    pub fn restore_state(&self, s: &VcpuState) -> Result<(), Error> {
+        for (r, v) in SAVED_GP.iter().zip(&s.gp) {
+            self.write_reg(*r, *v)?;
+        }
+        for &(r, v) in &s.sysregs {
+            self.write_sys_reg(r as u16, v)?;
+        }
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, s.vtimer_offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        let ret = unsafe { hv_vcpu_set_vtimer_mask(self.vcpuid, s.vtimer_mask) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetVtimerMask);
+        }
+        Ok(())
+    }
+
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
         if !self.vtimer_masked {
             return;
@@ -825,5 +923,23 @@ mod error_tests {
             Error::GicCreate.to_string(),
             "GicSetSpi must not reuse the GicCreate message"
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::VcpuState;
+
+    #[test]
+    fn vcpu_state_round_trips() {
+        let s = VcpuState {
+            gp: (0..33).collect(),
+            sysregs: vec![(1, 0xaaaa), (2, 0xbbbb)],
+            vtimer_mask: true,
+            vtimer_offset: 0x1234,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: VcpuState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
     }
 }

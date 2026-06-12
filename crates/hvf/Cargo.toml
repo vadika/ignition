@@ -14,3 +14,7 @@ path = "src/lib.rs"
 libloading = "0.8"
 log = "0.4"
 arch = { package = "ignition-arch", path = "../arch" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
