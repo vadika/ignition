@@ -25,8 +25,10 @@ pub trait VirtioDevice: Send {
     /// transport adds VIRTIO_F_VERSION_1 (bit 32) itself, so return only this
     /// device's own bits.
     fn device_features(&self, sel: u32) -> u32;
-    /// Read a 32-bit word of device config space at `offset` (relative to 0x100).
-    fn config_read(&self, offset: u64) -> u32;
+    /// Fill `data` from device config space at `offset` (relative to 0x100),
+    /// little-endian. The guest reads config at arbitrary widths (Linux reads the
+    /// 6-byte virtio-net MAC byte-by-byte), so this must serve any `data.len()`.
+    fn config_read(&self, offset: u64, data: &mut [u8]);
     fn queue_count(&self) -> usize;
     /// Service a QueueNotify on `queue_idx`. Returns true if any buffer was used.
     fn handle_notify(&mut self, queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool;
@@ -96,7 +98,8 @@ impl VirtioMmio {
             0x060 => self.interrupt_status,
             0x070 => self.status,
             0x0fc => 0,
-            off if off >= 0x100 => self.dev.config_read(off - 0x100),
+            // Config space (>= 0x100) is byte-addressable and served in
+            // BusDevice::read, not here (it handles non-32-bit widths).
             _ => 0,
         }
     }
@@ -210,10 +213,13 @@ impl VirtioMmio {
 
 impl BusDevice for VirtioMmio {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
-        if data.len() == 4 {
+        // Config space is byte-addressable (any width); registers are 32-bit.
+        if offset >= 0x100 {
+            self.dev.config_read(offset - 0x100, data);
+        } else if data.len() == 4 {
             data.copy_from_slice(&self.read_reg(offset).to_le_bytes());
         } else {
-            log::warn!("virtio-mmio: non-32-bit read at {offset:#x} len {}", data.len());
+            log::warn!("virtio-mmio: non-32-bit register read at {offset:#x} len {}", data.len());
         }
     }
 

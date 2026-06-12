@@ -145,11 +145,12 @@ impl VirtioDevice for VirtioBlk {
     fn device_features(&self, _sel: u32) -> u32 {
         0 // only VIRTIO_F_VERSION_1, added by the transport
     }
-    fn config_read(&self, offset: u64) -> u32 {
-        match offset {
-            0 => (self.capacity_sectors() & 0xffff_ffff) as u32,
-            4 => (self.capacity_sectors() >> 32) as u32,
-            _ => 0,
+    fn config_read(&self, offset: u64, data: &mut [u8]) {
+        // virtio-blk config: bytes 0..8 = capacity in sectors (u64 LE).
+        let cfg = self.capacity_sectors().to_le_bytes();
+        let off = offset as usize;
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = cfg.get(off + i).copied().unwrap_or(0);
         }
     }
     fn queue_count(&self) -> usize {

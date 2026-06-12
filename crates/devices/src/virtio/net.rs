@@ -77,19 +77,18 @@ impl<B: NetBackend> VirtioDevice for VirtioNet<B> {
     fn device_features(&self, sel: u32) -> u32 {
         if sel == 0 { 1 << VIRTIO_NET_F_MAC } else { 0 }
     }
-    fn config_read(&self, offset: u64) -> u32 {
-        // Config space: bytes 0..6 = MAC, 6..8 = status (link up). Word-addressed.
+    fn config_read(&self, offset: u64, data: &mut [u8]) {
+        // virtio-net config: bytes 0..6 = MAC, 6..8 = status. The Linux driver
+        // reads the MAC byte-by-byte, so serve any width from this 8-byte image.
         let mut cfg = [0u8; 8];
         cfg[..6].copy_from_slice(&self.mac);
-        // status = VIRTIO_NET_S_LINK_UP (1) — only meaningful if F_STATUS negotiated
-        // (it isn't), but harmless to expose.
+        // VIRTIO_NET_S_LINK_UP (1) — only read if F_STATUS is negotiated (it isn't);
+        // harmless to expose.
         cfg[6] = 1;
         let off = offset as usize;
-        let mut word = [0u8; 4];
-        for (i, b) in word.iter_mut().enumerate() {
-            *b = *cfg.get(off + i).unwrap_or(&0);
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = cfg.get(off + i).copied().unwrap_or(0);
         }
-        u32::from_le_bytes(word)
     }
     fn queue_count(&self) -> usize {
         2 // RX = 0, TX = 1
@@ -169,8 +168,14 @@ mod tests {
         assert_eq!(net.device_id(), 1);
         assert_eq!(net.queue_count(), 2);
         assert_eq!(net.device_features(0) & (1 << VIRTIO_NET_F_MAC), 1 << VIRTIO_NET_F_MAC);
-        // config offset 0 = MAC[0..4] little-endian as the device exposes it.
-        assert_eq!(net.config_read(0), u32::from_le_bytes([0x52, 0x54, 0x00, 0x12]));
+        // The full MAC is served, including byte-by-byte reads (as Linux does).
+        let mut mac = [0u8; 6];
+        net.config_read(0, &mut mac);
+        assert_eq!(mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        // Single-byte read at offset 3 returns MAC[3] (the path that was broken).
+        let mut one = [0u8; 1];
+        net.config_read(3, &mut one);
+        assert_eq!(one[0], 0x12);
     }
 
     #[test]
