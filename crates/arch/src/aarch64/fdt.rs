@@ -76,14 +76,15 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
 
 fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), vm_fdt::Error> {
     let cpus = fdt.begin_node("cpus")?;
-    fdt.property_u32("#address-cells", 0x02)?;
-    fdt.property_u32("#size-cells", 0x0)?;
+    fdt.property_u32("#address-cells", 2)?;
+    fdt.property_u32("#size-cells", 0)?; // cpu nodes have no size/ranges
     for (i, mpidr) in mpidrs.iter().enumerate() {
         let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
         fdt.property_string("enable-method", "psci")?;
-        // First 24 bits of MPIDR (affinity).
+        // Low 23 bits of MPIDR (matches FC/libkrun; covers Aff0-Aff2 for the
+        // small, linear MPIDRs we assign — Aff2 bit 23 is always 0 here).
         fdt.property_u64("reg", mpidr & 0x7F_FFFF)?;
         fdt.end_node(cpu)?;
     }
@@ -182,6 +183,7 @@ mod tests {
         assert_eq!(be_u64s(cpu0.property("reg").unwrap().value), vec![0x0]);
 
         let cpu1 = dt.find_node("/cpus/cpu@1").unwrap();
+        assert_eq!(dt_str(cpu1.property("enable-method").unwrap().value), "psci");
         assert_eq!(be_u64s(cpu1.property("reg").unwrap().value), vec![0x1]);
     }
 
