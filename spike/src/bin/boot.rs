@@ -294,7 +294,8 @@ fn main() {
     let serial: Arc<Mutex<Serial<FlushWriter>>> =
         Arc::new(Mutex::new(Serial::with_irq(FlushWriter, serial_irq)));
     let serial_bus: Arc<Mutex<dyn BusDevice>> = serial.clone();
-    bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial_bus);
+    bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial_bus)
+        .expect("serial range overlap");
 
     if let Some(path) = &disk_path {
         let file = fs::OpenOptions::new()
@@ -312,7 +313,8 @@ fn main() {
                 guest_ram,
                 Arc::new(GicIrq { gic: gic.clone(), intid: layout::VIRTIO_SPI + 32 }),
             )));
-        bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio);
+        bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio)
+            .expect("virtio range overlap");
         eprintln!("virtio : /dev/vda backed by {path}");
     }
     let bus = Arc::new(bus);

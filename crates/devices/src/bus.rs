@@ -10,12 +10,32 @@ pub trait BusDevice: Send {
     fn write(&mut self, _base: u64, _offset: u64, _data: &[u8]) {}
 }
 
+/// Why a `Bus::register` was rejected.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BusError {
+    /// The requested range overlaps an already-registered device.
+    Overlap { base: u64, len: u64 },
+}
+
+impl std::fmt::Display for BusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BusError::Overlap { base, len } => {
+                write!(f, "MMIO range [{base:#x}, {:#x}) overlaps a registered device", base + len)
+            }
+        }
+    }
+}
+
+impl std::error::Error for BusError {}
+
 /// A registered device and the guest-physical range it occupies.
 type BusEntry = (u64, u64, Arc<Mutex<dyn BusDevice>>); // (base, len, device)
 
-/// Address-routed collection of MMIO devices. Ranges are assumed
-/// non-overlapping. `read`/`write` take `&self` (devices carry their own
-/// `Mutex`), so a fully-built `Bus` can be shared as `Arc<Bus>` across threads.
+/// Address-routed collection of MMIO devices. Ranges are non-overlapping
+/// (enforced by `register`). `read`/`write` take `&self` (devices carry their
+/// own `Mutex`), so a fully-built `Bus` can be shared as `Arc<Bus>` across
+/// threads.
 #[derive(Default)]
 pub struct Bus {
     devices: Vec<BusEntry>,
@@ -26,8 +46,22 @@ impl Bus {
         Self { devices: Vec::new() }
     }
 
-    pub fn register(&mut self, base: u64, len: u64, dev: Arc<Mutex<dyn BusDevice>>) {
+    pub fn register(
+        &mut self,
+        base: u64,
+        len: u64,
+        dev: Arc<Mutex<dyn BusDevice>>,
+    ) -> Result<(), BusError> {
+        // Two half-open ranges [a, a+alen) and [b, b+blen) overlap iff
+        // a < b+blen and b < a+alen.
+        let overlaps = self.devices.iter().any(|(b, blen, _)| {
+            base < b.saturating_add(*blen) && *b < base.saturating_add(len)
+        });
+        if overlaps {
+            return Err(BusError::Overlap { base, len });
+        }
         self.devices.push((base, len, dev));
+        Ok(())
     }
 
     fn find(&self, addr: u64) -> Option<(u64, &Arc<Mutex<dyn BusDevice>>)> {
@@ -75,7 +109,7 @@ mod tests {
     fn write_routes_with_base_and_offset() {
         let rec = Arc::new(Mutex::new(Recorder::default()));
         let mut bus = Bus::new();
-        bus.register(0x1000, 0x100, rec.clone());
+        bus.register(0x1000, 0x100, rec.clone()).unwrap();
         bus.write(0x1004, &[0xab]);
         assert_eq!(rec.lock().unwrap().last_write, Some((0x1000, 0x4, vec![0xab])));
     }
@@ -84,7 +118,7 @@ mod tests {
     fn read_routes_with_offset() {
         let rec = Arc::new(Mutex::new(Recorder { read_val: 0x5a, ..Default::default() }));
         let mut bus = Bus::new();
-        bus.register(0x2000, 0x10, rec.clone());
+        bus.register(0x2000, 0x10, rec.clone()).unwrap();
         let mut buf = [0u8; 1];
         bus.read(0x2008, &mut buf);
         assert_eq!(buf[0], 0x5a);
@@ -97,5 +131,26 @@ mod tests {
         let mut b = [0u8; 1];
         bus.read(0xbeef, &mut b); // must not panic
         assert_eq!(b[0], 0, "read miss must not write the buffer");
+    }
+
+    #[test]
+    fn overlapping_register_is_rejected() {
+        let a = Arc::new(Mutex::new(Recorder::default()));
+        let b = Arc::new(Mutex::new(Recorder::default()));
+        let mut bus = Bus::new();
+        bus.register(0x1000, 0x100, a).unwrap();
+        // [0x1080, 0x10C0) overlaps [0x1000, 0x1100).
+        let err = bus.register(0x1080, 0x40, b).unwrap_err();
+        assert_eq!(err, BusError::Overlap { base: 0x1080, len: 0x40 });
+    }
+
+    #[test]
+    fn adjacent_register_is_allowed() {
+        let a = Arc::new(Mutex::new(Recorder::default()));
+        let b = Arc::new(Mutex::new(Recorder::default()));
+        let mut bus = Bus::new();
+        bus.register(0x1000, 0x100, a).unwrap();
+        // [0x1100, 0x1200) is adjacent, not overlapping.
+        assert!(bus.register(0x1100, 0x100, b).is_ok());
     }
 }

@@ -79,7 +79,8 @@ fn main() {
     let serial: Arc<Mutex<dyn BusDevice>> =
         Arc::new(Mutex::new(Serial::new(SharedSink(captured.clone()))));
     let mut bus = Bus::new();
-    bus.register(SERIAL_BASE, SERIAL_LEN, serial);
+    bus.register(SERIAL_BASE, SERIAL_LEN, serial)
+        .expect("serial range overlap");
     let bus = Arc::new(bus);
 
     // Run the vCPU to shutdown.
