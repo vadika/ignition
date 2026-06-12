@@ -58,6 +58,43 @@ The kernel mounts `/dev/vda` (the first virtio block device) as root and brings
 up a login prompt on the serial console (`ttyS0`). Grow `rootfs.ext4` if you add
 packages (`resize2fs`, after growing the file).
 
+## SMP (multi-vCPU) boot requirements
+
+The kernel is SMP-capable. On arm64 the guest brings up secondary CPUs via
+**PSCI** (`CPU_ON` calls), so the VMM must advertise PSCI in the device tree —
+there is no ACPI/MPParse path on this config.
+
+Kernel side (already enabled in `microvm-kernel-ci-aarch64-6.1.config`, verify
+with `grep -E 'CONFIG_SMP|PSCI' .config`):
+
+- `CONFIG_SMP=y` — multi-processor support.
+- `CONFIG_ARM_PSCI_FW=y` — PSCI firmware driver used to power on secondary CPUs.
+
+VMM side — to boot N vCPUs the hypervisor must:
+
+1. Create N vCPUs and set `vcpu_count` to N in machine-config.
+2. Emit one `/cpus/cpu@<n>` node per vCPU in the FDT, each with
+   `device_type = "cpu"`, the correct `reg` (MPIDR affinity), and
+   `enable-method = "psci"`.
+3. Emit a `/psci` node: `compatible = "arm,psci-0.2"` (or `"arm,psci-1.0"`),
+   `method = "hvc"` (Firecracker/HVF convention), and the standard function-id
+   properties.
+4. Handle the PSCI `CPU_ON` HVC from the guest: start the target vCPU at the
+   entry point + context-id passed in the call. Until the VMM services
+   `CPU_ON`, secondaries stay parked and the guest logs
+   `CPU%u: failed to boot: -110` (timeout).
+
+```json
+"machine-config": { "vcpu_count": 2, "mem_size_mib": 256 }
+```
+
+Boot proof: `nproc` (or `/proc/cpuinfo`) inside the guest reports N, and
+`dmesg | grep -i smp` shows `SMP: Total of N processors activated`.
+
+> The surrounding `firecracker-mac` HVF port handles the PSCI HVC and per-CPU
+> FDT generation host-side; see its SMP design/implementation docs. This kernel
+> imposes no extra requirement beyond the two CONFIG flags above.
+
 ## How it was built
 
 Built on host **`artemis2`** (Ubuntu 26.04, x86_64, 32 cores). That host has
