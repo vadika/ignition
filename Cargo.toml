@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/arch",
+    "crates/hvf",
+    "crates/devices",
+    "crates/vmm",
+    "spike",
+]
+# Reference clones (libkrun, firecracker) live here but are not part of the build.
+exclude = ["refs"]
+
+[workspace.package]
+license = "Apache-2.0"
+edition = "2024"

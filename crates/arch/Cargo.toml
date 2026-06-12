@@ -1,0 +1,12 @@
+[package]
+name = "ignition-arch"
+version = "0.0.0"
+edition = "2024"
+description = "Architecture support (boot regs, FDT, sysreg tables) for the ignition VMM"
+license = "Apache-2.0"
+
+# lib name is `arch` so lifted libkrun modules (`use arch::aarch64::sysreg::...`)
+# compile against it verbatim.
+[lib]
+name = "arch"
+path = "src/lib.rs"

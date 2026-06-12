@@ -1,0 +1,6 @@
+# Cargo build output (root workspace target/ and any stray per-crate target/).
+target/
+# Reference clones — re-clone via the URLs in HANDOFF.md, not committed.
+/refs
+**/*.rs.bk
+.DS_Store

@@ -1,0 +1,13 @@
+[package]
+name = "ignition-devices"
+version = "0.0.0"
+edition = "2024"
+description = "Device models for ignition: serial, virtio-blk/net/vsock, GIC (WIP)"
+license = "Apache-2.0"
+
+[lib]
+name = "devices"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"

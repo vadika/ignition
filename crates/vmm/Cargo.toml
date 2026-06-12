@@ -1,0 +1,16 @@
+[package]
+name = "ignition-vmm"
+version = "0.0.0"
+edition = "2024"
+description = "ignition VMM core: HVF-backed vstate, device manager, machine config (WIP)"
+license = "Apache-2.0"
+
+[lib]
+name = "vmm"
+path = "src/lib.rs"
+
+[dependencies]
+hvf = { package = "ignition-hvf", path = "../hvf" }
+arch = { package = "ignition-arch", path = "../arch" }
+devices = { package = "ignition-devices", path = "../devices" }
+log = "0.4"
