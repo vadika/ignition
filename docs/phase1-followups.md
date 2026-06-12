@@ -24,6 +24,27 @@ all matter once a real aarch64 Linux kernel boots.
   at 1–2 devices. When GIC + virtio land, have `register` return a `Result` with
   an overlap check before the device table grows.
 
+## NEXT MILESTONE (2f): interrupt delivery → shell + interactivity
+
+Confirmed at the 2e boot: after `OpenRC 0.52.1` the guest is **0.0% CPU, parked in
+WFI** waiting for an interrupt that never comes (see `docs/2e-virtio-result.md`).
+virtio-blk works (rootfs mounts, init runs); the shell is blocked on IRQ delivery.
+
+1. **vtimer PPI injection (in-kernel GIC).** `NoIrqVcpus::set_vtimer_irq` is a
+   no-op and `hv_gic` has no `set_ppi`. On `VtimerActivated`, the EL1 virtual
+   timer PPI must reach the guest or every userspace `sleep`/timeout hangs.
+   Investigate: does `hv_vcpu_set_pending_interrupt` (IRQ line) work with the
+   in-kernel GIC, or does the redistributor deliver the vtimer once we stop
+   masking? This is the unproven path from 2b — experiment against the live boot.
+2. **Channel-based WFI parking.** Replace the bounded-sleep parking in
+   `crates/vmm/src/vstate/hvf_vcpu.rs` with a per-vCPU crossbeam channel (libkrun
+   `macos/vstate.rs` pattern): park on `recv_timeout(cntv_deadline)`; wake when a
+   device calls `set_spi` (the virtio `IrqLine` / GIC path must signal the parked
+   thread, e.g. via `hv::vcpu_request_exit`). Without this, an IRQ raised while
+   parked doesn't promptly wake the guest.
+3. **Serial RX** (rides along): host stdin → 16550 RBR + RX interrupt for an
+   interactive shell.
+
 ## GIC (milestone 2b) — confirmed facts for 2d integration
 
 - **`hv_gic_set_spi` takes the ABSOLUTE GIC INTID** (SPI = `32 + spi_index`),
