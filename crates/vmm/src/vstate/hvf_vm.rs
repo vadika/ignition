@@ -5,7 +5,7 @@
 //
 // Replaces: firecracker/src/vmm/src/vstate/vm.rs (+ the kvm.rs bits).
 
-pub use hvf::HvfVm;
+use hvf::HvfVm;
 
 /// One host->guest mapping handed to HVF, retained so the VM owns its layout.
 #[derive(Clone, Copy, Debug)]
@@ -31,7 +31,9 @@ impl Vm {
     }
 
     /// Map a host range into the guest and record it. Same argument order as
-    /// `hvf::HvfVm::map_memory` (host, guest, size).
+    /// `hvf::HvfVm::map_memory` (host, guest, size). No dedup/overlap check here:
+    /// HVF rejects overlapping maps, so a recorded region implies a successful,
+    /// non-overlapping map.
     pub fn map_memory(&mut self, host_addr: u64, guest_addr: u64, size: u64) -> Result<(), hvf::Error> {
         self.hvf.map_memory(host_addr, guest_addr, size)?;
         self.regions.push(MappedRegion { host_addr, guest_addr, size });
