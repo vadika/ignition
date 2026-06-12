@@ -112,6 +112,14 @@ fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), v
     Ok(())
 }
 
+/// Fixed 64-byte CRNG seed placed in /chosen/rng-seed (see create_chosen_node).
+const RNG_SEED: [u8; 64] = [
+    0x69, 0x67, 0x6e, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x72, 0x6e, 0x67, 0x5f, 0x73, 0x65, 0x65,
+    0x64, 0x5f, 0x76, 0x30, 0x21, 0x9a, 0x3c, 0x7d, 0xe2, 0x4b, 0x80, 0x15, 0xf6, 0x29, 0xcd, 0x53,
+    0x8a, 0x1f, 0x64, 0xb7, 0x02, 0x9e, 0x4d, 0xa1, 0x76, 0xc8, 0x3b, 0x55, 0xe0, 0x12, 0x97, 0x6a,
+    0xbd, 0x41, 0x88, 0x2f, 0xd4, 0x60, 0x1b, 0xae, 0x33, 0xf9, 0x07, 0x52, 0xc1, 0x9b, 0x6e, 0x24,
+];
+
 fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -123,6 +131,10 @@ fn create_chosen_node(
         fdt.property_u64("linux,initrd-start", addr)?;
         fdt.property_u64("linux,initrd-end", addr + size)?;
     }
+    // Seed the kernel CRNG so early userspace getrandom() (e.g. OpenRC/seedrng)
+    // does not block forever waiting for entropy. A fixed seed is fine for a
+    // local dev VM; replace with per-boot randomness if this fork ever needs it.
+    fdt.property("rng-seed", &RNG_SEED)?;
     fdt.end_node(chosen)?;
     Ok(())
 }
@@ -301,6 +313,15 @@ mod tests {
         let chosen = dt.find_node("/chosen").unwrap();
         assert_eq!(be_u64s(chosen.property("linux,initrd-start").unwrap().value), vec![0x4800_0000]);
         assert_eq!(be_u64s(chosen.property("linux,initrd-end").unwrap().value), vec![0x4810_0000]);
+    }
+
+    #[test]
+    fn chosen_has_a_64_byte_rng_seed() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let chosen = dt.find_node("/chosen").unwrap();
+        // Seeds the kernel CRNG so early userspace getrandom() doesn't block.
+        assert_eq!(chosen.property("rng-seed").unwrap().value.len(), 64);
     }
 
     #[test]
