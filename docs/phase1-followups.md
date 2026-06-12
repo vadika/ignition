@@ -24,6 +24,21 @@ all matter once a real aarch64 Linux kernel boots.
   at 1–2 devices. When GIC + virtio land, have `register` return a `Result` with
   an overlap check before the device table grows.
 
+## FDT interface (milestone 2a) — evolve as consumers land
+
+- **`GicInfo` models a single redistributor region** (`redist_base`/`redist_size`
+  scalars). Correct for the default single-region GICv3. Large vCPU counts need
+  multiple redist regions → `#redistributor-regions` + a region slice in both
+  `GicInfo` and `create_gic_node`. The GIC milestone (2b) produces these values;
+  re-check then.
+- **`FdtConfig.serial: MmioDev` is a single device.** When virtio-mmio / RTC land,
+  switch to `Vec<MmioDev>` (or a typed device list) instead of per-device fields
+  to avoid an `FdtConfig` field explosion. `MmioDev` is already named generically
+  for reuse. Not a lock-in now.
+- **mpidr `& 0x7F_FFFF` mask assumes Aff2 bit 23 == 0.** When the vCPU milestone
+  wires real MPIDRs from Hypervisor.framework (HANDOFF: write vcpuid to Aff1),
+  re-validate the mask against the actual MPIDR scheme.
+
 ## Constraints to remember (not bugs)
 
 - **`Serial`/`BusDevice` only handle 1-byte accesses** (`data.len() == 1`); other

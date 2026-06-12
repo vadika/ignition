@@ -97,6 +97,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdt"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
+
+[[package]]
 name = "hvf-spike"
 version = "0.1.0"
 dependencies = [
@@ -111,6 +117,10 @@ dependencies = [
 [[package]]
 name = "ignition-arch"
 version = "0.0.0"
+dependencies = [
+ "fdt",
+ "vm-fdt",
+]
 
 [[package]]
 name = "ignition-devices"
@@ -307,6 +317,12 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "vm-fdt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
 
 [[package]]
 name = "vm-superio"

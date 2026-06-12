@@ -5,3 +5,4 @@
 // `arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name}` from here.
 
 pub mod sysreg;
+pub mod fdt;
