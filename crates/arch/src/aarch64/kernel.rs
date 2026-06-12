@@ -61,18 +61,25 @@ pub fn parse_arm64_header(image: &[u8]) -> Result<Arm64Header, KernelError> {
 /// Returns the guest entry address.
 pub fn load_kernel(ram: &mut [u8], ram_base: u64, image: &[u8]) -> Result<u64, KernelError> {
     let header = parse_arm64_header(image)?;
-    let offset = if header.image_size == 0 {
+    // text_offset == 0 is valid for modern kernels (load at the 2 MiB-aligned
+    // base). image_size == 0 means a pre-3.17 kernel with the legacy offset.
+    let offset_u64 = if header.image_size == 0 {
         LEGACY_TEXT_OFFSET
     } else {
         header.text_offset
-    } as usize;
+    };
+    // usize::try_from instead of `as usize` so a 64-bit offset can't silently
+    // truncate on a hypothetical 32-bit host.
+    let offset = usize::try_from(offset_u64).map_err(|_| KernelError::DoesNotFit)?;
 
     let end = offset.checked_add(image.len()).ok_or(KernelError::DoesNotFit)?;
     if end > ram.len() {
         return Err(KernelError::DoesNotFit);
     }
     ram[offset..end].copy_from_slice(image);
-    Ok(ram_base + offset as u64)
+    // Only image.len() bytes are copied; any image_size > image.len() delta
+    // (e.g. BSS) is satisfied by pre-zeroed guest RAM.
+    ram_base.checked_add(offset_u64).ok_or(KernelError::DoesNotFit)
 }
 
 #[cfg(test)]
