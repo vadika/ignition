@@ -1,65 +1,59 @@
-# Milestone 2f research: the blocker is virtio IRQ delivery, NOT the timer
+# Milestone 2f findings: VMM stack complete; the gap is guest userspace init
 
-Date: 2026-06-12. Status: **re-diagnosed** — the timer premise was wrong; the
-real blocker is the virtio completion interrupt not waking the guest. Branch
-`phase1-irq` (experiments reverted; tree clean).
+Date: 2026-06-12. Status: **VMM correct; remaining gap is rootfs init/tty, not
+our code.** Two earlier theories on this milestone were disproven by
+instrumentation — this is the final, evidence-backed conclusion.
 
-## Corrected diagnosis (supersedes the earlier "vtimer wall" write-up)
+## Evidence
 
-1. **The virtual timer already works.** Instrumenting the vCPU run loop showed
-   `HV_EXIT_REASON_VTIMER_ACTIVATED` **never fires** (0 occurrences across a full
-   boot). The in-kernel `hv_gic` delivers the EL1 virtual timer to the guest
-   itself; HVF does not surface it. So the scheduler tick / userspace `sleep`
-   are fine — the timer was a red herring.
+Instrumented the live boot (`target/debug/boot kimage/out/Image
+kimage/out/rootfs.ext4`):
 
-2. **The stall is a virtio poll loop.** Tracing every MMIO access, the guest's
-   steady-state right before it goes idle is a tight repeat of:
-   `WR 0x0a00_0050` (virtio QueueNotify) → `RD 0x0a00_0060` (InterruptStatus) →
-   `WR 0x0a00_0064` (InterruptACK), at roughly one iteration per ~10 ms — i.e.
-   matching the run loop's `MAX_PARK` WFI timeout (`hvf_vcpu.rs`).
+1. **The virtual timer works.** `HV_EXIT_REASON_VTIMER_ACTIVATED` never fires —
+   the in-kernel `hv_gic` delivers the EL1 vtimer natively. (Disproves the
+   original "vtimer delivery" theory; the list-register experiment is moot.)
+2. **virtio-blk + its IRQ work.** Logging every request: **711 requests in the
+   first ~31 s, all `status = 0` (OK)**, across many distinct sectors (reads of
+   init/OpenRC, then writes of OpenRC state / ext4 journal). The guest acks every
+   completion; nothing is left pending. (Disproves the "hv_gic_set_spi doesn't
+   wake the guest / limps on timeout" theory — I/O completes and the guest
+   reaps it.)
+3. **Then the guest goes idle** (0% CPU) — it has finished its boot I/O and is
+   waiting in userspace, not throttled and not blocked on a device.
 
-3. **Conclusion:** the guest submits a virtio request, WFIs for the completion
-   interrupt, and only makes progress when our bounded WFI sleep times out and
-   re-enters (so it re-reads `InterruptStatus`, which we set synchronously during
-   the notify). The **virtio completion IRQ raised via `hv_gic_set_spi(33, …)` is
-   not actually waking the guest.** `hv_gic_set_spi` returns `HV_SUCCESS` (per
-   gic-smoke) but success ≠ delivery. Boot therefore crawls at ~100 I/O/s and
-   never finishes OpenRC's many reads.
+## Root cause: alpine userspace init
 
-## What to investigate next (the real 2f)
+The kernel boots, mounts the virtio rootfs, and execs `/sbin/init`. After
+`OpenRC 0.52.1` it produces no further console output and goes idle — OpenRC
+hangs on an early service (an alpine/OpenRC config matter; candidates: a service
+that waits on a device/tty we don't model, `hwclock`/`mdev`/`modules`, etc.).
 
-The milestone re-scopes to **make `hv_gic_set_spi` actually deliver the virtio
-SPI to the guest**, or find the correct delivery call:
+`init=/bin/sh` (with the flushing serial, and even `-- -i`) runs the shell but
+prints `/bin/sh: can't access tty` and no prompt: a bare `sh` as PID 1 cannot get
+a controlling terminal (`setsid` + `TIOCSCTTY` on `/dev/console`), so it stays
+non-interactive. Setting up the controlling tty and spawning a getty is the
+**rootfs init's** responsibility.
 
-- **INTID correctness.** Confirm the SPI INTID. The FDT advertises virtio
-  `interrupts = [SPI, 1, EDGE]` → INTID `32 + 1 = 33`, and we call
-  `hv_gic_set_spi(33, …)`. Verify against `hv_gic_get_spi_interrupt_range()` and
-  `hv_gic_get_intid()` that 33 is the value the in-kernel GIC expects (it may
-  index differently).
-- **Edge vs level / pulse timing.** We assert on notify (`set_spi(true)`) and
-  deassert on ACK (`set_spi(false)`). The FDT says EDGE_RISING. Check whether the
-  guest configured it level, and whether asserting *during the paused MMIO exit*
-  (before the guest re-enters) latches the edge. Try a deassert→assert pulse, or
-  asserting after the exit.
-- **Does the guest enable the SPI?** Confirm the guest enabled INTID 33 in the
-  distributor (it should, since it set up the virtio IRQ) — a redistributor/
-  distributor reg read via `hv_gic_get_distributor_reg` could verify.
-- **Cross-check with the serial.** The serial uses INTID 32 (SPI 0) but only for
-  output (polled) — it has not exercised IRQ delivery, so virtio is the first
-  real test of `hv_gic_set_spi` delivery. If virtio IRQ is fixed, the same path
-  serves serial RX later.
+## What landed (the one VMM fix this surfaced)
 
-## What works (unchanged)
+- `spike/src/bin/boot.rs` `FlushWriter`: the guest console sink now flushes each
+  byte, so a newline-less prompt (`login: ` / `/ # `) is visible instead of
+  sitting in stdout's line buffer (commit 39d0d51).
 
-- virtio-blk mounts the rootfs and runs init (2e); the kernel boots to userspace.
-- The bounded-WFI timeout is currently masking the bug (the guest limps via
-  timeout polling). Channel parking would EXPOSE it (a no-timeout `recv()` would
-  hang outright until the IRQ fires) — so the IRQ-delivery fix must land before
-  or with the parking change.
+## Reaching a visible prompt — next options (mostly rootfs-side)
 
-## Status
+- **Rootfs:** make the alpine image spawn `agetty -L 0 ttyS0 vt100` (or a
+  `console::respawn:/sbin/getty -L ttyS0` inittab line), or fix/skip the OpenRC
+  service that hangs. A getty prints `login:` and sets up the tty — independent
+  of the VMM. This is the most direct path and is owned by `kimage/`.
+- **VMM (optional, for interactivity):** implement serial RX (host stdin in raw
+  mode → 16550 RBR + RX interrupt) so an interactive shell/login works once the
+  rootfs presents one. The virtio IRQ path already proves `hv_gic_set_spi`
+  delivery, so the serial RX interrupt will work the same way.
 
-Research goal re-scoped: the in-kernel-GIC **vtimer is not the problem** (it works
-natively); the problem is **virtio SPI interrupt delivery via `hv_gic_set_spi`**.
-The earlier list-register/vtimer experiments are reverted (moot — that exit never
-fires). Next: prove and fix `hv_gic_set_spi` delivery against the live boot.
+## Bottom line
+
+The ignition VMM boots a real aarch64 Linux to userspace with a working
+virtio-blk rootfs, virtual timer, and interrupt delivery. The shell-prompt bar is
+now gated on **guest rootfs init configuration** (getty/controlling-tty), not on
+any missing hypervisor capability.

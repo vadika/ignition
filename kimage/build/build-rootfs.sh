@@ -23,6 +23,12 @@ docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
 
   # root has no password for console login
   passwd -d root || true
+
+  # /dev/tty -> /dev/ttyS0 so programs that open the controlling terminal work
+  # on the serial console. /dev is a fresh devtmpfs each boot, so create the
+  # link at early init via a busybox sysinit action (runs before getty/login).
+  grep -q "ln -sf /dev/ttyS0 /dev/tty" /etc/inittab ||
+    printf "::sysinit:/bin/ln -sf /dev/ttyS0 /dev/tty\n" >> /etc/inittab
 '
 
 # Export the built container filesystem to a tarball (host-user writable path).
