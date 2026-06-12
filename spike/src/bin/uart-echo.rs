@@ -50,7 +50,7 @@ impl Write for SharedSink {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
+    let mut vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
 
     // Allocate + populate guest RAM. No munmap: the process exits right after
     // and the OS reclaims the mapping.
@@ -71,8 +71,7 @@ fn main() {
             dst.add(i).write(word.to_le());
         }
     }
-    vm.hvf
-        .map_memory(host as u64, GUEST_RAM_BASE, GUEST_RAM_SIZE)
+    vm.map_memory(host as u64, GUEST_RAM_BASE, GUEST_RAM_SIZE)
         .expect("hv_vm_map failed");
 
     // Wire the device bus: one serial at SERIAL_BASE, output captured.

@@ -245,7 +245,7 @@ fn main() {
     let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
 
     // VM, then the in-kernel GIC (must be created before any vCPU).
-    let vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
+    let mut vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
     let gic = Arc::new(HvfGicV3::new(1, layout::RAM_BASE).expect("hv_gic_create failed"));
 
     // Build and place the device tree.
@@ -270,8 +270,7 @@ fn main() {
     ram[fdt_off..fdt_off + dtb.len()].copy_from_slice(&dtb);
 
     // Map the populated RAM into the guest.
-    vm.hvf
-        .map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
         .expect("hv_vm_map failed");
 
     // Diagnostics (stderr) so a silent boot is debuggable.
