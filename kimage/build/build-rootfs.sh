@@ -11,7 +11,7 @@ TAR="$STAGE/rootfs.tar"
 # 1. Provision rootfs inside an arm64 alpine container (init, console, dirs).
 docker rm -f fcroot_build >/dev/null 2>&1 || true
 docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
-  apk add --no-cache openrc util-linux
+  apk add --no-cache openrc util-linux ifupdown-ng
 
   # serial console on ttyS0 (Firecracker default)
   ln -sf agetty /etc/init.d/agetty.ttyS0
@@ -29,6 +29,17 @@ docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
   # link at early init via a busybox sysinit action (runs before getty/login).
   grep -q "ln -sf /dev/ttyS0 /dev/tty" /etc/inittab ||
     printf "::sysinit:/bin/ln -sf /dev/ttyS0 /dev/tty\n" >> /etc/inittab
+
+  # Automatic networking: bring eth0 up via DHCP at boot. ifupdown-ng runs
+  # busybox udhcpc (with its default.script) to apply address/route/DNS.
+  # vmnet shared mode (and most Firecracker TAP setups) serve DHCP.
+  mkdir -p /etc/network /etc/local.d
+  printf "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n" > /etc/network/interfaces
+  # No /etc/init.d/networking ships on alpine, so drive ifup from the openrc
+  # local service (runs at boot, after device nodes exist).
+  printf "#!/bin/sh\nifup -a\n" > /etc/local.d/network.start
+  chmod +x /etc/local.d/network.start
+  rc-update add local boot
 '
 
 # Export the built container filesystem to a tarball (host-user writable path).
