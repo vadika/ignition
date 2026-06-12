@@ -183,10 +183,10 @@ impl VcpuManager {
             let handle = self.threads.lock().unwrap().pop();
             match handle {
                 Some(h) => {
-                    if let Err(e) = h.join().expect("vCPU thread panicked") {
-                        if result.is_ok() {
-                            result = Err(e);
-                        }
+                    if let Err(e) = h.join().expect("vCPU thread panicked")
+                        && result.is_ok()
+                    {
+                        result = Err(e);
                     }
                 }
                 None => return result,
