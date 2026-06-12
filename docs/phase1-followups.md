@@ -47,6 +47,26 @@ all matter once a real aarch64 Linux kernel boots.
   module lands, pass the real value (likely RAM base) — not the serial MMIO
   address.
 
+## Kernel loader (milestone 2c) — for the 2d boot integration
+
+- **Wiring:** `arch::aarch64::kernel::load_kernel(ram, RAM_BASE, &image)` returns
+  the entry address; `arch::aarch64::layout::fdt_addr(ram_size)` gives the DTB
+  address. Feed both to `HvfVcpu::set_initial_state(entry, fdt_addr)` (already
+  built) and write the DTB bytes into the host RAM slice at `fdt_addr - RAM_BASE`.
+  `load_kernel` takes `&mut [u8]` so pass the HVF mmap slice directly.
+- **`KernelError` should impl `std::error::Error`** once it propagates through the
+  VMM error chain in 2d (trivial: `impl std::error::Error for KernelError {}`).
+  Same applies to `hvf::Error`.
+- **`text_offset` alignment:** a real-kernel validator could warn (not error) if
+  `text_offset % 0x20_0000 != 0` — modern kernels are 2 MiB-aligned. The copy
+  works regardless.
+- **`image_size` > file size (BSS):** `load_kernel` copies only `image.len()`
+  bytes; the delta is satisfied by pre-zeroed guest RAM. Correct — don't "fix" it
+  to copy `image_size` bytes.
+- **DTB-within-512 MiB / large-RAM:** `layout::fdt_addr` has a `TODO(larger-ram)`
+  — top-of-RAM placement only stays within the kernel's early-map 512 MiB window
+  while `ram_size <= 512 MiB`. Add a guard when bigger RAM lands.
+
 ## FDT interface (milestone 2a) — evolve as consumers land
 
 - **`GicInfo` models a single redistributor region** (`redist_base`/`redist_size`
