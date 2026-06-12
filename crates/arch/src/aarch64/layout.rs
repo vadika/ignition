@@ -20,15 +20,16 @@ pub const VIRTIO_SIZE: u64 = 0x200;
 pub const VIRTIO_SPI: u32 = 1;
 /// Reserved size for the flattened device tree.
 pub const FDT_MAX_SIZE: u64 = 0x20_0000; // 2 MiB
-/// The kernel maps the first 512 MiB of RAM early in boot, so the DTB must live
-/// within that window (it is read before the full linear map exists).
+/// The DTB must sit within the part of RAM the kernel maps early in boot (before
+/// the full linear map exists). 512 MiB is a conservative upper bound for arm64.
 pub const DTB_EARLY_MAP_LIMIT: u64 = 0x2000_0000; // 512 MiB
 
 /// Address where the DTB is placed: the top `FDT_MAX_SIZE` of `min(ram_size,
 /// 512 MiB)` of RAM, rounded down to an 8-byte boundary. The 512 MiB cap keeps
 /// the DTB within the kernel's early-mapped window even for large RAM configs.
-/// Within `[RAM_BASE, RAM_BASE + ram_size)` and clear of a kernel at `RAM_BASE`
-/// while the kernel stays smaller than `ram_size - FDT_MAX_SIZE`.
+/// Within `[RAM_BASE, RAM_BASE + ram_size)` and clear of a kernel at `RAM_BASE`.
+/// A kernel at `RAM_BASE` must fit in `DTB_EARLY_MAP_LIMIT - FDT_MAX_SIZE`
+/// (~510 MiB) to clear the DTB, regardless of total `ram_size`.
 /// `ram_size` must be >= `FDT_MAX_SIZE`.
 pub fn fdt_addr(ram_size: u64) -> u64 {
     debug_assert!(ram_size >= FDT_MAX_SIZE, "ram_size must be >= FDT_MAX_SIZE");
@@ -84,7 +85,7 @@ mod tests {
         assert_eq!(addr & 0x7, 0, "fdt addr must be 8-byte aligned");
         assert!(addr >= RAM_BASE, "fdt addr must be within RAM");
         assert!(
-            addr < RAM_BASE + 0x2000_0000,
+            addr < RAM_BASE + DTB_EARLY_MAP_LIMIT,
             "DTB must stay within the kernel's early-mapped first 512 MiB"
         );
     }
