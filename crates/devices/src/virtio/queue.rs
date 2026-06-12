@@ -28,11 +28,12 @@ pub struct Virtqueue {
     driver_addr: u64, // available ring
     device_addr: u64, // used ring
     last_avail_idx: u16,
+    used_idx: u16,
 }
 
 impl Virtqueue {
     pub fn new(size: u16, desc_addr: u64, driver_addr: u64, device_addr: u64) -> Self {
-        Self { size, desc_addr, driver_addr, device_addr, last_avail_idx: 0 }
+        Self { size, desc_addr, driver_addr, device_addr, last_avail_idx: 0, used_idx: 0 }
     }
 
     /// The next not-yet-seen available chain, or `None` if drained.
@@ -48,18 +49,29 @@ impl Virtqueue {
         }
         let slot = self.last_avail_idx % self.size;
         let head = mem.read_u16(self.driver_addr + 4 + u64::from(slot) * 2)?;
+        // Consume the avail entry even if it turns out malformed, so a bad index
+        // can't stall the ring (it is dropped, not retried).
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+        if head >= self.size {
+            return None; // malformed head index; entry consumed and dropped
+        }
 
         let mut descriptors = Vec::new();
         let mut idx = head;
         // Bounded by `size` to defend against a malformed cyclic chain.
         for _ in 0..self.size {
+            if idx >= self.size {
+                break; // malformed next index; end the chain here
+            }
             let d = self.desc_addr + u64::from(idx) * DESC_SIZE;
             let addr = mem.read_u64(d)?;
             let len = mem.read_u32(d + 8)?;
             let flags = mem.read_u16(d + 12)?;
             let next = mem.read_u16(d + 14)?;
             descriptors.push(Desc { addr, len, writable: flags & VIRTQ_DESC_F_WRITE != 0 });
+            // Note: VIRTQ_DESC_F_INDIRECT (bit 2) is not supported — an indirect
+            // descriptor is treated as a direct buffer. The block driver does not
+            // use indirect descriptors, so this does not arise in practice.
             if flags & VIRTQ_DESC_F_NEXT == 0 {
                 break;
             }
@@ -72,12 +84,15 @@ impl Virtqueue {
     ///
     /// used ring layout: `{flags: u16, idx: u16, ring: [{id: u32, len: u32}; size]}`.
     pub fn push_used(&mut self, mem: &GuestRam, head: u16, len: u32) {
-        let used_idx = mem.read_u16(self.device_addr + 2).unwrap_or(0);
-        let slot = used_idx % self.size;
+        if self.size == 0 {
+            return;
+        }
+        let slot = self.used_idx % self.size;
         let elem = self.device_addr + 4 + u64::from(slot) * 8;
         mem.write_u32(elem, u32::from(head));
         mem.write_u32(elem + 4, len);
-        mem.write_u16(self.device_addr + 2, used_idx.wrapping_add(1));
+        self.used_idx = self.used_idx.wrapping_add(1);
+        mem.write_u16(self.device_addr + 2, self.used_idx);
     }
 }
 
@@ -144,5 +159,33 @@ mod tests {
         assert_eq!(m.read_u32(USED + 4), Some(3)); // ring[0].id
         assert_eq!(m.read_u32(USED + 8), Some(512)); // ring[0].len
         assert_eq!(m.read_u16(USED + 2), Some(1)); // used.idx
+    }
+
+    #[test]
+    fn pop_drops_out_of_range_head() {
+        let mut backing = vec![0u8; 0x4000];
+        let m = mem(&mut backing);
+        write_desc(&m, 0, 0x4000_0500, 16, 0, 0); // valid desc 0
+        m.write_u16(AVAIL + 2, 2); // avail.idx = 2 (two entries)
+        m.write_u16(AVAIL + 4, 255); // ring[0] = bogus head 255 (>= size 8)
+        m.write_u16(AVAIL + 6, 0); // ring[1] = valid head 0
+
+        let mut vq = Virtqueue::new(8, DESC, AVAIL, USED);
+        assert!(vq.pop_avail(&m).is_none()); // bogus entry dropped, not retried
+        let chain = vq.pop_avail(&m).unwrap(); // the next entry still works
+        assert_eq!(chain.head, 0);
+    }
+
+    #[test]
+    fn push_used_wraps_the_ring() {
+        let mut backing = vec![0u8; 0x4000];
+        let m = mem(&mut backing);
+        let mut vq = Virtqueue::new(8, DESC, AVAIL, USED);
+        for i in 0..9u32 {
+            vq.push_used(&m, i as u16, i);
+        }
+        // 9th element (i=8) wrapped to slot 0; used.idx advanced to 9.
+        assert_eq!(m.read_u32(USED + 4), Some(8)); // ring[0].id overwritten by the 9th
+        assert_eq!(m.read_u16(USED + 2), Some(9));
     }
 }
