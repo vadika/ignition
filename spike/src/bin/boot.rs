@@ -28,6 +28,47 @@ use vmm::vstate::hvf_vm::Vm;
 
 const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
 
+/// Host console escape key: Ctrl-A (0x01).
+const CTRL_A: u8 = 0x01;
+
+/// State of the host-side escape sequence. Ctrl-A then `x` quits the harness;
+/// Ctrl-A then anything else forwards a literal Ctrl-A plus that byte.
+enum EscState {
+    Normal,
+    SawCtrlA,
+}
+
+/// What the reader thread should do with one input byte.
+enum Action {
+    /// Forward `Action::Forward(buf, len)` — `buf[..len]` — to the guest RX FIFO.
+    Forward([u8; 2], usize),
+    /// Ctrl-A consumed; awaiting the next byte. Forward nothing yet.
+    Pending,
+    /// Quit the harness.
+    Quit,
+}
+
+/// Advance the escape state machine by one input byte.
+fn step(state: &mut EscState, byte: u8) -> Action {
+    match state {
+        EscState::Normal if byte == CTRL_A => {
+            *state = EscState::SawCtrlA;
+            Action::Pending
+        }
+        EscState::Normal => Action::Forward([byte, 0], 1),
+        EscState::SawCtrlA => {
+            *state = EscState::Normal;
+            match byte {
+                b'x' => Action::Quit,
+                // Ctrl-A Ctrl-A sends a single literal Ctrl-A to the guest.
+                CTRL_A => Action::Forward([CTRL_A, 0], 1),
+                // Ctrl-A was not an escape: send it literally, then this byte.
+                _ => Action::Forward([CTRL_A, byte], 2),
+            }
+        }
+    }
+}
+
 /// Adapts the in-kernel GIC to the device `IrqLine`. The virtio SPI index is the
 /// bare FDT index; hv_gic_set_spi wants the absolute INTID (32 + index).
 struct GicIrq {
@@ -166,5 +207,46 @@ fn main() {
     match vcpu.start().join().expect("vCPU thread panicked") {
         Ok(()) => eprintln!("\n[vcpu exited cleanly]"),
         Err(e) => eprintln!("\n[vcpu error: {e}]"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_byte_forwards_one() {
+        let mut s = EscState::Normal;
+        match step(&mut s, b'r') {
+            Action::Forward(buf, 1) => assert_eq!(buf[0], b'r'),
+            _ => panic!("expected Forward of one byte"),
+        }
+    }
+
+    #[test]
+    fn ctrl_a_then_x_quits() {
+        let mut s = EscState::Normal;
+        assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
+        assert!(matches!(step(&mut s, b'x'), Action::Quit));
+    }
+
+    #[test]
+    fn ctrl_a_then_other_forwards_both() {
+        let mut s = EscState::Normal;
+        let _ = step(&mut s, CTRL_A);
+        match step(&mut s, b'a') {
+            Action::Forward(buf, 2) => assert_eq!(&buf, &[CTRL_A, b'a']),
+            _ => panic!("expected Forward of [Ctrl-A, 'a']"),
+        }
+    }
+
+    #[test]
+    fn ctrl_a_twice_forwards_one_literal() {
+        let mut s = EscState::Normal;
+        let _ = step(&mut s, CTRL_A);
+        match step(&mut s, CTRL_A) {
+            Action::Forward(buf, 1) => assert_eq!(buf[0], CTRL_A),
+            _ => panic!("expected one literal Ctrl-A"),
+        }
     }
 }
