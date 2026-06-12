@@ -31,6 +31,13 @@ dd if=out/rootfs.ext4 bs=1 skip=$((0x438)) count=2 2>/dev/null | xxd  # expect: 
 - Login: `root` with **no password** (passwordless console login).
 - Shell: BusyBox `/bin/sh` (Alpine default).
 - Runtime mountpoints present: `/dev /proc /run /sys /tmp /mnt`.
+- Networking: **eth0 via DHCP**, brought up automatically at boot. Provided by
+  `ifupdown-ng` + busybox `udhcpc`; `/etc/network/interfaces` marks `eth0` as
+  `auto ... inet dhcp`, and the OpenRC `local` service runs `ifup -a` at boot
+  (alpine ships no `networking` service). Assumes the host serves DHCP on the
+  guest's link — true for vmnet shared mode and typical Firecracker TAP setups.
+  For a static address instead, replace `/etc/network/interfaces` with an
+  `inet static` stanza in `build/build-rootfs.sh`.
 
 ## Booting in Firecracker
 
