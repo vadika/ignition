@@ -5,24 +5,25 @@ all matter once a real aarch64 Linux kernel boots.
 
 ## Hazards (fix before/while bringing up a kernel)
 
-- **Halfword MMIO write panics in the hvf crate.** `crates/hvf/src/lib.rs` (the
-  `EC_DATAABORT` write path, ~line 639) only matches access lengths 1/4/8 and
-  `panic!`s on len 2 — while the `MmioRead` readback (~line 560) *does* handle
-  len 2. A real kernel/virtio guest can issue halfword (`strh`) MMIO writes, so
-  this is a latent panic during bring-up. It is lifted-verbatim libkrun code, so
-  decide: patch our fork, or confirm guests never do halfword MMIO. Track it.
+- ✅ **DONE** (2026-06-12, commits `ecda960`/`3d6c82a`) — **Halfword MMIO write
+  panicked in the hvf crate.** The `EC_DATAABORT` write path only matched access
+  lengths 1/4/8 and `panic!`d on len 2, while the read path handled it. Fixed by
+  sharing `encode_mmio_le`/`decode_mmio_le` across both paths (all of 1/2/4/8,
+  `debug_assert` on size); removed the dead `MmioRead::addr` field. See the
+  hardening plan `docs/superpowers/plans/2026-06-12-phase1-hardening.md`.
 
 ## Layering migrations (do early in the next milestone)
 
-- **`Vm` is a no-op wrapper.** `crates/vmm/src/vstate/hvf_vm.rs` owns only
-  `pub hvf: HvfVm`; the harness reaches through `vm.hvf.map_memory(...)`. Kernel
-  boot needs `Vm` to own guest-memory regions (for FDT placement + future
-  dirty-tracking). Give `Vm` real memory-management methods and make `hvf`
-  private; migrate the spike's `vm.hvf.*` reach-through first.
+- ✅ **DONE** (2026-06-12, commits `62dcc30`/`4f24978`) — **`Vm` was a no-op
+  wrapper.** `Vm` now owns `Vec<MappedRegion>` via `map_memory(&mut self, ...)`,
+  the `hvf` field is private, and `HvfVm` is no longer re-exported; both spike
+  bins migrated off `vm.hvf.map_memory`. `regions()` exposes the layout for future
+  dirty-tracking.
 
-- **`Bus::register` does no overlap validation; `find` is a linear scan.** Fine
-  at 1–2 devices. When GIC + virtio land, have `register` return a `Result` with
-  an overlap check before the device table grows.
+- ✅ **DONE** (2026-06-12, commits `61e4772`/`7ec261e`) — **`Bus::register` did no
+  overlap validation.** `register` now returns `Result<(), BusError>` and rejects
+  overlapping ranges (half-open formula, `saturating_add`); the error names both
+  colliding ranges. `find` is still a linear scan — fine at this device count.
 
 ## NEXT MILESTONE (2f): interrupt delivery → shell — RE-DIAGNOSED
 
