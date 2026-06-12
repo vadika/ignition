@@ -333,6 +333,22 @@ pub struct HvfVcpu<'a> {
     nested_enabled: bool,
 }
 
+/// Write the low `len` little-endian bytes of `val` into `buf` (the MMIO data
+/// buffer). `len` is `1 << sas` from the data-abort syndrome, so it is always one
+/// of 1, 2, 4, 8.
+fn encode_mmio_le(buf: &mut [u8], val: u64, len: usize) {
+    let bytes = val.to_le_bytes();
+    buf[..len].copy_from_slice(&bytes[..len]);
+}
+
+/// Read `len` little-endian bytes from `buf` as a zero-extended `u64`. `len` is
+/// `1 << sas`, always one of 1, 2, 4, 8.
+fn decode_mmio_le(buf: &[u8], len: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes[..len].copy_from_slice(&buf[..len]);
+    u64::from_le_bytes(bytes)
+}
+
 impl HvfVcpu<'_> {
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
@@ -559,16 +575,7 @@ impl HvfVcpu<'_> {
         if let Some(mmio_read) = self.pending_mmio_read.take()
             && mmio_read.srt < 31
         {
-            let val = match mmio_read.len {
-                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                _ => panic!(
-                    "unsupported mmio pa={} len={}",
-                    mmio_read.addr, mmio_read.len
-                ),
-            };
+            let val = decode_mmio_le(&self.mmio_buf, mmio_read.len);
 
             self.write_reg(mmio_read.srt, val)?;
         }
@@ -639,12 +646,7 @@ impl HvfVcpu<'_> {
                         0
                     };
 
-                    match len {
-                        1 => self.mmio_buf[0..1].copy_from_slice(&(val as u8).to_le_bytes()),
-                        4 => self.mmio_buf[0..4].copy_from_slice(&(val as u32).to_le_bytes()),
-                        8 => self.mmio_buf[0..8].copy_from_slice(&val.to_le_bytes()),
-                        _ => panic!("unsupported mmio len={len}"),
-                    };
+                    encode_mmio_le(&mut self.mmio_buf, val, len);
 
                     Ok(VcpuExit::MmioWrite(pa, &self.mmio_buf[0..len]))
                 } else {
@@ -730,5 +732,31 @@ impl HvfVcpu<'_> {
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod mmio_tests {
+    use super::{decode_mmio_le, encode_mmio_le};
+
+    #[test]
+    fn encode_roundtrips_all_access_sizes() {
+        for &len in &[1usize, 2, 4, 8] {
+            let mut buf = [0u8; 8];
+            let val: u64 = 0x1122_3344_5566_7788;
+            encode_mmio_le(&mut buf, val, len);
+            let expected = &val.to_le_bytes()[..len];
+            assert_eq!(&buf[..len], expected, "encode len={len}");
+            let mask = if len == 8 { u64::MAX } else { (1u64 << (len * 8)) - 1 };
+            assert_eq!(decode_mmio_le(&buf, len), val & mask, "decode len={len}");
+        }
+    }
+
+    #[test]
+    fn halfword_write_does_not_panic() {
+        let mut buf = [0u8; 8];
+        encode_mmio_le(&mut buf, 0xBEEF, 2);
+        assert_eq!(&buf[..2], &[0xEF, 0xBE]);
+        assert_eq!(decode_mmio_le(&buf, 2), 0xBEEF);
     }
 }
