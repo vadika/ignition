@@ -51,7 +51,8 @@ impl Vcpu {
     }
 
     /// Spawn the vCPU thread. The join handle resolves to `Ok(())` on guest
-    /// shutdown (PSCI SYSTEM_OFF) or vCPU cancel.
+    /// shutdown (PSCI SYSTEM_OFF) or vCPU cancel, or `Err(hvf::Error)` if an
+    /// HVF call failed — in which case the VM should be torn down.
     pub fn start(self) -> JoinHandle<Result<(), hvf::Error>> {
         thread::spawn(move || self.run())
     }
@@ -67,6 +68,10 @@ impl Vcpu {
             let exit = vcpu.run(vcpus.clone())?;
             match exit {
                 VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
+                // `data` aliases the vCPU's mmio_buf; `Bus::read` fills it in
+                // place, and the hvf crate copies it into the guest register on
+                // the next `run()`. On a bus miss the buffer is left unchanged
+                // (zeroed), i.e. the guest reads zero — intentional this milestone.
                 VcpuExit::MmioRead(addr, data) => self.bus.read(addr, data),
                 VcpuExit::Shutdown => {
                     log::info!("guest requested shutdown (PSCI SYSTEM_OFF)");
