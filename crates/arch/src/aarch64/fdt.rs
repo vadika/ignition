@@ -53,6 +53,8 @@ pub struct FdtConfig {
     pub gic: GicInfo,
     /// (guest addr, size) when an initramfs is loaded.
     pub initrd: Option<(u64, u64)>,
+    /// The virtio-mmio block device, when attached.
+    pub virtio: Option<MmioDev>,
 }
 
 /// Build the DTB blob. All errors originate in `vm-fdt` (e.g. an interior NUL in
@@ -74,6 +76,9 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     create_timer_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_serial_node(&mut fdt, &cfg.serial)?;
+    if let Some(virtio) = &cfg.virtio {
+        create_virtio_node(&mut fdt, virtio)?;
+    }
 
     fdt.end_node(root)?;
     fdt.finish()
@@ -107,6 +112,14 @@ fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), v
     Ok(())
 }
 
+/// Fixed 64-byte CRNG seed placed in /chosen/rng-seed (see create_chosen_node).
+const RNG_SEED: [u8; 64] = [
+    0x69, 0x67, 0x6e, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x72, 0x6e, 0x67, 0x5f, 0x73, 0x65, 0x65,
+    0x64, 0x5f, 0x76, 0x30, 0x21, 0x9a, 0x3c, 0x7d, 0xe2, 0x4b, 0x80, 0x15, 0xf6, 0x29, 0xcd, 0x53,
+    0x8a, 0x1f, 0x64, 0xb7, 0x02, 0x9e, 0x4d, 0xa1, 0x76, 0xc8, 0x3b, 0x55, 0xe0, 0x12, 0x97, 0x6a,
+    0xbd, 0x41, 0x88, 0x2f, 0xd4, 0x60, 0x1b, 0xae, 0x33, 0xf9, 0x07, 0x52, 0xc1, 0x9b, 0x6e, 0x24,
+];
+
 fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: &str,
@@ -118,6 +131,10 @@ fn create_chosen_node(
         fdt.property_u64("linux,initrd-start", addr)?;
         fdt.property_u64("linux,initrd-end", addr + size)?;
     }
+    // Seed the kernel CRNG so early userspace getrandom() (e.g. OpenRC/seedrng)
+    // does not block forever waiting for entropy. A fixed seed is fine for a
+    // local dev VM; replace with per-boot randomness if this fork ever needs it.
+    fdt.property("rng-seed", &RNG_SEED)?;
     fdt.end_node(chosen)?;
     Ok(())
 }
@@ -191,6 +208,18 @@ fn create_serial_node(fdt: &mut FdtWriter, serial: &MmioDev) -> Result<(), vm_fd
     Ok(())
 }
 
+fn create_virtio_node(fdt: &mut FdtWriter, dev: &MmioDev) -> Result<(), vm_fdt::Error> {
+    let node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev.addr))?;
+    fdt.property_string("compatible", "virtio,mmio")?;
+    fdt.property_array_u64("reg", &[dev.addr, dev.size])?;
+    fdt.property_null("dma-coherent")?;
+    fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, dev.irq, IRQ_TYPE_EDGE_RISING])?;
+    // interrupt-parent is inherited from the root node (GIC_PHANDLE), like the
+    // serial node — no need to repeat it here.
+    fdt.end_node(node)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +253,7 @@ mod tests {
                 maint_irq: 9,
             },
             initrd: None,
+            virtio: None,
         }
     }
 
@@ -286,6 +316,15 @@ mod tests {
     }
 
     #[test]
+    fn chosen_has_a_64_byte_rng_seed() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let chosen = dt.find_node("/chosen").unwrap();
+        // Seeds the kernel CRNG so early userspace getrandom() doesn't block.
+        assert_eq!(chosen.property("rng-seed").unwrap().value.len(), 64);
+    }
+
+    #[test]
     fn gic_node_is_gicv3_with_reg_and_cells() {
         let blob = generate(&sample()).unwrap();
         let dt = Fdt::new(&blob).unwrap();
@@ -343,5 +382,23 @@ mod tests {
         assert_eq!(dt_str(clk.property("compatible").unwrap().value), "fixed-clock");
         assert_eq!(be_u32s(clk.property("clock-frequency").unwrap().value), vec![24_000_000]);
         assert_eq!(be_u32s(clk.property("phandle").unwrap().value), vec![2]);
+    }
+
+    #[test]
+    fn virtio_node_present_only_when_set() {
+        // Absent by default.
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        assert!(dt.find_node("/virtio_mmio@a000000").is_none());
+
+        // Present when configured.
+        let mut cfg = sample();
+        cfg.virtio = Some(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 });
+        let blob = generate(&cfg).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let node = dt.find_node("/virtio_mmio@a000000").unwrap();
+        assert_eq!(dt_str(node.property("compatible").unwrap().value), "virtio,mmio");
+        assert_eq!(be_u64s(node.property("reg").unwrap().value), vec![0x0a00_0000, 0x200]);
+        assert_eq!(be_u32s(node.property("interrupts").unwrap().value), vec![0, 1, 1]);
     }
 }

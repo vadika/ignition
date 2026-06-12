@@ -12,6 +12,12 @@ pub const SERIAL_SIZE: u64 = 0x1000;
 /// INTID = 32 + this; index 0 -> INTID 32, confirmed by the spike/src/bin/
 /// gic-smoke.rs run on macOS 26).
 pub const SERIAL_SPI: u32 = 0;
+/// virtio-mmio device window (one block device). Above the serial, below GIC/RAM.
+pub const VIRTIO_BASE: u64 = 0x0a00_0000;
+/// virtio-mmio register frame size (512 bytes, per virtio 1.0 §4.2.2).
+pub const VIRTIO_SIZE: u64 = 0x200;
+/// virtio block IRQ as the bare GIC SPI index (absolute INTID = 32 + this = 33).
+pub const VIRTIO_SPI: u32 = 1;
 /// Reserved size for the flattened device tree.
 pub const FDT_MAX_SIZE: u64 = 0x20_0000; // 2 MiB
 
@@ -30,7 +36,7 @@ pub fn fdt_addr(ram_size: u64) -> u64 {
 /// Default kernel command line, with the earlycon MMIO address kept in sync with
 /// `SERIAL_BASE`.
 pub fn default_cmdline() -> String {
-    format!("console=ttyS0 earlycon=uart8250,mmio,{SERIAL_BASE:#x} reboot=k panic=1")
+    format!("console=ttyS0 earlycon=uart8250,mmio,{SERIAL_BASE:#x} root=/dev/vda rw rootwait reboot=k panic=1")
 }
 
 #[cfg(test)]
