@@ -1,79 +1,65 @@
-# Milestone 2f research: vtimer delivery SOLVED — GICv3 list-register injection
+# Milestone 2f research: the blocker is virtio IRQ delivery, NOT the timer
 
-Date: 2026-06-12. Status: **mechanism found** (implementation is the next step).
-Branch `phase1-irq` (experiments reverted; tree clean).
+Date: 2026-06-12. Status: **re-diagnosed** — the timer premise was wrong; the
+real blocker is the virtio completion interrupt not waking the guest. Branch
+`phase1-irq` (experiments reverted; tree clean).
 
-## What we proved works
+## Corrected diagnosis (supersedes the earlier "vtimer wall" write-up)
 
-- The rootfs + exec path is solid: `init=/bin/sh` runs the shell off the virtio
-  disk and prints to our serial (`Run /bin/sh as init process` →
-  `/bin/sh: can't access tty`).
-- Under normal boot, OpenRC stalls after its banner at 0% CPU, parked in WFI,
-  waiting on the virtual-timer interrupt that is never delivered.
+1. **The virtual timer already works.** Instrumenting the vCPU run loop showed
+   `HV_EXIT_REASON_VTIMER_ACTIVATED` **never fires** (0 occurrences across a full
+   boot). The in-kernel `hv_gic` delivers the EL1 virtual timer to the guest
+   itself; HVF does not surface it. So the scheduler tick / userspace `sleep`
+   are fine — the timer was a red herring.
 
-## The answer (from Apple's Hypervisor headers)
+2. **The stall is a virtio poll loop.** Tracing every MMIO access, the guest's
+   steady-state right before it goes idle is a tight repeat of:
+   `WR 0x0a00_0050` (virtio QueueNotify) → `RD 0x0a00_0060` (InterruptStatus) →
+   `WR 0x0a00_0064` (InterruptACK), at roughly one iteration per ~10 ms — i.e.
+   matching the run loop's `MAX_PARK` WFI timeout (`hvf_vcpu.rs`).
 
-`HV_EXIT_REASON_VTIMER_ACTIVATED` doc (`hv_vcpu_types.h`, `hv_vcpu.h`):
+3. **Conclusion:** the guest submits a virtio request, WFIs for the completion
+   interrupt, and only makes progress when our bounded WFI sleep times out and
+   re-enters (so it re-reads `InterruptStatus`, which we set synchronously during
+   the notify). The **virtio completion IRQ raised via `hv_gic_set_spi(33, …)` is
+   not actually waking the guest.** `hv_gic_set_spi` returns `HV_SUCCESS` (per
+   gic-smoke) but success ≠ delivery. Boot therefore crawls at ~100 I/O/s and
+   never finishes OpenRC's many reads.
 
-> The caller is expected to **make the interrupt corresponding to the VTimer
-> pending in the guest's interrupt controller** and **to detect when the guest
-> has completed servicing** it. For example, when emulating a GIC, clear the
-> vtimer mask **when deactivating an interrupt whose ID matches the VTimer**.
+## What to investigate next (the real 2f)
 
-For the in-kernel `hv_gic`, "make it pending in the guest's GIC" is **not**
-`hv_gic_set_spi` (SPIs only, INTID ≥ 32) and **not** mask-toggling (both tried,
-both failed). It is **GICv3 list-register injection**: Apple exposes the
-hypervisor control interface via `hv_gic_set_ich_reg` /
-`HV_GIC_ICH_REG_LR0_EL2 … LR15_EL2`, plus `ICH_HCR_EL2`, `ICH_VMCR_EL2`,
-`ICH_VTR_EL2`, `ICH_EISR_EL2`, `ICH_ELRSR_EL2`, and the maintenance interrupt
-`HV_GIC_INT_MAINTENANCE = 25`. The vtimer INTID is
-`HV_GIC_INT_EL1_VIRTUAL_TIMER = 27`.
+The milestone re-scopes to **make `hv_gic_set_spi` actually deliver the virtio
+SPI to the guest**, or find the correct delivery call:
 
-This is standard GICv3 virtualization: the hypervisor writes a List Register to
-make a virtual interrupt pending; the GIC's virtual CPU interface presents it to
-the guest; the guest EOIs it; the LR empties (`ICH_ELRSR`/`ICH_EISR`), optionally
-raising the maintenance interrupt.
+- **INTID correctness.** Confirm the SPI INTID. The FDT advertises virtio
+  `interrupts = [SPI, 1, EDGE]` → INTID `32 + 1 = 33`, and we call
+  `hv_gic_set_spi(33, …)`. Verify against `hv_gic_get_spi_interrupt_range()` and
+  `hv_gic_get_intid()` that 33 is the value the in-kernel GIC expects (it may
+  index differently).
+- **Edge vs level / pulse timing.** We assert on notify (`set_spi(true)`) and
+  deassert on ACK (`set_spi(false)`). The FDT says EDGE_RISING. Check whether the
+  guest configured it level, and whether asserting *during the paused MMIO exit*
+  (before the guest re-enters) latches the edge. Try a deassert→assert pulse, or
+  asserting after the exit.
+- **Does the guest enable the SPI?** Confirm the guest enabled INTID 33 in the
+  distributor (it should, since it set up the virtio IRQ) — a redistributor/
+  distributor reg read via `hv_gic_get_distributor_reg` could verify.
+- **Cross-check with the serial.** The serial uses INTID 32 (SPI 0) but only for
+  output (polled) — it has not exercised IRQ delivery, so virtio is the first
+  real test of `hv_gic_set_spi` delivery. If virtio IRQ is fixed, the same path
+  serves serial RX later.
 
-## Why the earlier candidates failed (now explained)
+## What works (unchanged)
 
-- libkrun's `hvf_sync_vtimer` is for a **userspace** GIC, where `set_vtimer_irq`
-  queues the PPI in `VcpuList` and the userspace GIC presents it via trapped ICC
-  reads. With our in-kernel GIC, ICC is handled in-kernel and nothing makes the
-  vtimer pending → no delivery.
-- Unmasking (candidate 1/3) doesn't make the interrupt pending; it only controls
-  whether HVF *exits* on timeout. Necessary but not sufficient.
-
-## Implementation outline (the next step)
-
-In `hvf` (a documented divergence from the userspace-GIC libkrun lift), add a
-GICv3 LR-based vtimer path:
-
-1. **One-time setup** (per vCPU, after GIC create / first run): enable the
-   virtual CPU interface — `ICH_HCR_EL2.En = 1` (and `LRENPIE`/maintenance if we
-   use the maintenance IRQ); read `ICH_VTR_EL2` for the LR count.
-2. **On `VTIMER_ACTIVATED`:** write a free list register
-   (`HV_GIC_ICH_REG_LR0_EL2`) with the vtimer pending — LR64 fields: `State =
-   0b01` (pending), `HW = 1`, `pINTID = 27`, `vINTID = 27`, `Group`/`Priority`
-   per the guest's config. Keep the HVF vtimer mask set (avoid the exit storm).
-3. **Detect EOI:** on subsequent exits, read `ICH_ELRSR_EL2` (or `ICH_EISR_EL2`);
-   when the vtimer's LR has emptied (guest deactivated INTID 27), clear the HVF
-   vtimer mask (`hv_vcpu_set_vtimer_mask(false)`) so the next deadline exits.
-   Alternative: wire `HV_GIC_INT_MAINTENANCE` and unmask in its handler.
-4. **`GicVcpus`/parking** (vmm) then layer on as planned — but `set_vtimer_irq`'s
-   real work is the LR injection in step 2, which lives in `hvf` (it needs the
-   `hv_gic_set_ich_reg` bindings).
-
-Bindings needed (already in `crates/hvf/src/bindings.rs`): `hv_gic_set_ich_reg`,
-`hv_gic_get_ich_reg`, and the `hv_gic_ich_reg_t` LR/HCR/ELRSR/EISR constants.
-
-Risks: the exact LR64 bit layout (State[63:62], HW[61], Group[60],
-Priority[55:48], pINTID[44:32], vINTID[31:0]) must be right; `ICH_HCR.En` must be
-set or the virtual interface stays off; EOI detection timing. Iterate against the
-live boot (success = OpenRC service-start lines past the banner).
+- virtio-blk mounts the rootfs and runs init (2e); the kernel boots to userspace.
+- The bounded-WFI timeout is currently masking the bug (the guest limps via
+  timeout polling). Channel parking would EXPOSE it (a no-timeout `recv()` would
+  hang outright until the IRQ fires) — so the IRQ-delivery fix must land before
+  or with the parking change.
 
 ## Status
 
-Research goal achieved: the in-kernel-GIC vtimer is delivered via GICv3 list
-registers (`hv_gic_set_ich_reg`), not the userspace-GIC mask protocol. The
-implementation is now a well-defined task (no longer a guess), ready to build
-against the live boot.
+Research goal re-scoped: the in-kernel-GIC **vtimer is not the problem** (it works
+natively); the problem is **virtio SPI interrupt delivery via `hv_gic_set_spi`**.
+The earlier list-register/vtimer experiments are reverted (moot — that exit never
+fires). Next: prove and fix `hv_gic_set_spi` delivery against the live boot.
