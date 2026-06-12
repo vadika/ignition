@@ -44,6 +44,11 @@ pub struct VcpuManager {
     vcpuids: Mutex<Vec<u64>>,
     threads: Mutex<Vec<JoinHandle<Result<(), hvf::Error>>>>,
     shutdown: AtomicBool,
+    /// Set by `request_snapshot`; cleared atomically inside `run_loop` when handled.
+    snapshot_req: AtomicBool,
+    /// Installed by the boot harness before `run`; called on the vCPU thread when
+    /// `snapshot_req` fires. Single-vCPU only (asserted at install time).
+    snapshot_handler: Option<Box<dyn Fn(&HvfVcpu) + Send + Sync>>,
 }
 
 impl VcpuManager {
@@ -57,7 +62,39 @@ impl VcpuManager {
             vcpuids: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
+            snapshot_req: AtomicBool::new(false),
+            snapshot_handler: None,
         })
+    }
+
+    /// Install a snapshot handler. MUST be called before `run` and only with
+    /// `vcpu_count == 1`. The handler is invoked on the vCPU thread (required by
+    /// HVF thread-affinity) when the snapshot request fires.
+    pub fn set_snapshot_handler(
+        self: &mut Arc<Self>,
+        handler: Box<dyn Fn(&HvfVcpu) + Send + Sync>,
+    ) {
+        let me = Arc::get_mut(self).expect("set_snapshot_handler must be called before run");
+        assert_eq!(me.mpidrs.len(), 1, "snapshot is single-vCPU only");
+        me.snapshot_handler = Some(handler);
+    }
+
+    /// Request a snapshot. Sets the flag and interrupts the (single) vCPU so the
+    /// handler fires at the next `Canceled` exit. No-op if no handler is installed.
+    pub fn request_snapshot(&self) {
+        if self.snapshot_handler.is_none() {
+            return;
+        }
+        self.snapshot_req.store(true, Ordering::Release);
+        // Interrupt the primary vCPU so it exits to `Canceled` promptly.
+        if let Some(&vcpuid) = self.vcpuids.lock().unwrap().first() {
+            let _ = hvf::vcpu_request_exit(vcpuid);
+        }
+    }
+
+    /// The HVF vcpuid of the primary vCPU (index 0), if it has been registered.
+    pub fn primary_vcpuid(&self) -> Option<u64> {
+        self.vcpuids.lock().unwrap().first().copied()
     }
 
     /// Try to claim `mpidr` for a bring-up. Idempotent guard against unknown or
@@ -83,6 +120,29 @@ impl VcpuManager {
         let primary = thread::spawn(move || me.run_primary(entry, fdt_addr));
         self.threads.lock().unwrap().push(primary);
         self.join_all()
+    }
+
+    /// Run the restore path: create a fresh primary vCPU, restore its state from
+    /// `vcpu_state`, and run the loop without calling `set_initial_state`. The
+    /// vCPU's PC/regs come exclusively from `vcpu_state`. Single-vCPU only.
+    pub fn run_restored(
+        self: &Arc<Self>,
+        vcpu_state: hvf::VcpuState,
+    ) -> Result<(), hvf::Error> {
+        let me = Arc::clone(self);
+        let handle = thread::spawn(move || me.run_restored_primary(vcpu_state));
+        self.threads.lock().unwrap().push(handle);
+        self.join_all()
+    }
+
+    fn run_restored_primary(self: &Arc<Self>, vcpu_state: hvf::VcpuState) -> Result<(), hvf::Error> {
+        let mpidr = mpidr_for(0);
+        self.running.lock().unwrap().insert(mpidr);
+        let vcpu = HvfVcpu::new(mpidr, false)?;
+        self.vcpuids.lock().unwrap().push(vcpu.id());
+        // Restore state instead of set_initial_state.
+        vcpu.restore_state(&vcpu_state)?;
+        self.run_loop(vcpu)
     }
 
     fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), hvf::Error> {
@@ -153,7 +213,15 @@ impl VcpuManager {
                     self.request_shutdown();
                     return Ok(());
                 }
-                VcpuExit::Canceled => return Ok(()),
+                VcpuExit::Canceled => {
+                    if self.snapshot_req.swap(false, Ordering::AcqRel) {
+                        if let Some(h) = &self.snapshot_handler {
+                            h(&vcpu);
+                        }
+                        continue; // resume the guest after snapshotting
+                    }
+                    return Ok(());
+                }
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
                 VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
                 VcpuExit::WaitForEventExpired | VcpuExit::VtimerActivated => {}

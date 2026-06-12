@@ -11,6 +11,7 @@
 // earlycon lines are cleanly separable.
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
@@ -24,6 +25,8 @@ use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
 use hvf::gic::HvfGicV3;
+use hvf::HvfVcpu;
+use vmm::snapshot::{self, MmioWindow, VmConfig, VmSnapshot};
 use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
 
@@ -48,6 +51,8 @@ enum Action {
     Pending,
     /// Quit the harness.
     Quit,
+    /// Ctrl-A s: request a snapshot.
+    Snapshot,
 }
 
 /// Advance the escape state machine by one input byte. The caller forwards
@@ -68,6 +73,7 @@ fn step(state: &mut EscState, byte: u8) -> Action {
             *state = EscState::Normal;
             match byte {
                 b'x' => Action::Quit,
+                b's' => Action::Snapshot,
                 // Ctrl-A Ctrl-A sends a single literal Ctrl-A to the guest.
                 CTRL_A => Action::Forward([CTRL_A, 0], 1),
                 // Ctrl-A was not an escape: send it literally, then this byte.
@@ -139,11 +145,13 @@ impl Drop for TermiosGuard {
 
 /// Spawn a thread that reads host stdin one byte at a time, runs the escape
 /// state machine, and feeds forwarded bytes into the serial's RX FIFO. On
-/// Ctrl-A x it restores the terminal and exits the process. On EOF/error it
-/// stops reading and leaves the guest running.
+/// Ctrl-A x it restores the terminal and exits the process. On Ctrl-A s it
+/// requests a snapshot via the manager. On EOF/error it stops reading and
+/// leaves the guest running.
 fn spawn_stdin_reader(
     serial: Arc<Mutex<Serial<FlushWriter>>>,
     saved_termios: Option<libc::termios>,
+    manager: Arc<vmm::vstate::vcpu_manager::VcpuManager>,
 ) {
     // Detached: the reader lives for the process lifetime.
     std::thread::spawn(move || {
@@ -179,6 +187,10 @@ fn spawn_stdin_reader(
                     restore_termios(&saved_termios);
                     eprintln!("\n[console detached]");
                     process::exit(0);
+                }
+                Action::Snapshot => {
+                    eprintln!("\n[snapshot requested]");
+                    manager.request_snapshot();
                 }
             }
         }
@@ -221,6 +233,8 @@ fn main() {
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
     let mut net = false;
+    let mut snap_dir: PathBuf = PathBuf::from("./snapshot");
+    let mut restore_dir: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -237,6 +251,14 @@ fn main() {
             "--net" => {
                 net = true;
             }
+            "--snap-dir" => {
+                let v = it.next().expect("--snap-dir needs a path");
+                snap_dir = PathBuf::from(v);
+            }
+            "--restore" => {
+                let v = it.next().expect("--restore needs a directory path");
+                restore_dir = Some(PathBuf::from(v));
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown flag: {other}");
                 process::exit(2);
@@ -244,8 +266,21 @@ fn main() {
             other => positionals.push(other.to_string()),
         }
     }
+
+    // Restore path: skip normal boot entirely.
+    if let Some(dir) = restore_dir {
+        match run_restore(&dir) {
+            Ok(()) => eprintln!("\n[restore exited cleanly]"),
+            Err(e) => {
+                eprintln!("\n[restore error: {e}]");
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--net] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--net] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     let kernel_image = fs::read(&positionals[0]).expect("failed to read kernel image");
@@ -338,6 +373,9 @@ fn main() {
     bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial_bus)
         .expect("serial range overlap");
 
+    // Keep a typed Arc for the snapshot handler (None when no disk).
+    let virtio_blk_mmio: Option<Arc<Mutex<VirtioMmio>>>;
+
     if let Some(path) = &disk_path {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -348,15 +386,19 @@ fn main() {
         // SAFETY: the host mapping outlives the run; the device touches it only
         // during MMIO exits, when the guest is paused.
         let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        let virtio: Arc<Mutex<dyn BusDevice>> =
+        let virtio: Arc<Mutex<VirtioMmio>> =
             Arc::new(Mutex::new(VirtioMmio::new(
                 Box::new(blk),
                 guest_ram,
                 Arc::new(GicIrq { gic: gic.clone(), intid: layout::VIRTIO_SPI + 32 }),
             )));
-        bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio)
+        let virtio_bus: Arc<Mutex<dyn BusDevice>> = virtio.clone();
+        bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio_bus)
             .expect("virtio range overlap");
+        virtio_blk_mmio = Some(virtio);
         eprintln!("virtio : /dev/vda backed by {path}");
+    } else {
+        virtio_blk_mmio = None;
     }
 
     if net {
@@ -381,19 +423,211 @@ fn main() {
 
     let bus = Arc::new(bus);
 
+    // Build the VcpuManager and (for single-vCPU + disk + no-net) install the
+    // snapshot handler before run.
+    let mut manager = VcpuManager::new(smp, bus);
+
+    if smp == 1 && !net {
+        // Build a closure capturing all state needed to write the snapshot.
+        // Clone Arcs and scalars; `host` raw pointer is captured as usize for Send.
+        let gic_snap = gic.clone();
+        let serial_snap = serial.clone();
+        let blk_snap = virtio_blk_mmio.clone();
+        let disk_path_snap = disk_path.clone();
+        let snap_dir_snap = snap_dir.clone();
+        let host_usize = host as usize;
+
+        manager.set_snapshot_handler(Box::new(move |vcpu: &HvfVcpu| {
+            // All of this runs on the vCPU thread.
+            let vcpu_state = match vcpu.save_state() {
+                Ok(s) => s,
+                Err(e) => { eprintln!("[snapshot] save_state failed: {e}"); return; }
+            };
+            let gic_blob = match gic_snap.save_state() {
+                Ok(b) => b,
+                Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
+            };
+            let blk_state = blk_snap.as_ref().map(|v| v.lock().unwrap().save());
+            let serial_state = serial_snap.lock().unwrap().save();
+
+            // Build VmSnapshot.
+            let blk_mmio_state = match blk_state {
+                Some(s) => s,
+                None => {
+                    // No disk — snapshot of a diskless guest is degenerate but allowed.
+                    devices::virtio::mmio::VirtioMmioState {
+                        status: 0, queue_sel: 0, device_features_sel: 0,
+                        interrupt_status: 0, queues: vec![],
+                    }
+                }
+            };
+            let config = VmConfig {
+                mem_size: RAM_SIZE,
+                vcpu_count: 1,
+                serial: MmioWindow {
+                    base: layout::SERIAL_BASE,
+                    size: layout::SERIAL_SIZE,
+                    spi: layout::SERIAL_SPI,
+                },
+                blk: MmioWindow {
+                    base: layout::VIRTIO_BASE,
+                    size: layout::VIRTIO_SIZE,
+                    spi: layout::VIRTIO_SPI,
+                },
+            };
+            let devices_state = vmm::snapshot::DeviceState {
+                blk: blk_mmio_state,
+                serial: serial_state,
+            };
+            let snap = VmSnapshot::new(config, vcpu_state, devices_state);
+
+            // The RAM slice — pointer was captured as usize for Send.
+            let ram_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(host_usize as *const u8, RAM_SIZE as usize)
+            };
+
+            let disk_src = match &disk_path_snap {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    // Write an empty placeholder so the snapshot dir is complete.
+                    let placeholder = snap_dir_snap.join("disk.img");
+                    let _ = std::fs::write(&placeholder, b"");
+                    placeholder
+                }
+            };
+
+            match snapshot::write_snapshot(&snap_dir_snap, &snap, ram_slice, &gic_blob, &disk_src) {
+                Ok(()) => eprintln!("[snapshot] written to {}", snap_dir_snap.display()),
+                Err(e) => eprintln!("[snapshot] write failed: {e}"),
+            }
+        }));
+    } else if !net {
+        eprintln!("[snapshot] handler not installed: smp={smp} (snapshot is single-vCPU only)");
+    } else {
+        eprintln!("[snapshot] handler not installed: --net active (snapshot requires no net)");
+    }
+
     // Raw terminal + host stdin reader for the interactive console. The guard
     // restores the terminal on drop (guest-initiated exit); the reader restores
     // it before process::exit on Ctrl-A x.
     let termios = TermiosGuard::new();
-    spawn_stdin_reader(serial.clone(), termios.saved());
-    eprintln!("--- console attached (quit: Ctrl-A x), {smp} vCPU(s) ---");
+    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone());
+    eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s), {smp} vCPU(s) ---");
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
-    let manager = VcpuManager::new(smp, bus);
     match manager.run(entry, fdt_addr) {
         Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
         Err(e) => eprintln!("\n[vcpu error: {e}]"),
     }
+}
+
+/// Restore a snapshot from `dir` and resume the guest.
+/// Does NOT load a kernel, generate an FDT, or call set_initial_state.
+/// The running kernel + DTB are already in memory.bin.
+fn run_restore(dir: &Path) -> io::Result<()> {
+    use devices::bus::BusDevice;
+
+    // 1. Read the snapshot metadata.
+    let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
+    assert_eq!(
+        snap.config.vcpu_count, 1,
+        "restore only supports single-vCPU snapshots"
+    );
+    assert_eq!(
+        snap.config.mem_size, RAM_SIZE,
+        "snapshot mem_size does not match this binary's RAM_SIZE"
+    );
+
+    // 2. Allocate guest RAM and load memory.bin into it.
+    let host = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            RAM_SIZE as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    assert!(host != libc::MAP_FAILED, "mmap failed");
+    let host_addr = host as u64;
+    let ram: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(host as *mut u8, RAM_SIZE as usize) };
+    let mem_bytes = fs::read(&paths.memory)?;
+    assert_eq!(
+        mem_bytes.len(),
+        snap.config.mem_size as usize,
+        "memory.bin length != snap.config.mem_size"
+    );
+    ram.copy_from_slice(&mem_bytes);
+    drop(mem_bytes);
+
+    // 3. Create the HVF VM (must precede GIC and vCPU creation).
+    let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
+
+    // 4. Restore the in-kernel GIC (replaces hv_gic_create).
+    let gic = Arc::new(
+        HvfGicV3::from_state(&gic_blob, snap.config.vcpu_count, layout::RAM_BASE)
+            .map_err(|e| io::Error::other(format!("GIC restore: {e}")))?,
+    );
+
+    // 5. Map the populated RAM into the guest.
+    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+        .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
+
+    // 6. Copy disk.img to a private instance so clones are independent.
+    let instance_disk = dir.join(format!("instance-{}.img", process::id()));
+    fs::copy(&paths.disk, &instance_disk)?;
+    let disk_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&instance_disk)
+        .map_err(|e| io::Error::other(format!("open instance disk: {e}")))?;
+
+    // 7. Build the bus from the restored device state.
+    let mut bus = Bus::new();
+
+    // Serial.
+    let serial_irq: Arc<dyn IrqLine> =
+        Arc::new(GicIrq { gic: gic.clone(), intid: snap.config.serial.spi + 32 });
+    let serial: Arc<Mutex<Serial<FlushWriter>>> = Arc::new(Mutex::new(
+        Serial::from_snapshot(FlushWriter, serial_irq, &snap.devices.serial),
+    ));
+    let serial_bus: Arc<Mutex<dyn BusDevice>> = serial.clone();
+    bus.register(snap.config.serial.base, snap.config.serial.size, serial_bus)
+        .map_err(|e| io::Error::other(format!("serial bus register: {e:?}")))?;
+
+    // Virtio-blk.
+    let blk = VirtioBlk::new(disk_file)
+        .map_err(|e| io::Error::other(format!("VirtioBlk::new: {e}")))?;
+    let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+    let blk_irq: Arc<dyn IrqLine> =
+        Arc::new(GicIrq { gic: gic.clone(), intid: snap.config.blk.spi + 32 });
+    let mut blk_mmio = VirtioMmio::new(Box::new(blk), guest_ram, blk_irq);
+    blk_mmio.restore(&snap.devices.blk);
+    let blk_arc: Arc<Mutex<VirtioMmio>> = Arc::new(Mutex::new(blk_mmio));
+    let blk_bus: Arc<Mutex<dyn BusDevice>> = blk_arc.clone();
+    bus.register(snap.config.blk.base, snap.config.blk.size, blk_bus)
+        .map_err(|e| io::Error::other(format!("blk bus register: {e:?}")))?;
+
+    let bus = Arc::new(bus);
+
+    // 8. Set up the interactive console (raw terminal + stdin reader).
+    let termios = TermiosGuard::new();
+    let manager = VcpuManager::new(1, bus);
+    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone());
+    eprintln!("--- restore console attached (quit: Ctrl-A x) ---");
+
+    eprintln!("== ignition restore == (no kernel boot; resuming from saved PC)");
+    eprintln!("--- guest console (stdout) ---");
+    io::stderr().flush().ok();
+
+    // 9. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
+    match manager.run_restored(snap.vcpu) {
+        Ok(()) => {}
+        Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -434,5 +668,12 @@ mod tests {
             Action::Forward(buf, 1) => assert_eq!(buf[0], CTRL_A),
             _ => panic!("expected one literal Ctrl-A"),
         }
+    }
+
+    #[test]
+    fn ctrl_a_then_s_snapshots() {
+        let mut s = EscState::Normal;
+        assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
+        assert!(matches!(step(&mut s, b's'), Action::Snapshot));
     }
 }
