@@ -1,13 +1,18 @@
 # ignition
 
-A research fork porting AWS Firecracker's microVM VMM to **macOS on Apple
-Silicon**, replacing KVM with Apple's **Hypervisor.framework (HVF)**. Permanently
-diverged from upstream Firecracker (which is KVM-only by design tenet).
+A research microVM for **macOS on Apple Silicon**, built on Apple's
+**Hypervisor.framework (HVF)**. Architecturally modeled on AWS Firecracker — the
+microVM model, the vstate seam, the device set — but **not a port of it**: it
+shares ~0 lines of Firecracker source (the Firecracker repo isn't even a
+dependency). The lineage is the *design*, plus the rust-vmm building blocks
+Firecracker also uses (`vm-superio`, `vm-fdt`).
 
-Reference implementation for the HVF layer is [libkrun](https://github.com/containers/libkrun)
-(Apache-2.0, itself Firecracker-derived). See `HANDOFF.md` and
-`firecracker-hvf-porting-map.md` for the full plan and source analysis, and
-`SPIKE_RESULTS.md` for the validation spike that de-risked this structure.
+The one genuinely lifted piece is the HVF backend — the `hvf` crate, taken from
+[libkrun](https://github.com/containers/libkrun) (Red Hat, Apache-2.0; itself
+Firecracker-inspired) and then substantially reworked here (direct `hv_gic_*`,
+SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
+harness — is original. See `HANDOFF.md` and `firecracker-hvf-porting-map.md` for
+the source analysis, and `SPIKE_RESULTS.md` for the validation spike.
 
 ## Status: boots Linux to a shell, with snapshot/restore
 
@@ -31,7 +36,7 @@ load-bearing layer; the `hvf-spike` smoke test still exercises it in isolation
 ```
 crates/
   arch/      ignition-arch  (lib `arch`)  — aarch64 sysreg tables; FDT/boot regs later
-  hvf/       ignition-hvf   (lib `hvf`)   — Hypervisor.framework backend, verbatim from libkrun
+  hvf/       ignition-hvf   (lib `hvf`)   — Hypervisor.framework backend, lifted from libkrun then reworked
   devices/   ignition-devices             — serial/virtio/GIC (Phase 1)
   vmm/       ignition-vmm   (lib `vmm`)   — vstate seam (HVF replacement for FC kvm/vm/vcpu)
 spike/       hvf-spike                     — smoke test for the hvf crate
