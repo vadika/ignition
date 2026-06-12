@@ -10,3 +10,4 @@
 //   libkrun/src/vmm/src/device_manager/hvf/mmio.rs     (MMIO bus without irqfd)
 
 pub mod bus;
+pub mod serial;
