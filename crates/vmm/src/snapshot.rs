@@ -52,6 +52,7 @@ impl VmSnapshot {
     }
 }
 
+#[derive(Debug)]
 pub struct Paths {
     pub memory: PathBuf,
     pub gic: PathBuf,
@@ -163,5 +164,19 @@ mod tests {
         assert_eq!(gic, vec![1, 2, 3]);
         assert_eq!(std::fs::read(&p.memory).unwrap(), vec![0u8; 16]);
         assert_eq!(std::fs::read(&p.disk).unwrap(), b"DISK");
+    }
+
+    #[test]
+    fn read_snapshot_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("src.img");
+        std::fs::write(&disk, b"D").unwrap();
+        write_snapshot(dir.path(), &sample(), &[0u8; 8], &[0u8], &disk).unwrap();
+        let p = paths(dir.path());
+        let mut snap = sample();
+        snap.magic = "wrong-magic".to_string();
+        std::fs::write(&p.state, serde_json::to_vec(&snap).unwrap()).unwrap();
+        let err = read_snapshot(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("magic"), "error should mention magic: {err}");
     }
 }
