@@ -95,12 +95,22 @@ impl VirtioMmio {
             0x044 => {
                 self.queue_ready = val;
                 if val == 1 && self.queue_sel == 0 {
+                    // The driver writes all six addr halves before QueueReady=1
+                    // (virtio 1.0 §4.2.3.2), so the shadows are stable here.
                     let desc = (u64::from(self.desc_hi) << 32) | u64::from(self.desc_lo);
                     let driver = (u64::from(self.driver_hi) << 32) | u64::from(self.driver_lo);
                     let device = (u64::from(self.device_hi) << 32) | u64::from(self.device_lo);
                     self.vq = Some(Virtqueue::new(self.queue_num, desc, driver, device));
                 } else if val == 0 {
+                    // Drop the queue and clear the addr shadows so a re-setup
+                    // can't compose a GPA from a mix of new and stale halves.
                     self.vq = None;
+                    self.desc_lo = 0;
+                    self.desc_hi = 0;
+                    self.driver_lo = 0;
+                    self.driver_hi = 0;
+                    self.device_lo = 0;
+                    self.device_hi = 0;
                 }
             }
             0x050 => self.notify(),
@@ -149,6 +159,9 @@ impl VirtioMmio {
             }
         }
         if serviced {
+            // Re-asserting an already-asserted line is idempotent; the guest
+            // drains the whole used ring on the one interrupt it handles, so no
+            // completion is lost if a second notify lands before the ACK.
             self.interrupt_status |= INT_STATUS_USED;
             self.irq.set_spi(true);
         }
