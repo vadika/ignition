@@ -69,6 +69,11 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     create_cpu_nodes(&mut fdt, &cfg.cpu_mpidrs)?;
     create_memory_node(&mut fdt, cfg.mem_base, cfg.mem_size)?;
     create_chosen_node(&mut fdt, &cfg.cmdline, cfg.initrd)?;
+    create_gic_node(&mut fdt, &cfg.gic)?;
+    create_clock_node(&mut fdt)?;
+    create_timer_node(&mut fdt)?;
+    create_psci_node(&mut fdt)?;
+    create_serial_node(&mut fdt, &cfg.serial)?;
 
     fdt.end_node(root)?;
     fdt.finish()
@@ -104,6 +109,75 @@ fn create_chosen_node(
         fdt.property_u64("linux,initrd-end", addr + size)?;
     }
     fdt.end_node(chosen)?;
+    Ok(())
+}
+
+fn create_gic_node(fdt: &mut FdtWriter, gic: &GicInfo) -> Result<(), vm_fdt::Error> {
+    let intc = fdt.begin_node("intc")?;
+    fdt.property_string("compatible", "arm,gic-v3")?;
+    fdt.property_null("interrupt-controller")?;
+    fdt.property_u32("#interrupt-cells", 3)?;
+    fdt.property_array_u64(
+        "reg",
+        &[gic.dist_base, gic.dist_size, gic.redist_base, gic.redist_size],
+    )?;
+    fdt.property_u32("phandle", GIC_PHANDLE)?;
+    fdt.property_u32("#address-cells", 2)?;
+    fdt.property_u32("#size-cells", 2)?;
+    fdt.property_null("ranges")?;
+    fdt.property_array_u32("interrupts", &[IRQ_TYPE_PPI, gic.maint_irq, IRQ_TYPE_LEVEL_HI])?;
+    fdt.end_node(intc)?;
+    Ok(())
+}
+
+fn create_clock_node(fdt: &mut FdtWriter) -> Result<(), vm_fdt::Error> {
+    let clock = fdt.begin_node("apb-pclk")?;
+    fdt.property_string("compatible", "fixed-clock")?;
+    fdt.property_u32("#clock-cells", 0x0)?;
+    fdt.property_u32("clock-frequency", 24_000_000)?;
+    fdt.property_string("clock-output-names", "clk24mhz")?;
+    fdt.property_u32("phandle", CLOCK_PHANDLE)?;
+    fdt.end_node(clock)?;
+    Ok(())
+}
+
+fn create_timer_node(fdt: &mut FdtWriter) -> Result<(), vm_fdt::Error> {
+    // Fixed PPIs for the arm,armv8-timer (secure/non-secure/virtual/hyp).
+    let irqs = [13u32, 14, 11, 10];
+    let mut cells = Vec::with_capacity(irqs.len() * 3);
+    for &irq in irqs.iter() {
+        cells.push(IRQ_TYPE_PPI);
+        cells.push(irq);
+        cells.push(IRQ_TYPE_LEVEL_HI);
+    }
+    let timer = fdt.begin_node("timer")?;
+    fdt.property_string("compatible", "arm,armv8-timer")?;
+    fdt.property_null("always-on")?;
+    fdt.property_array_u32("interrupts", &cells)?;
+    fdt.end_node(timer)?;
+    Ok(())
+}
+
+fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), vm_fdt::Error> {
+    let psci = fdt.begin_node("psci")?;
+    fdt.property_string("compatible", "arm,psci-0.2")?;
+    // PSCI calls use HVC (we are the hypervisor firmware).
+    fdt.property_string("method", "hvc")?;
+    fdt.end_node(psci)?;
+    Ok(())
+}
+
+fn create_serial_node(fdt: &mut FdtWriter, serial: &MmioDev) -> Result<(), vm_fdt::Error> {
+    let uart = fdt.begin_node(&format!("uart@{:x}", serial.addr))?;
+    fdt.property_string("compatible", "ns16550a")?;
+    fdt.property_array_u64("reg", &[serial.addr, serial.size])?;
+    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
+    fdt.property_string("clock-names", "apb_pclk")?;
+    fdt.property_array_u32(
+        "interrupts",
+        &[IRQ_TYPE_SPI, serial.irq, IRQ_TYPE_EDGE_RISING],
+    )?;
+    fdt.end_node(uart)?;
     Ok(())
 }
 
@@ -209,5 +283,54 @@ mod tests {
         let chosen = dt.find_node("/chosen").unwrap();
         assert_eq!(be_u64s(chosen.property("linux,initrd-start").unwrap().value), vec![0x4800_0000]);
         assert_eq!(be_u64s(chosen.property("linux,initrd-end").unwrap().value), vec![0x4810_0000]);
+    }
+
+    #[test]
+    fn gic_node_is_gicv3_with_reg_and_cells() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let intc = dt.find_node("/intc").unwrap();
+        assert_eq!(dt_str(intc.property("compatible").unwrap().value), "arm,gic-v3");
+        assert_eq!(be_u32s(intc.property("#interrupt-cells").unwrap().value), vec![3]);
+        assert!(intc.property("interrupt-controller").is_some());
+        assert_eq!(
+            be_u64s(intc.property("reg").unwrap().value),
+            vec![0x0800_0000, 0x1_0000, 0x080A_0000, 0xC_0000]
+        );
+        assert_eq!(be_u32s(intc.property("phandle").unwrap().value), vec![1]);
+    }
+
+    #[test]
+    fn psci_uses_hvc() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let psci = dt.find_node("/psci").unwrap();
+        assert_eq!(dt_str(psci.property("compatible").unwrap().value), "arm,psci-0.2");
+        assert_eq!(dt_str(psci.property("method").unwrap().value), "hvc");
+    }
+
+    #[test]
+    fn timer_is_armv8_timer() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let timer = dt.find_node("/timer").unwrap();
+        assert_eq!(dt_str(timer.property("compatible").unwrap().value), "arm,armv8-timer");
+        // four PPIs, each 3 cells: [PPI, n, LEVEL_HI]
+        assert_eq!(
+            be_u32s(timer.property("interrupts").unwrap().value),
+            vec![1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4]
+        );
+    }
+
+    #[test]
+    fn serial_node_is_ns16550a() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let uart = dt.find_node("/uart@9000000").unwrap();
+        assert_eq!(dt_str(uart.property("compatible").unwrap().value), "ns16550a");
+        assert_eq!(be_u64s(uart.property("reg").unwrap().value), vec![0x0900_0000, 0x1000]);
+        assert_eq!(be_u32s(uart.property("clocks").unwrap().value), vec![2]);
+        // [SPI, irq, EDGE_RISING]
+        assert_eq!(be_u32s(uart.property("interrupts").unwrap().value), vec![0, 33, 1]);
     }
 }
