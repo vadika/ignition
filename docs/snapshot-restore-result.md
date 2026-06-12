@@ -1,127 +1,87 @@
-# Snapshot / restore — PARTIAL: snapshot works; restore resumes-without-crash but livelocks
+# Snapshot / restore — WORKING (single-vCPU, clone-capable, no-net)
 
-Date: 2026-06-12. Status: **snapshot fully working; restore loads everything and
-resumes without crashing, but the guest livelocks (100% CPU, spinning in guest code
-with no host exits). Root cause not yet found.** Honest checkpoint — not a completed
-milestone.
+Date: 2026-06-12. Status: **snapshot + restore fully working.** A running guest can
+be snapshotted (`Ctrl-A s`), and the snapshot directory restored (`boot --restore
+<dir>`) into a fresh, responsive guest that idles at ~0% CPU, keeps time, and accepts
+console input. The same snapshot can be restored multiple times into independent
+guests (clone).
 
-## What works
+## What works, end to end
 
-- **Snapshot** (`Ctrl-A s`): captures and writes a complete directory —
-  `memory.bin` (512 MiB RAM dump), `gic.bin` (the `hv_gic_state` distributor/
-  redistributor blob), `disk.img` (rootfs copy), `vmstate.json` (vCPU + device
-  state). The guest **resumes and keeps running** after snapshotting. Verified end
-  to end.
-- **State model + I/O** (Tasks 1–3, all unit-tested, 15 suites green, 0 clippy):
-  `VcpuState` (GP + 38 sysregs + FP/SIMD + vtimer + PAC keys + ICC), `VirtioMmioState`,
-  `SerialSnapshot`, `VmSnapshot` write/read with magic validation + atomic temp-dir
-  rename. The two-stage reviews caught + fixed: the FP/SIMD capture gap (would
-  corrupt glibc on resume), the GIC state-object leak, the unsafe serial swap
-  (replaced with a safe constructor), the instance-disk-pollutes-snapshot bug, the
-  non-atomic write, and the handler-panic-unwinds-vCPU bug.
-- **Restore** (`boot --restore <dir>`): loads RAM, restores the GIC, rebuilds the
-  bus + devices from the saved state (private per-clone disk copy), creates the vCPU,
-  applies the saved register state, and resumes from the saved PC — **no kernel
-  reload, no FDT regeneration** (confirmed: 0 "Booting Linux" banners on restore).
+- **Snapshot** (`Ctrl-A s`): writes a complete directory — `memory.bin` (RAM dump),
+  `gic.bin` (the `hv_gic_state` distributor/redistributor blob), `disk.img` (rootfs
+  copy), `vmstate.json` (vCPU + device state). The guest resumes after snapshotting.
+- **Restore** (`boot --restore <dir>`): loads RAM, creates the GIC + vCPU, restores
+  the GIC state, applies the saved register/timer/device state, and resumes from the
+  saved PC — no kernel reload, no FDT regeneration.
+- **Responsive + idle**: the restored guest parks at ~0% CPU at its idle WFI and
+  responds to typed input (login prompt, shell commands).
+- **Clone**: restoring one snapshot twice yields two independent guests (private
+  per-clone disk copy under `std::env::temp_dir()`).
 
-## Three real bugs found + fixed via live restore debugging
+Drivers (live, not `cargo test` — they need the hypervisor entitlement + a real
+kernel/rootfs): `scripts/restore_test.py` (snapshot → restore → CPU% + responsive),
+`scripts/restore_clone_test.py` (login + command + two clones).
+
+## Bugs found and fixed via live restore debugging
 
 Each was confirmed by the guest's failure mode changing:
 
-1. **GIC restore needs create-first.** `HvfGicV3::from_state` originally called
-   `hv_gic_set_state` alone → "Error restoring HVF GIC state". `hv_gic_set_state`
-   restores INTO an existing GIC; it does not create one. Fixed to `hv_gic_create`
-   (same placement config as `new`) then `hv_gic_set_state`.
-2. **Pointer-authentication keys.** The restored guest panicked: "Attempted to kill
-   the idle task", faulting on instruction `0xd50323bf` = `autiasp`. The kernel
-   signs return addresses with the PAC keys (APIA/APIB/APDA/APDB/APGA, HI+LO); a
-   restored vCPU with different keys fails authentication → corrupted pointer →
-   crash. Added all 10 PAC key sysregs to the captured set. (Fixed the crash.)
-3. **Per-vCPU GIC CPU-interface (ICC) state.** The ICC registers (CTLR/PMR/IGRPEN0/1/
-   BPR0/1/SRE/AP0R0/AP1R0) live in the vCPU's interface, NOT in the
-   distributor/redistributor `hv_gic_state` blob. Added `hv_gic_get/set_icc_reg`
-   capture/restore. (Did not change the livelock — see below.)
+1. **GIC restore needs create-first.** `hv_gic_set_state` restores INTO an existing
+   in-kernel GIC; it does not create one. Create the GIC (`hv_gic_create`, same
+   placement as a fresh boot) before restoring its state.
+2. **Pointer-authentication keys.** The restored guest faulted on `autiasp`
+   ("Attempted to kill the idle task"). The kernel signs return addresses with the
+   PAC keys (APIA/APIB/APDA/APDB/APGA, HI+LO); a restored vCPU needs the same keys.
+   Added all 10 to the captured set.
+3. **FP/SIMD state.** Added Q0–Q31 + FPCR/FPSR capture/restore (otherwise glibc's
+   NEON paths corrupt on resume).
+4. **The livelock — three interacting causes (see below).**
 
-## The open problem — narrowed by systematic debugging
+## The livelock: root cause and the three-part fix
 
-After (1)+(2) the guest no longer crashes; after (3) it still **livelocks** at 100%
-CPU. Also added (4) a **vtimer-offset continuity fix** (capture `mach_absolute_time`
-at snapshot; on restore set `vtimer_offset += elapsed_host_counter` so the guest's
-`CNTVCT` continues instead of jumping to host uptime) — correct and necessary, but
-did NOT resolve the spin.
+After (1)–(3) the restored guest no longer crashed but **livelocked at 100% CPU**,
+PC pinned at the idle `wfi` (`arch_cpu_idle` / `cpu_do_idle`), with **zero host
+exits** — i.e. spinning entirely inside `hv_vcpu_run`. Systematic instrumentation
+(a kicked PC + vtimer-state sampler) established:
 
-### What the systematic debugging established (tools: a gated PC sampler —
-`IGNITION_SAMPLE` — that kicks the vCPU to read its PC, plus decoding instructions
-straight out of `memory.bin`)
+- The vtimer fires once; `CNTV_CTL.ISTATUS` latches and `CNTV_CVAL` then **never
+  moves** — the guest never re-arms it, so the timer IRQ is never serviced.
+- WFI wakes on the pending vtimer (so it never traps to the host → no exit), but the
+  IRQ is **never delivered as an exception** (PC never enters a handler). Forcing
+  `PSTATE.I` clear did not help → the interrupt was not deliverable at the CPU
+  interface at all.
 
-- **The spin is the kernel idle loop.** The PC sits at `0xffff800008b1182c` (~38/40
-  samples). The instructions there (read from `memory.bin` at the matching offset)
-  are `paciasp ; dsb sy ; wfi ; autiasp ; ret` — i.e. `arch_cpu_idle`. **WFI is
-  returning immediately and the idle loop spins.**
-- **Normal idle parks; restore idle spins.** A normally-booted guest left idle at
-  the login prompt sits at **0.0% CPU** (WFI traps → host parks). The restored guest
-  at the same idle loop is **100% CPU** (WFI does not trap). This is the core
-  anomaly.
-- **It is NOT the vtimer.** Force-masking the vtimer (`hv_vcpu_set_vtimer_mask(true)`)
-  AND the offset-continuity fix both leave it spinning.
-- **It is NOT interrupt delivery at the CPU interface.** Forcing `ICC_IGRPEN0/1 = 0`
-  on restore does not stop the spin (IGRPEN gates *delivery as an exception*, not the
-  WFI *wake*, which is at the redistributor/distributor pending level).
-- **It is NOT the restored GIC blob.** Restoring with a *fresh* GIC
-  (`hv_gic_create` only, skipping `hv_gic_set_state`) still spins. So no
-  restored-pending-interrupt is the cause.
-- **Independent of the snapshot↔restore time gap** (reproduces back-to-back).
+Three things had to be true for the guest to resume correctly:
 
-### ROOT CAUSE FOUND + PROVEN: the virtual-timer comparator
+1. **GIC state must be restored AFTER the vCPU exists.** `hv_gic_set_state` restores
+   the per-cpu *redistributor* state, which includes the PPI enable bits that gate
+   the virtual-timer interrupt (PPI 27). Restoring it before the vCPU is created
+   (the old code created the GIC and restored its state up front, then created the
+   vCPU) silently dropped the redistributor state, so the timer IRQ was never
+   delivered. **This was the actual livelock.** Fix: `HvfGicV3::new` creates the GIC
+   up front; `gic_restore(blob)` applies the saved state on the vCPU thread, after
+   `HvfVcpu::new`, before `restore_state`. (`crates/hvf/src/gic.rs`,
+   `crates/vmm/src/vstate/vcpu_manager.rs::run_restored_primary`.)
+2. **The WFI exit handler must be vtimer-offset-aware** (`crates/hvf/src/lib.rs`,
+   `EC_WFX_TRAP`). It compared `CNTV_CVAL` against raw `mach_absolute_time()`. That
+   is correct only when `vtimer_offset == 0` (fresh boot). With a nonzero restore
+   offset it read the comparator as perpetually expired and the host busy-looped on
+   `WaitForEventExpired`. Fixed to compare against `CNTVCT = mach - vtimer_offset`
+   (read back via `hv_vcpu_get_vtimer_offset`); reduces to the original on a fresh
+   boot.
+3. **The vtimer offset must make CNTVCT continuous** across the snapshot
+   (`restore_state`). At snapshot time `vtimer_offset == 0`, so `CNTVCT == CNTPCT ==
+   mach_absolute_time() == host_counter` (captured). On restore, set `offset =
+   mach_now - host_counter` so CNTVCT resumes at the captured value instead of
+   jumping forward by the wall-clock gap (a forward jump expires every armed
+   clock-event deadline at once → timer storm).
 
-Skipping the generic-timer sysregs on restore (`IGNITION_SKIP_TIMER` probe — not
-restoring `CNTV_CTL/CVAL`, `CNTP_CTL/CVAL`, `CNTKCTL`) makes the guest **park at
-0.0% CPU** instead of spinning. So the cause is the timer: the captured
-`CNTV_CTL.ENABLE=1` plus the **absolute** `CNTV_CVAL` deadline, which in the
-restored vCPU's counter domain is already-expired → `ISTATUS` stays set → the
-virtual-timer PPI is perpetually pending at the redistributor → the idle WFI never
-traps → 100% CPU spin. This explains why masking the vtimer, zeroing `IGRPEN`, and
-using a fresh GIC all failed: none of them clear the redistributor pending bit that
-the enabled+expired comparator keeps re-setting.
-
-### The remaining blocker (well-defined): re-anchor the comparator
-
-Skip-timer parks but is **non-functional** (timer disabled → no scheduler tick →
-unresponsive). The guest needs the timer enabled with a comparator that is NOT
-expired in the restored counter domain. Every host-side way to achieve that was
-tried and is blocked by missing HVF primitives:
-
-- **Adjust `vtimer_offset` by the mach-counter delta** — `mach_absolute_time` is a
-  different counter domain than the guest's `CNTVCT`; both signs still spin.
-- **Anchor the offset to the captured `CNTV_CVAL`** — same domain problem.
-- **Binary-search the offset using `CNTV_CTL.ISTATUS`** — `ISTATUS` is not
-  recomputed while the vCPU is stopped, so the host reads a stale value and the
-  search never converges.
-- **Write the relative `CNTV_TVAL`** (which would set `CVAL = CNTVCT + TVAL`,
-  domain-independent) — HVF's sysreg enum exposes `CNTP_TVAL_EL0` but **not**
-  `CNTV_TVAL_EL0`.
-- HVF exposes no gettable `CNTVCT_EL0`/`CNTPCT_EL0` to compute a correct offset.
-
-**Next-session options:** (a) run the restored vCPU for a single bounded step so the
-timer hardware recomputes `ISTATUS`, then binary-search the offset across real
-runs (slower but `ISTATUS` becomes live); (b) find the exact relationship between
-`hv_vcpu_set_vtimer_offset` and `mach_absolute_time` (Apple HVF docs / a calibration
-that reads back something live) and set the offset so `CNTVCT` continues from the
-snapshot; (c) capture the guest's `CNTVCT` at snapshot via a guest-cooperative read
-and re-anchor `CNTV_CVAL` to `CNTVCT_fresh + tick`. Note there may ALSO be a second
-issue (serial-RX delivery on restore) to verify once the timer is fixed — skip-timer
-parked but did not respond to typed input.
-
-The `IGNITION_SAMPLE` PC sampler + `HvfVcpu::read_pc` + the `host_counter` capture
-are left in (gated/harmless) for this work.
+On Apple Silicon `CNTPCT == mach_absolute_time()` and `CNTVCT = CNTPCT - offset`;
+these were confirmed empirically by the offset/cval/cntvct sampler.
 
 ## Tests / gate
 
 15 test suites green (serde round-trips for every state struct; device save/restore;
-snapshot dir write/read/magic). Workspace builds, 0 clippy. The live snapshot→restore
-is the part that does not yet succeed.
-
-## Commits
-
-`f1bc34f` (vCPU+GIC state) → `17cd1d7` (the three live-debug fixes) + the lint
-cleanup. Plus the Task 1–4 implementation + review-fix commits.
+snapshot dir write/read/magic). Workspace builds, 0 clippy. Live snapshot→restore and
+clone verified by the two driver scripts above.

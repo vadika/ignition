@@ -132,35 +132,32 @@ impl VcpuManager {
     pub fn run_restored(
         self: &Arc<Self>,
         vcpu_state: hvf::VcpuState,
+        gic_blob: Option<Vec<u8>>,
     ) -> Result<(), hvf::Error> {
         let me = Arc::clone(self);
-        let handle = thread::spawn(move || me.run_restored_primary(vcpu_state));
+        let handle = thread::spawn(move || me.run_restored_primary(vcpu_state, gic_blob));
         self.threads.lock().unwrap().push(handle);
         self.join_all()
     }
 
-    fn run_restored_primary(self: &Arc<Self>, vcpu_state: hvf::VcpuState) -> Result<(), hvf::Error> {
+    fn run_restored_primary(
+        self: &Arc<Self>,
+        vcpu_state: hvf::VcpuState,
+        gic_blob: Option<Vec<u8>>,
+    ) -> Result<(), hvf::Error> {
         let mpidr = mpidr_for(0);
         self.running.lock().unwrap().insert(mpidr);
         let vcpu = HvfVcpu::new(mpidr, false)?;
         let vcpuid = vcpu.id();
         self.vcpuids.lock().unwrap().push(vcpuid);
+        // Restore the in-kernel GIC state AFTER the vCPU exists: the per-cpu
+        // redistributor state (PPI enables, incl. the vtimer PPI 27) can only be
+        // restored once the vCPU/redistributor is present.
+        if let Some(blob) = gic_blob {
+            hvf::gic::gic_restore(&blob)?;
+        }
         // Restore state instead of set_initial_state.
         vcpu.restore_state(&vcpu_state)?;
-        // Debug: IGNITION_SAMPLE spawns a thread that periodically kicks the vCPU
-        // out (vcpu_request_exit) so run_loop can sample the spinning PC.
-        if std::env::var("IGNITION_SAMPLE").is_ok() {
-            let shutdown = Arc::clone(self);
-            thread::spawn(move || {
-                for _ in 0..40 {
-                    thread::sleep(Duration::from_millis(150));
-                    if shutdown.shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let _ = hvf::vcpu_request_exit(vcpuid);
-                }
-            });
-        }
         self.run_loop(vcpu)
     }
 
@@ -243,15 +240,6 @@ impl VcpuManager {
                             }
                         }
                         continue; // resume the guest after snapshotting
-                    }
-                    // Debug PC sampling: a Cancel with no shutdown set is the sampler
-                    // kicking us — read the spinning PC and resume.
-                    if std::env::var("IGNITION_SAMPLE").is_ok()
-                        && !self.shutdown.load(Ordering::Acquire)
-                    {
-                        let pc = vcpu.read_pc().unwrap_or(0);
-                        eprintln!("[sample] pc={pc:#x}");
-                        continue;
                     }
                     return Ok(());
                 }

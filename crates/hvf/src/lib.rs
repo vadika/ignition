@@ -635,10 +635,6 @@ impl HvfVcpu<'_> {
     }
 
     /// The current program counter (debug/sampling aid).
-    pub fn read_pc(&self) -> Result<u64, Error> {
-        self.read_reg(hv_reg_t_HV_REG_PC)
-    }
-
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
@@ -739,16 +735,26 @@ impl HvfVcpu<'_> {
         for &(r, v) in &s.sysregs {
             self.write_sys_reg(r as u16, v)?;
         }
-        // KNOWN ISSUE (see docs/snapshot-restore-result.md): the captured virtual
-        // timer comparator (CNTV_CVAL, absolute) is already-expired in the restored
-        // vCPU's counter domain, so the timer PPI stays perpetually pending, the idle
-        // WFI never traps, and the guest spins at 100% CPU. Proven root cause (not
-        // restoring the timer regs makes the guest park). The fix needs to re-anchor
-        // the virtual counter, which HVF does not currently give us the primitives
-        // for (no gettable CNTVCT, no CNTV_TVAL, ISTATUS is stale while the vCPU is
-        // stopped, mach_absolute_time is a different counter domain). Restoring the
-        // captured offset as-is until that is resolved.
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, s.vtimer_offset) };
+        // Make the guest's virtual counter CONTINUOUS across the snapshot.
+        //
+        // At snapshot time vtimer_offset was 0, so CNTVCT == CNTPCT ==
+        // mach_absolute_time() == the captured `host_counter`. By restore time the
+        // host physical counter (mach) has advanced by the wall-clock gap. If we
+        // leave offset 0, CNTVCT jumps forward by that whole gap in one step, so
+        // every clock-event deadline the guest had armed expires at once and the
+        // kernel re-fires the virtual timer continuously trying to catch up -> a
+        // timer storm that pins the vCPU at 100% with no idle WFI ever parking.
+        //
+        // Setting offset = mach_now - host_counter makes CNTVCT resume at the
+        // captured value (CNTVCT = mach - offset = host_counter), so no time appears
+        // to pass: the guest's armed CNTV_CVAL is still a near-future deadline, the
+        // first idle WFI parks, the timer fires once, and the guest re-arms normally.
+        // The WFI exit handler in run() is offset-aware (reads hv_vcpu_get_vtimer_offset
+        // and compares CNTV_CVAL against mach - offset), so the host parks correctly
+        // in this shifted domain instead of busy-looping on WaitForEventExpired.
+        let mach_now = unsafe { mach_absolute_time() };
+        let offset = mach_now.saturating_sub(s.host_counter);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
         }
@@ -759,9 +765,7 @@ impl HvfVcpu<'_> {
         self.write_reg(hv_reg_t_HV_REG_FPCR, s.fpcr)?;
         self.write_reg(hv_reg_t_HV_REG_FPSR, s.fpsr)?;
         for (q, &val) in s.simd.iter().enumerate() {
-            let ret = unsafe {
-                hv_vcpu_set_simd_fp_reg(self.vcpuid, q as u32, val)
-            };
+            let ret = unsafe { hv_vcpu_set_simd_fp_reg(self.vcpuid, q as u32, val) };
             if ret != HV_SUCCESS {
                 return Err(Error::VcpuSetRegister);
             }
@@ -974,14 +978,23 @@ impl HvfVcpu<'_> {
                     return Ok(VcpuExit::WaitForEvent);
                 }
 
-                // Also CNTV_CVAL & CNTV_CVAL_EL0
+                // Compare the comparator against the guest's virtual counter, not raw
+                // mach time. CNTVCT = CNTPCT - vtimer_offset, and on Apple Silicon
+                // CNTPCT == mach_absolute_time(). After a restore the offset is nonzero
+                // (set so CNTVCT stays continuous across the snapshot), so using raw
+                // mach here would read the comparator as perpetually expired and the
+                // host would busy-loop on WaitForEventExpired. On a fresh boot the
+                // offset is 0 and this reduces to the original raw-mach comparison.
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
-                if now > cval {
+                let mut offset: u64 = 0;
+                unsafe { hv_vcpu_get_vtimer_offset(self.vcpuid, &mut offset) };
+                let cntvct = unsafe { mach_absolute_time() }.wrapping_sub(offset);
+                if cntvct >= cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
 
-                let timeout = Duration::from_nanos((cval - now) * (1_000_000_000 / self.cntfrq));
+                let timeout =
+                    Duration::from_nanos((cval - cntvct) * (1_000_000_000 / self.cntfrq));
                 Ok(VcpuExit::WaitForEventTimeout(timeout))
             }
             EC_AA64_HVC => self.handle_psci_request(),

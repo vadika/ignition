@@ -123,71 +123,17 @@ impl HvfGicV3 {
         }
     }
 
-    /// Restore the in-kernel GIC from a snapshot blob and return a usable
-    /// `HvfGicV3` handle (for `set_spi`/`fdt_info` on the restore path).
-    ///
-    /// # Restore mechanism
-    ///
-    /// `hv_gic_set_state` restores state INTO an existing in-kernel GIC — it does
-    /// not create one. So this creates the GIC with the same config/placement as
-    /// `new` (recomputed from `vcpu_count`/`gic_top`), then applies the snapshot
-    /// blob. The placement fields let `set_spi`/`fdt_info` work after restore.
-    /// (Verified at runtime: `hv_gic_set_state` without a preceding `hv_gic_create`
-    /// returns an error.)
-    ///
-    /// MUST be called after `hv_vm_create` and before any vCPU is created.
-    pub fn from_state(blob: &[u8], vcpu_count: u64, gic_top: u64) -> Result<Self, Error> {
-        // Recompute placement using the same arithmetic as `new`.
-        let mut dist_size: usize = 0;
-        let ret = unsafe { hv_gic_get_distributor_size(&mut dist_size) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
-        }
-        let dist_size = dist_size as u64;
-
-        let mut redist_each: usize = 0;
-        let ret = unsafe { hv_gic_get_redistributor_size(&mut redist_each) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
-        }
-        let redist_size = redist_each as u64 * vcpu_count;
-
-        let redist_base = gic_top.checked_sub(redist_size).ok_or(Error::GicCreate)?;
-        let dist_base = redist_base.checked_sub(dist_size).ok_or(Error::GicCreate)?;
-
-        // The GIC must be created (same config/placement as `new`) BEFORE its state
-        // can be restored: `hv_gic_set_state` restores into an existing in-kernel
-        // GIC, it does not create one. (Verified at runtime — set_state alone fails.)
-        let config = unsafe { hv_gic_config_create() };
-        let ret = unsafe { hv_gic_config_set_distributor_base(config, dist_base) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
-        }
-        let ret = unsafe { hv_gic_config_set_redistributor_base(config, redist_base) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
-        }
-        let ret = unsafe { hv_gic_create(config) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicCreate);
-        }
-
-        // Now restore the captured distributor/redistributor state into it.
-        let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
-        if ret != HV_SUCCESS {
-            return Err(Error::GicRestore);
-        }
-
-        Ok(Self { dist_base, dist_size, redist_base, redist_size })
-    }
 }
 
-/// Restore the in-kernel GIC from a snapshot blob. Call after `hv_vm_create` and
-/// before any vCPU is created (replaces `HvfGicV3::new`'s create path).
+/// Restore the in-kernel GIC distributor/redistributor state from a snapshot blob.
 ///
-/// Prefer `HvfGicV3::from_state` for restore paths that also need `set_spi` or
-/// `fdt_info` — this free function is provided for callers that only need to
-/// restore GIC hardware state and manage the `HvfGicV3` handle separately.
+/// `hv_gic_set_state` restores INTO an existing in-kernel GIC, so the GIC must
+/// already be created (via `HvfGicV3::new`). It MUST also be called **after the
+/// vCPU is created**: the per-cpu redistributor state — including the PPI enables
+/// that gate the virtual-timer interrupt (PPI 27) — can only be restored once the
+/// vCPU's redistributor exists. Restoring before vCPU creation silently drops the
+/// redistributor state, so the guest's timer IRQ is never delivered and the
+/// restored guest livelocks at its idle WFI.
 pub fn gic_restore(blob: &[u8]) -> Result<(), Error> {
     let ret = unsafe { hv_gic_set_state(blob.as_ptr() as *const _, blob.len()) };
     if ret != HV_SUCCESS {

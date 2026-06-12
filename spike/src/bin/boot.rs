@@ -571,10 +571,12 @@ fn run_restore(dir: &Path) -> io::Result<()> {
     // 3. Create the HVF VM (must precede GIC and vCPU creation).
     let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
 
-    // 4. Restore the in-kernel GIC (replaces hv_gic_create).
+    // 4. Create the in-kernel GIC (same placement as a fresh boot). Its saved
+    //    distributor/redistributor state is restored later via `gic_restore`, after
+    //    the vCPU exists (see VcpuManager::run_restored / gic_restore).
     let gic = Arc::new(
-        HvfGicV3::from_state(&gic_blob, snap.config.vcpu_count, layout::RAM_BASE)
-            .map_err(|e| io::Error::other(format!("GIC restore: {e}")))?,
+        HvfGicV3::new(snap.config.vcpu_count, layout::RAM_BASE)
+            .map_err(|e| io::Error::other(format!("GIC create: {e}")))?,
     );
 
     // 5. Map the populated RAM into the guest.
@@ -629,7 +631,7 @@ fn run_restore(dir: &Path) -> io::Result<()> {
     io::stderr().flush().ok();
 
     // 9. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
-    match manager.run_restored(snap.vcpu) {
+    match manager.run_restored(snap.vcpu, Some(gic_blob)) {
         Ok(()) => {}
         Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
     }
