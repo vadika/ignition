@@ -64,50 +64,19 @@ impl Vcpu {
         vcpu.set_initial_state(self.entry, self.fdt_addr)?;
 
         loop {
-            // `VcpuExit` borrows from `vcpu` (mmio_buf lifetime), so we must
-            // copy out any data we need before the borrow ends, then dispatch
-            // to the bus outside the match arm that holds the borrow.
-            enum Action {
-                MmioWrite(u64, Vec<u8>),
-                MmioRead(u64, usize),
-                Shutdown,
-                Canceled,
-                Other,
-            }
-
-            let action = {
-                let exit = vcpu.run(vcpus.clone())?;
-                match exit {
-                    VcpuExit::MmioWrite(addr, data) => {
-                        Action::MmioWrite(addr, data.to_vec())
-                    }
-                    VcpuExit::MmioRead(addr, data) => {
-                        Action::MmioRead(addr, data.len())
-                    }
-                    VcpuExit::Shutdown => Action::Shutdown,
-                    VcpuExit::Canceled => Action::Canceled,
-                    other => {
-                        log::debug!("unhandled vCPU exit: {other:?}");
-                        Action::Other
-                    }
-                }
-            };
-
-            match action {
-                Action::MmioWrite(addr, data) => self.bus.write(addr, &data),
-                Action::MmioRead(addr, len) => {
-                    let mut buf = vec![0u8; len];
-                    self.bus.read(addr, &mut buf);
-                }
-                Action::Shutdown => {
+            let exit = vcpu.run(vcpus.clone())?;
+            match exit {
+                VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
+                VcpuExit::MmioRead(addr, data) => self.bus.read(addr, data),
+                VcpuExit::Shutdown => {
                     log::info!("guest requested shutdown (PSCI SYSTEM_OFF)");
                     return Ok(());
                 }
-                Action::Canceled => return Ok(()),
+                VcpuExit::Canceled => return Ok(()),
                 // No idle-park yet; the milestone guest does not WFI on the
                 // success path. TODO(phase1-smp): WFE/WFI parking with a
                 // CNTV_CVAL-derived timeout, lifted from libkrun macos/vstate.rs.
-                Action::Other => {}
+                other => log::debug!("unhandled vCPU exit: {other:?}"),
             }
         }
     }
