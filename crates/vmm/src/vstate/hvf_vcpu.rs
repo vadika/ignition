@@ -12,36 +12,12 @@ use std::time::Duration;
 
 use devices::bus::Bus;
 
-pub use hvf::{HvfVcpu, InterruptType, VcpuExit, Vcpus};
+pub use hvf::{HvfVcpu, InterruptType, NoIrqVcpus, VcpuExit, Vcpus};
 
 /// Upper bound on how long the run loop sleeps on an idle exit. Caps a large
 /// timer deadline so the loop stays responsive, and bounds the busy-wait on a
 /// no-deadline WFI on the earlycon path.
 const MAX_PARK: Duration = Duration::from_millis(10);
-
-/// Interrupt source with no GIC yet: the guest receives no injected IRQs, and
-/// trapped system-register accesses are acknowledged so the vCPU keeps running.
-/// Replaced by a real GIC-backed `Vcpus` impl in a later milestone.
-struct NoIrqVcpus;
-
-impl Vcpus for NoIrqVcpus {
-    fn set_vtimer_irq(&self, _vcpuid: u64) {}
-    fn should_wait(&self, _vcpuid: u64) -> bool {
-        false
-    }
-    fn has_pending_irq(&self, _vcpuid: u64) -> bool {
-        false
-    }
-    fn get_pending_irq(&self, _vcpuid: u64) -> u32 {
-        0
-    }
-    fn handle_sysreg_read(&self, _vcpuid: u64, _reg: u32) -> Option<u64> {
-        Some(0)
-    }
-    fn handle_sysreg_write(&self, _vcpuid: u64, _reg: u32, _val: u64) -> bool {
-        true
-    }
-}
 
 /// A single guest vCPU that runs on its own OS thread.
 pub struct Vcpu {

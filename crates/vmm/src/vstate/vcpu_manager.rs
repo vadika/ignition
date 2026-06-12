@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use devices::bus::Bus;
-use hvf::{HvfVcpu, VcpuExit, Vcpus};
+use hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
 
 /// Upper bound on an idle WFI/timer park, matching the single-vCPU runner.
 const MAX_PARK: Duration = Duration::from_millis(10);
@@ -31,19 +31,6 @@ pub enum Claim {
     Unknown,
     /// Already running — duplicate CPU_ON, reject.
     AlreadyRunning,
-}
-
-/// Interrupt source with the in-kernel GIC: the userspace IRQ/sysreg path is
-/// stubbed (hv_gic delivers everything in-kernel). Copied from hvf_vcpu.rs.
-struct NoIrqVcpus;
-
-impl Vcpus for NoIrqVcpus {
-    fn set_vtimer_irq(&self, _vcpuid: u64) {}
-    fn should_wait(&self, _vcpuid: u64) -> bool { false }
-    fn has_pending_irq(&self, _vcpuid: u64) -> bool { false }
-    fn get_pending_irq(&self, _vcpuid: u64) -> u32 { 0 }
-    fn handle_sysreg_read(&self, _vcpuid: u64, _reg: u32) -> Option<u64> { Some(0) }
-    fn handle_sysreg_write(&self, _vcpuid: u64, _reg: u32, _val: u64) -> bool { true }
 }
 
 pub struct VcpuManager {

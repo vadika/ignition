@@ -175,6 +175,20 @@ pub trait Vcpus {
     fn handle_sysreg_write(&self, vcpuid: u64, reg: u32, val: u64) -> bool;
 }
 
+/// A `Vcpus` impl for the in-kernel GIC: the userspace IRQ/sysreg path is stubbed
+/// because `hv_gic` delivers interrupts and per-cpu timers in-kernel. Used by every
+/// vCPU runner.
+pub struct NoIrqVcpus;
+
+impl Vcpus for NoIrqVcpus {
+    fn set_vtimer_irq(&self, _vcpuid: u64) {}
+    fn should_wait(&self, _vcpuid: u64) -> bool { false }
+    fn has_pending_irq(&self, _vcpuid: u64) -> bool { false }
+    fn get_pending_irq(&self, _vcpuid: u64) -> u32 { 0 }
+    fn handle_sysreg_read(&self, _vcpuid: u64, _reg: u32) -> Option<u64> { Some(0) }
+    fn handle_sysreg_write(&self, _vcpuid: u64, _reg: u32, _val: u64) -> bool { true }
+}
+
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
     let mut vcpu: u64 = vcpuid;
     let ret = unsafe { hv_vcpus_exit(&mut vcpu, 1) };
