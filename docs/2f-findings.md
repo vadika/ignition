@@ -1,68 +1,79 @@
-# Milestone 2f findings: vtimer delivery is a research wall (in-kernel GIC)
+# Milestone 2f research: vtimer delivery SOLVED — GICv3 list-register injection
 
-Date: 2026-06-12. Status: **blocked**, needs focused research (not more
-guess-and-check). Branch `phase1-irq` (experiments reverted; tree clean).
+Date: 2026-06-12. Status: **mechanism found** (implementation is the next step).
+Branch `phase1-irq` (experiments reverted; tree clean).
 
 ## What we proved works
 
-- **The rootfs + exec path is solid.** Booting `init=/bin/sh` (cmdline tweak)
-  runs the shell off the virtio disk and it prints to our serial:
-  `Run /bin/sh as init process` → `/bin/sh: can't access tty`. So the kernel
-  execs userspace from `/dev/vda` and userspace output reaches stdout.
-- The stall under normal boot is OpenRC waiting after its banner — at 0% CPU,
-  parked in WFI (established in 2e), i.e. waiting on an interrupt that never
-  arrives.
+- The rootfs + exec path is solid: `init=/bin/sh` runs the shell off the virtio
+  disk and prints to our serial (`Run /bin/sh as init process` →
+  `/bin/sh: can't access tty`).
+- Under normal boot, OpenRC stalls after its banner at 0% CPU, parked in WFI,
+  waiting on the virtual-timer interrupt that is never delivered.
 
-## The blocker
+## The answer (from Apple's Hypervisor headers)
 
-Userspace timed waits (OpenRC `sleep`/service timeouts, the scheduler tick) need
-the **EL1 virtual-timer interrupt**, which is never delivered to the guest under
-the in-kernel `hv_gic`.
+`HV_EXIT_REASON_VTIMER_ACTIVATED` doc (`hv_vcpu_types.h`, `hv_vcpu.h`):
 
-`hvf::run` masks the vtimer on the HVF `VTIMER_ACTIVATED` exit; `hvf_sync_vtimer`
-(verbatim libkrun, **userspace-GIC** logic) only unmasks once the timer condition
-clears — which assumes a userspace GIC injected the PPI for the guest to ACK.
-Under our in-kernel GIC nothing injects it, so it never clears, and it stays
-masked.
+> The caller is expected to **make the interrupt corresponding to the VTimer
+> pending in the guest's interrupt controller** and **to detect when the guest
+> has completed servicing** it. For example, when emulating a GIC, clear the
+> vtimer mask **when deactivating an interrupt whose ID matches the VTimer**.
 
-## Candidates tried (all FAILED — boot still stalls at `OpenRC 0.52.1`)
+For the in-kernel `hv_gic`, "make it pending in the guest's GIC" is **not**
+`hv_gic_set_spi` (SPIs only, INTID ≥ 32) and **not** mask-toggling (both tried,
+both failed). It is **GICv3 list-register injection**: Apple exposes the
+hypervisor control interface via `hv_gic_set_ich_reg` /
+`HV_GIC_ICH_REG_LR0_EL2 … LR15_EL2`, plus `ICH_HCR_EL2`, `ICH_VMCR_EL2`,
+`ICH_VTR_EL2`, `ICH_EISR_EL2`, `ICH_ELRSR_EL2`, and the maintenance interrupt
+`HV_GIC_INT_MAINTENANCE = 25`. The vtimer INTID is
+`HV_GIC_INT_EL1_VIRTUAL_TIMER = 27`.
 
-1. **Unmask unconditionally** in `hvf_sync_vtimer` (drop the `if !irq_state`
-   gate). No effect.
-2. **Unmask before re-entry** at the top of `hvf::run` (so the guest runs with
-   the vtimer live, not masked). No effect.
+This is standard GICv3 virtualization: the hypervisor writes a List Register to
+make a virtual interrupt pending; the GIC's virtual CPU interface presents it to
+the guest; the guest EOIs it; the LR empties (`ICH_ELRSR`/`ICH_EISR`), optionally
+raising the maintenance interrupt.
 
-Neither makes the in-kernel GIC raise PPI 27 (`HV_GIC_INT_EL1_VIRTUAL_TIMER`).
-Conclusion: unmasking the HVF vtimer mask alone does not cause the in-kernel GIC
-to deliver the vtimer PPI. The CNTV→GIC PPI wiring needs something we haven't
-found by inspection.
+## Why the earlier candidates failed (now explained)
 
-## What to investigate next (real research, not guessing)
+- libkrun's `hvf_sync_vtimer` is for a **userspace** GIC, where `set_vtimer_irq`
+  queues the PPI in `VcpuList` and the userspace GIC presents it via trapped ICC
+  reads. With our in-kernel GIC, ICC is handled in-kernel and nothing makes the
+  vtimer pending → no delivery.
+- Unmasking (candidate 1/3) doesn't make the interrupt pending; it only controls
+  whether HVF *exits* on timeout. Necessary but not sufficient.
 
-- **Apple `hv_gic` semantics.** Read `Hypervisor/hv_gic*.h` in the SDK and Apple
-  docs for how the architected virtual timer connects to the in-kernel GIC's PPI
-  27. There may be a required `hv_gic` call, a redistributor config, or a
-  different exit/mask protocol than the userspace-GIC model libkrun uses.
-- **`hv_vcpu_set_pending_interrupt` interplay.** Whether asserting the IRQ line
-  makes the GIC present the vtimer INTID at `ICC_IAR1` (candidate 2 in the spec,
-  not yet isolated from the masking changes).
-- **Alternative: userspace GICv3** (libkrun's `gicv3.rs` — snapshot-friendly,
-  has a PROVEN vtimer path via `VcpuList`). This is the HANDOFF's documented
-  perf-vs-snapshot trade. Switching the GIC backend is a larger change but has a
-  known-working timer + is needed for snapshot anyway. Could be the right pivot.
+## Implementation outline (the next step)
 
-## Reaching a prompt without the timer (possible interim)
+In `hvf` (a documented divergence from the userspace-GIC libkrun lift), add a
+GICv3 LR-based vtimer path:
 
-A bare interactive shell prints a prompt without sleeps. `init=/bin/sh` runs but
-busybox is non-interactive on a non-tty (no PS1, no prompt). Forcing interactive
-(`sh -i`) or wiring a minimal serial RX + tty so the shell sees a terminal could
-surface a prompt independent of the timer — but that overlaps the deferred
-serial-RX work.
+1. **One-time setup** (per vCPU, after GIC create / first run): enable the
+   virtual CPU interface — `ICH_HCR_EL2.En = 1` (and `LRENPIE`/maintenance if we
+   use the maintenance IRQ); read `ICH_VTR_EL2` for the LR count.
+2. **On `VTIMER_ACTIVATED`:** write a free list register
+   (`HV_GIC_ICH_REG_LR0_EL2`) with the vtimer pending — LR64 fields: `State =
+   0b01` (pending), `HW = 1`, `pINTID = 27`, `vINTID = 27`, `Group`/`Priority`
+   per the guest's config. Keep the HVF vtimer mask set (avoid the exit storm).
+3. **Detect EOI:** on subsequent exits, read `ICH_ELRSR_EL2` (or `ICH_EISR_EL2`);
+   when the vtimer's LR has emptied (guest deactivated INTID 27), clear the HVF
+   vtimer mask (`hv_vcpu_set_vtimer_mask(false)`) so the next deadline exits.
+   Alternative: wire `HV_GIC_INT_MAINTENANCE` and unmask in its handler.
+4. **`GicVcpus`/parking** (vmm) then layer on as planned — but `set_vtimer_irq`'s
+   real work is the LR injection in step 2, which lives in `hvf` (it needs the
+   `hv_gic_set_ich_reg` bindings).
 
-## Decision needed
+Bindings needed (already in `crates/hvf/src/bindings.rs`): `hv_gic_set_ich_reg`,
+`hv_gic_get_ich_reg`, and the `hv_gic_ich_reg_t` LR/HCR/ELRSR/EISR constants.
 
-2f's vtimer goal is a genuine research problem. Options: (a) deep-research Apple
-`hv_gic`'s vtimer wiring; (b) pivot the GIC to userspace gicv3 (known-good timer +
-snapshot-ready); (c) chase an interim prompt via `sh -i` + minimal serial RX;
-(d) pause 2f. The reverted experiments and this analysis are the milestone's
-output so far.
+Risks: the exact LR64 bit layout (State[63:62], HW[61], Group[60],
+Priority[55:48], pINTID[44:32], vINTID[31:0]) must be right; `ICH_HCR.En` must be
+set or the virtual interface stays off; EOI detection timing. Iterate against the
+live boot (success = OpenRC service-start lines past the banner).
+
+## Status
+
+Research goal achieved: the in-kernel-GIC vtimer is delivered via GICv3 list
+registers (`hv_gic_set_ich_reg`), not the userspace-GIC mask protocol. The
+implementation is now a well-defined task (no longer a guess), ready to build
+against the live boot.
