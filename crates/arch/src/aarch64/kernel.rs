@@ -34,6 +34,8 @@ impl Display for KernelError {
     }
 }
 
+impl std::error::Error for KernelError {}
+
 /// The fields we use from the 64-byte arm64 Image header.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Arm64Header {
@@ -93,6 +95,12 @@ mod tests {
         h[16..24].copy_from_slice(&image_size.to_le_bytes());
         h[56..60].copy_from_slice(&ARM64_IMAGE_MAGIC.to_le_bytes());
         h
+    }
+
+    #[test]
+    fn kernel_error_is_std_error() {
+        fn assert_std_error<E: std::error::Error>() {}
+        assert_std_error::<KernelError>();
     }
 
     #[test]

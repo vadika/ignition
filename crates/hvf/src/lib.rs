@@ -123,6 +123,7 @@ pub enum Error {
     VcpuSetVtimerMask,
     VmCreate,
     GicCreate,
+    GicSetSpi,
 }
 
 impl Display for Error {
@@ -153,9 +154,12 @@ impl Display for Error {
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
             GicCreate => write!(f, "Error creating in-kernel HVF GIC"),
+            GicSetSpi => write!(f, "Error setting HVF GIC SPI level"),
         }
     }
 }
+
+impl std::error::Error for Error {}
 
 pub enum InterruptType {
     Irq,
@@ -787,5 +791,25 @@ mod mmio_tests {
         encode_mmio_le(&mut buf, 0xBEEF, 2);
         assert_eq!(&buf[..2], &[0xEF, 0xBE]);
         assert_eq!(decode_mmio_le(&buf, 2), 0xBEEF);
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::Error;
+
+    #[test]
+    fn error_is_std_error() {
+        fn assert_std_error<E: std::error::Error>() {}
+        assert_std_error::<Error>();
+    }
+
+    #[test]
+    fn gic_set_spi_has_distinct_message() {
+        assert_ne!(
+            Error::GicSetSpi.to_string(),
+            Error::GicCreate.to_string(),
+            "GicSetSpi must not reuse the GicCreate message"
+        );
     }
 }

@@ -91,7 +91,7 @@ impl HvfGicV3 {
     pub fn set_spi(&self, intid: u32, level: bool) -> Result<(), Error> {
         let ret = unsafe { hv_gic_set_spi(intid, level) };
         if ret != HV_SUCCESS {
-            Err(Error::GicCreate)
+            Err(Error::GicSetSpi)
         } else {
             Ok(())
         }
