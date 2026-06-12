@@ -41,11 +41,13 @@ impl<B: NetBackend> VirtioNet<B> {
         while let Some(chain) = vq.pop_avail(mem) {
             // Gather the chain's readable bytes into one frame buffer.
             let mut buf = Vec::new();
+            let mut oversized = false;
             for d in &chain.descriptors {
                 if d.writable {
                     continue; // TX buffers are device-readable
                 }
                 if buf.len() + d.len as usize > MAX_FRAME {
+                    oversized = true;
                     break;
                 }
                 let mut tmp = vec![0u8; d.len as usize];
@@ -53,7 +55,9 @@ impl<B: NetBackend> VirtioNet<B> {
                     buf.extend_from_slice(&tmp);
                 }
             }
-            if buf.len() > NET_HDR_LEN {
+            if oversized {
+                log::warn!("virtio-net: dropping oversized TX chain ({} bytes+)", buf.len());
+            } else if buf.len() > NET_HDR_LEN {
                 let frame = &buf[NET_HDR_LEN..];
                 if let Err(e) = self.backend.write_frame(frame) {
                     log::warn!("virtio-net TX write failed: {e}");
