@@ -18,8 +18,9 @@ const MMIO_MEM_START: u64 = 0x4000_0000;
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // GIC must be created after the VM and before any vCPU.
-    let _vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
+    // GIC must be created after the VM and before any vCPU. Hold the VM for the
+    // whole run (`_vm_guard`, not `_`, keeps it alive to end of scope).
+    let _vm_guard = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
     let gic = HvfGicV3::new(1, MMIO_MEM_START).expect("hv_gic_create failed");
 
     let info = gic.fdt_info();
@@ -28,6 +29,9 @@ fn main() {
         info.dist_base, info.dist_size, info.redist_base, info.redist_size, info.maint_irq
     );
 
+    // dist_size/redist_size come from HVF (hv_gic_get_*_size) — independent.
+    // The base equalities below re-derive from new()'s own arithmetic, so they
+    // check struct round-trip fidelity, not independent hardware placement.
     assert!(info.dist_size > 0 && info.redist_size > 0, "zero GIC region size");
     assert_eq!(info.redist_base, MMIO_MEM_START - info.redist_size);
     assert_eq!(info.dist_base, MMIO_MEM_START - info.dist_size - info.redist_size);
