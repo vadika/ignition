@@ -104,7 +104,7 @@ impl VirtioMmio {
     fn write_reg(&mut self, off: u64, val: u32) {
         let sel = self.queue_sel as usize;
         match off {
-            0x014 => self.device_features_sel = val,
+            0x014 => self.device_features_sel = val & 1,
             0x020 | 0x024 => {}
             0x030 => self.queue_sel = val,
             0x038 => {
@@ -146,13 +146,13 @@ impl VirtioMmio {
         let Some(q) = self.queues.get_mut(sel) else {
             return;
         };
-        q.ready = val;
-        if val == 1 {
+        if val != 0 {
+            q.ready = 1;
             let desc = (u64::from(q.desc_hi) << 32) | u64::from(q.desc_lo);
             let driver = (u64::from(q.driver_hi) << 32) | u64::from(q.driver_lo);
             let device = (u64::from(q.device_hi) << 32) | u64::from(q.device_lo);
             q.vq = Some(Virtqueue::new(q.num, desc, driver, device));
-        } else if val == 0 {
+        } else {
             *q = QueueState::default();
         }
     }
@@ -174,8 +174,9 @@ impl VirtioMmio {
         }
     }
 
-    /// Inject a received frame into RX queue 0 (called from the host RX thread).
-    /// Returns false if there was no free RX buffer (frame dropped).
+    /// Inject a received frame into RX queue 0 (called from the host RX thread,
+    /// which must hold the transport's `Mutex`). Returns false if there was no
+    /// free RX buffer (frame dropped).
     pub fn inject_rx(&mut self, frame: &[u8]) -> bool {
         let Some(q) = self.queues.get_mut(0) else {
             return false;
