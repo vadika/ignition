@@ -59,7 +59,9 @@ pub struct FdtConfig {
     pub cpu_mpidrs: Vec<u64>,
     /// Kernel command line -> /chosen bootargs.
     pub cmdline: String,
-    /// MMIO devices to emit, in node order.
+    /// MMIO devices to emit as FDT nodes, in node order. The caller composes this
+    /// list; a serial console (`FdtDevice::Serial`) is expected first so the guest
+    /// has a console — it is the caller's responsibility (not enforced here).
     pub devices: Vec<FdtDevice>,
     pub gic: GicInfo,
     /// (guest addr, size) when an initramfs is loaded.
