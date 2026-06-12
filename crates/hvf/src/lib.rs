@@ -95,14 +95,14 @@ const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
-
-/// PSCI return value for an unrecognized function id (SMCCC: -1 in X0/W0).
-const PSCI_NOT_SUPPORTED: u64 = -1_i64 as u64;
 const EC_AA64_SMC: u64 = 0x17;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const EC_SYSTEMREGISTERTRAP: u64 = 0x18;
 const EC_DATAABORT: u64 = 0x24;
 const EC_AA64_BKPT: u64 = 0x3c;
+
+/// PSCI return value for an unrecognized function id (SMCCC: -1 in X0/W0).
+const PSCI_NOT_SUPPORTED: u64 = -1_i64 as u64;
 
 #[derive(Debug)]
 pub enum Error {
