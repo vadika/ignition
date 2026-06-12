@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Cross-compile aarch64 Firecracker guest kernel (6.1) inside an x86_64 container.
+# Output: ~/kbuild/out/Image
+set -euo pipefail
+
+KVER=6.1
+LINUX_TARBALL="linux-${KVER}.tar.xz"
+CFG_URL="https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
+
+docker run --rm \
+  -v "$HOME/kbuild:/work" \
+  -w /work \
+  -e KVER="$KVER" -e LINUX_TARBALL="$LINUX_TARBALL" -e CFG_URL="$CFG_URL" \
+  ubuntu:22.04 bash -euxc '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+      gcc-aarch64-linux-gnu build-essential flex bison bc \
+      libssl-dev libelf-dev cpio kmod wget xz-utils ca-certificates >/dev/null
+
+    if [ ! -d "linux-${KVER}" ]; then
+      wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/${LINUX_TARBALL}"
+      tar xf "${LINUX_TARBALL}"
+    fi
+    cd "linux-${KVER}"
+    wget -qO .config "${CFG_URL}"
+
+    export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+    make olddefconfig
+    make -j"$(nproc)" Image
+
+    # NOTE: never strip the arm64 Image. It is a valid PE/COFF binary, so
+    # binutils strip will silently rewrite it and destroy the arm64 boot
+    # header (magic 0x644d5241 "ARMd" at offset 0x38). Copy it verbatim.
+    mkdir -p /work/out
+    cp arch/arm64/boot/Image /work/out/Image
+    ls -la /work/out/Image
+  '
