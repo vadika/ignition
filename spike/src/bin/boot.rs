@@ -22,6 +22,7 @@ use devices::virtio::IrqLine;
 use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
+use devices::virtio::net::VirtioNet;
 use hvf::gic::HvfGicV3;
 use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
@@ -219,6 +220,7 @@ fn main() {
     // Cap matches the FDT/GIC sizing we exercise; raise if a guest needs more.
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
+    let mut net = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -232,6 +234,9 @@ fn main() {
                 assert!((1..=MAX_VCPUS).contains(&n), "--smp must be 1..={MAX_VCPUS}");
                 smp = n;
             }
+            "--net" => {
+                net = true;
+            }
             other if other.starts_with('-') => {
                 eprintln!("unknown flag: {other}");
                 process::exit(2);
@@ -240,7 +245,7 @@ fn main() {
         }
     }
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--net] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     let kernel_image = fs::read(&positionals[0]).expect("failed to read kernel image");
@@ -283,6 +288,13 @@ fn main() {
             addr: layout::VIRTIO_BASE,
             size: layout::VIRTIO_SIZE,
             irq: layout::VIRTIO_SPI,
+        }));
+    }
+    if net {
+        fdt_devices.push(fdt::FdtDevice::VirtioBlk(MmioDev {
+            addr: layout::NET_BASE,
+            size: layout::NET_SIZE,
+            irq: layout::NET_SPI,
         }));
     }
     let cfg = FdtConfig {
@@ -346,6 +358,27 @@ fn main() {
             .expect("virtio range overlap");
         eprintln!("virtio : /dev/vda backed by {path}");
     }
+
+    if net {
+        let (backend, rx) = ignition_vmnet::VmnetBackend::start()
+            .expect("vmnet start failed (run boot under sudo for --net)");
+        let net_irq = Arc::new(GicIrq { gic: gic.clone(), intid: layout::NET_SPI + 32 });
+        let guest_ram_net = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        let net_dev = VirtioNet::new(backend);
+        let net_mmio: Arc<Mutex<VirtioMmio>> =
+            Arc::new(Mutex::new(VirtioMmio::new(Box::new(net_dev), guest_ram_net, net_irq)));
+        let net_bus: Arc<Mutex<dyn BusDevice>> = net_mmio.clone();
+        bus.register(layout::NET_BASE, layout::NET_SIZE, net_bus)
+            .expect("net range overlap");
+        let net_rx = net_mmio.clone();
+        std::thread::spawn(move || {
+            for frame in rx {
+                net_rx.lock().unwrap().inject_rx(&frame);
+            }
+        });
+        eprintln!("virtio-net: enabled (vmnet shared/NAT)");
+    }
+
     let bus = Arc::new(bus);
 
     // Raw terminal + host stdin reader for the interactive console. The guard

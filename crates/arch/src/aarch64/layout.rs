@@ -18,6 +18,11 @@ pub const VIRTIO_BASE: u64 = 0x0a00_0000;
 pub const VIRTIO_SIZE: u64 = 0x200;
 /// virtio block IRQ as the bare GIC SPI index (absolute INTID = 32 + this = 33).
 pub const VIRTIO_SPI: u32 = 1;
+/// Second virtio-mmio window (the NIC). Above the block device, below GIC/RAM.
+pub const NET_BASE: u64 = 0x0a00_0200;
+pub const NET_SIZE: u64 = 0x200;
+/// virtio-net IRQ as the bare GIC SPI index (absolute INTID = 32 + this = 34).
+pub const NET_SPI: u32 = 2;
 /// Reserved size for the flattened device tree.
 pub const FDT_MAX_SIZE: u64 = 0x20_0000; // 2 MiB
 /// The DTB must sit within the part of RAM the kernel maps early in boot (before
@@ -101,5 +106,13 @@ mod tests {
     fn serial_window_is_below_ram() {
         // serial sits well below the GIC, which sits just below RAM.
         assert!(SERIAL_BASE + SERIAL_SIZE <= RAM_BASE);
+    }
+
+    #[test]
+    fn net_window_is_adjacent_to_virtio_and_below_ram() {
+        // NET_BASE must immediately follow the block device window (no gap, no overlap).
+        assert_eq!(NET_BASE, VIRTIO_BASE + VIRTIO_SIZE, "net window must be adjacent to virtio");
+        // The net window must fit entirely below guest RAM.
+        assert!(NET_BASE + NET_SIZE <= RAM_BASE, "net window must not overlap RAM");
     }
 }
