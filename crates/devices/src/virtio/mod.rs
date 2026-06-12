@@ -3,6 +3,7 @@
 pub mod blk;
 pub mod guest_ram;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 
 /// A device interrupt line. Implemented by the boot harness over the GIC.
