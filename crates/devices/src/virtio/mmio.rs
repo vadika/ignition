@@ -5,115 +5,115 @@ use std::sync::Arc;
 use crate::bus::BusDevice;
 
 use super::IrqLine;
-use super::blk::VirtioBlk;
 use super::guest_ram::GuestRam;
 use super::queue::Virtqueue;
 
 const MAGIC: u32 = 0x7472_6976; // "virt"
 const VERSION: u32 = 2;
-const DEVICE_ID_BLK: u32 = 2;
 const VENDOR_ID: u32 = 0x4b4e_5246; // arbitrary non-zero
 const QUEUE_SIZE_MAX: u32 = 256;
 /// DeviceFeatures high word (sel 1): bit 0 == VIRTIO_F_VERSION_1 (feature bit 32).
 const FEATURES_HI_VERSION_1: u32 = 1;
 const INT_STATUS_USED: u32 = 1;
 
-/// A single-queue virtio-mmio block device.
-pub struct VirtioMmio {
-    blk: VirtioBlk,
-    mem: GuestRam,
-    irq: Arc<dyn IrqLine>,
-    vq: Option<Virtqueue>,
+/// A virtio device plugged into the mmio transport. The transport owns the
+/// virtqueues and the interrupt line; the device supplies identity, features,
+/// config space, and per-queue servicing.
+pub trait VirtioDevice: Send {
+    fn device_id(&self) -> u32;
+    /// The device-feature word for `sel` (0 = bits 0..31, 1 = bits 32..63). The
+    /// transport adds VIRTIO_F_VERSION_1 (bit 32) itself, so return only this
+    /// device's own bits.
+    fn device_features(&self, sel: u32) -> u32;
+    /// Read a 32-bit word of device config space at `offset` (relative to 0x100).
+    fn config_read(&self, offset: u64) -> u32;
+    fn queue_count(&self) -> usize;
+    /// Service a QueueNotify on `queue_idx`. Returns true if any buffer was used.
+    fn handle_notify(&mut self, queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool;
+    /// Inject a received frame into the RX queue. Default: not an RX device.
+    fn inject_rx(&mut self, _vq: &mut Virtqueue, _mem: &GuestRam, _frame: &[u8]) -> bool {
+        false
+    }
+}
 
-    status: u32,
-    device_features_sel: u32,
-    queue_sel: u32,
-    queue_num: u16,
-    queue_ready: u32,
+/// Per-queue driver-programmed state.
+#[derive(Default)]
+struct QueueState {
+    num: u16,
+    ready: u32,
     desc_lo: u32,
     desc_hi: u32,
     driver_lo: u32,
     driver_hi: u32,
     device_lo: u32,
     device_hi: u32,
+    vq: Option<Virtqueue>,
+}
+
+/// A virtio-mmio transport hosting one `VirtioDevice`.
+pub struct VirtioMmio {
+    dev: Box<dyn VirtioDevice>,
+    mem: GuestRam,
+    irq: Arc<dyn IrqLine>,
+    queues: Vec<QueueState>,
+    status: u32,
+    device_features_sel: u32,
+    queue_sel: u32,
     interrupt_status: u32,
 }
 
 impl VirtioMmio {
-    pub fn new(blk: VirtioBlk, mem: GuestRam, irq: Arc<dyn IrqLine>) -> Self {
+    pub fn new(dev: Box<dyn VirtioDevice>, mem: GuestRam, irq: Arc<dyn IrqLine>) -> Self {
+        let queues = (0..dev.queue_count()).map(|_| QueueState::default()).collect();
         Self {
-            blk,
+            dev,
             mem,
             irq,
-            vq: None,
+            queues,
             status: 0,
             device_features_sel: 0,
             queue_sel: 0,
-            queue_num: 0,
-            queue_ready: 0,
-            desc_lo: 0,
-            desc_hi: 0,
-            driver_lo: 0,
-            driver_hi: 0,
-            device_lo: 0,
-            device_hi: 0,
             interrupt_status: 0,
         }
     }
 
     fn read_reg(&self, off: u64) -> u32 {
+        let sel = self.queue_sel as usize;
         match off {
             0x000 => MAGIC,
             0x004 => VERSION,
-            0x008 => DEVICE_ID_BLK,
+            0x008 => self.dev.device_id(),
             0x00c => VENDOR_ID,
             0x010 => {
                 if self.device_features_sel == 1 {
-                    FEATURES_HI_VERSION_1
+                    FEATURES_HI_VERSION_1 | self.dev.device_features(1)
                 } else {
-                    0
+                    self.dev.device_features(0)
                 }
             }
             0x034 => QUEUE_SIZE_MAX,
-            0x044 => self.queue_ready,
+            0x044 => self.queues.get(sel).map_or(0, |q| q.ready),
             0x060 => self.interrupt_status,
             0x070 => self.status,
             0x0fc => 0,
-            0x100 => (self.blk.capacity_sectors() & 0xffff_ffff) as u32,
-            0x104 => (self.blk.capacity_sectors() >> 32) as u32,
+            off if off >= 0x100 => self.dev.config_read(off - 0x100),
             _ => 0,
         }
     }
 
     fn write_reg(&mut self, off: u64, val: u32) {
+        let sel = self.queue_sel as usize;
         match off {
             0x014 => self.device_features_sel = val,
-            0x020 => {} // DriverFeatures: accepted.
-            0x024 => {} // DriverFeaturesSel: ignored (we only key DeviceFeatures off sel).
+            0x020 | 0x024 => {}
             0x030 => self.queue_sel = val,
-            0x038 => self.queue_num = val as u16,
-            0x044 => {
-                self.queue_ready = val;
-                if val == 1 && self.queue_sel == 0 {
-                    // The driver writes all six addr halves before QueueReady=1
-                    // (virtio 1.0 §4.2.3.2), so the shadows are stable here.
-                    let desc = (u64::from(self.desc_hi) << 32) | u64::from(self.desc_lo);
-                    let driver = (u64::from(self.driver_hi) << 32) | u64::from(self.driver_lo);
-                    let device = (u64::from(self.device_hi) << 32) | u64::from(self.device_lo);
-                    self.vq = Some(Virtqueue::new(self.queue_num, desc, driver, device));
-                } else if val == 0 {
-                    // Drop the queue and clear the addr shadows so a re-setup
-                    // can't compose a GPA from a mix of new and stale halves.
-                    self.vq = None;
-                    self.desc_lo = 0;
-                    self.desc_hi = 0;
-                    self.driver_lo = 0;
-                    self.driver_hi = 0;
-                    self.device_lo = 0;
-                    self.device_hi = 0;
+            0x038 => {
+                if let Some(q) = self.queues.get_mut(sel) {
+                    q.num = val as u16;
                 }
             }
-            0x050 => self.notify(),
+            0x044 => self.set_queue_ready(sel, val),
+            0x050 => self.notify(val), // QueueNotify carries the queue index in `val`
             0x064 => {
                 self.interrupt_status &= !val;
                 if self.interrupt_status == 0 {
@@ -126,45 +126,84 @@ impl VirtioMmio {
                     self.reset();
                 }
             }
-            0x080 => self.desc_lo = val,
-            0x084 => self.desc_hi = val,
-            0x090 => self.driver_lo = val,
-            0x094 => self.driver_hi = val,
-            0x0a0 => self.device_lo = val,
-            0x0a4 => self.device_hi = val,
+            0x080 => self.set_addr(sel, |q| &mut q.desc_lo, val),
+            0x084 => self.set_addr(sel, |q| &mut q.desc_hi, val),
+            0x090 => self.set_addr(sel, |q| &mut q.driver_lo, val),
+            0x094 => self.set_addr(sel, |q| &mut q.driver_hi, val),
+            0x0a0 => self.set_addr(sel, |q| &mut q.device_lo, val),
+            0x0a4 => self.set_addr(sel, |q| &mut q.device_hi, val),
             _ => {}
         }
     }
 
-    fn reset(&mut self) {
-        self.vq = None;
-        self.queue_ready = 0;
-        self.interrupt_status = 0;
-        self.irq.set_spi(false);
+    fn set_addr(&mut self, sel: usize, field: impl Fn(&mut QueueState) -> &mut u32, val: u32) {
+        if let Some(q) = self.queues.get_mut(sel) {
+            *field(q) = val;
+        }
     }
 
-    fn notify(&mut self) {
-        if self.queue_ready == 0 || self.queue_sel != 0 {
+    fn set_queue_ready(&mut self, sel: usize, val: u32) {
+        let Some(q) = self.queues.get_mut(sel) else {
+            return;
+        };
+        q.ready = val;
+        if val == 1 {
+            let desc = (u64::from(q.desc_hi) << 32) | u64::from(q.desc_lo);
+            let driver = (u64::from(q.driver_hi) << 32) | u64::from(q.driver_lo);
+            let device = (u64::from(q.device_hi) << 32) | u64::from(q.device_lo);
+            q.vq = Some(Virtqueue::new(q.num, desc, driver, device));
+        } else if val == 0 {
+            *q = QueueState::default();
+        }
+    }
+
+    fn notify(&mut self, queue_idx: u32) {
+        let idx = queue_idx as usize;
+        let Some(q) = self.queues.get_mut(idx) else {
+            return;
+        };
+        if q.ready == 0 {
             return;
         }
-        let mut serviced = false;
-        {
-            let Some(vq) = self.vq.as_mut() else { return };
-            let mem = &self.mem;
-            let blk = &mut self.blk;
-            while let Some(chain) = vq.pop_avail(mem) {
-                let len = blk.process(&chain, mem);
-                vq.push_used(mem, chain.head, len);
-                serviced = true;
-            }
-        }
+        let Some(vq) = q.vq.as_mut() else {
+            return;
+        };
+        let serviced = self.dev.handle_notify(idx, vq, &self.mem);
         if serviced {
-            // Re-asserting an already-asserted line is idempotent; the guest
-            // drains the whole used ring on the one interrupt it handles, so no
-            // completion is lost if a second notify lands before the ACK.
-            self.interrupt_status |= INT_STATUS_USED;
-            self.irq.set_spi(true);
+            self.raise();
         }
+    }
+
+    /// Inject a received frame into RX queue 0 (called from the host RX thread).
+    /// Returns false if there was no free RX buffer (frame dropped).
+    pub fn inject_rx(&mut self, frame: &[u8]) -> bool {
+        let Some(q) = self.queues.get_mut(0) else {
+            return false;
+        };
+        if q.ready == 0 {
+            return false;
+        }
+        let Some(vq) = q.vq.as_mut() else {
+            return false;
+        };
+        let used = self.dev.inject_rx(vq, &self.mem, frame);
+        if used {
+            self.raise();
+        }
+        used
+    }
+
+    fn raise(&mut self) {
+        self.interrupt_status |= INT_STATUS_USED;
+        self.irq.set_spi(true);
+    }
+
+    fn reset(&mut self) {
+        for q in &mut self.queues {
+            *q = QueueState::default();
+        }
+        self.interrupt_status = 0;
+        self.irq.set_spi(false);
     }
 }
 
@@ -192,6 +231,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::virtio::blk::VirtioBlk;
     use crate::virtio::guest_ram::GuestRam;
 
     const BASE: u64 = 0x4000_0000;
@@ -212,7 +252,7 @@ mod tests {
 
     fn dev(backing: &mut Vec<u8>, irq: Arc<dyn IrqLine>) -> VirtioMmio {
         let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
-        VirtioMmio::new(VirtioBlk::new(disk()).unwrap(), mem, irq)
+        VirtioMmio::new(Box::new(VirtioBlk::new(disk()).unwrap()), mem, irq)
     }
 
     fn rd(d: &mut VirtioMmio, off: u64) -> u32 {

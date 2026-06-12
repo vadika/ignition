@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::guest_ram::GuestRam;
-use super::queue::{Desc, DescChain};
+use super::mmio::VirtioDevice;
+use super::queue::{Desc, DescChain, Virtqueue};
 
 const SECTOR_SIZE: u64 = 512;
 
@@ -132,6 +133,36 @@ impl VirtioBlk {
 
     fn set_status(&self, mem: &GuestRam, addr: u64, status: u8) {
         mem.write_slice(addr, &[status]);
+    }
+}
+
+const DEVICE_ID_BLK: u32 = 2;
+
+impl VirtioDevice for VirtioBlk {
+    fn device_id(&self) -> u32 {
+        DEVICE_ID_BLK
+    }
+    fn device_features(&self, _sel: u32) -> u32 {
+        0 // only VIRTIO_F_VERSION_1, added by the transport
+    }
+    fn config_read(&self, offset: u64) -> u32 {
+        match offset {
+            0 => (self.capacity_sectors() & 0xffff_ffff) as u32,
+            4 => (self.capacity_sectors() >> 32) as u32,
+            _ => 0,
+        }
+    }
+    fn queue_count(&self) -> usize {
+        1
+    }
+    fn handle_notify(&mut self, _queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
+        let mut serviced = false;
+        while let Some(chain) = vq.pop_avail(mem) {
+            let len = self.process(&chain, mem);
+            vq.push_used(mem, chain.head, len);
+            serviced = true;
+        }
+        serviced
     }
 }
 

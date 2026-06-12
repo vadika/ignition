@@ -338,7 +338,7 @@ fn main() {
         let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
         let virtio: Arc<Mutex<dyn BusDevice>> =
             Arc::new(Mutex::new(VirtioMmio::new(
-                blk,
+                Box::new(blk),
                 guest_ram,
                 Arc::new(GicIrq { gic: gic.clone(), intid: layout::VIRTIO_SPI + 32 }),
             )));
