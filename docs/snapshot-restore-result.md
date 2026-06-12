@@ -72,25 +72,48 @@ straight out of `memory.bin`)
   restored-pending-interrupt is the cause.
 - **Independent of the snapshot↔restore time gap** (reproduces back-to-back).
 
-### Conclusion + next step
+### ROOT CAUSE FOUND + PROVEN: the virtual-timer comparator
 
-Same fresh GIC, the difference between "parks" (normal boot) and "spins" (restore)
-must be in the **restored vCPU register state** — one forced register differs from
-what a naturally-running guest holds and changes WFI/wakeup behavior (HVF only traps
-WFI when nothing is pending; on restore HVF behaves as if something is always
-pending). Captured CPSR is `…c5` = EL1h with IRQs masked.
+Skipping the generic-timer sysregs on restore (`IGNITION_SKIP_TIMER` probe — not
+restoring `CNTV_CTL/CVAL`, `CNTP_CTL/CVAL`, `CNTKCTL`) makes the guest **park at
+0.0% CPU** instead of spinning. So the cause is the timer: the captured
+`CNTV_CTL.ENABLE=1` plus the **absolute** `CNTV_CVAL` deadline, which in the
+restored vCPU's counter domain is already-expired → `ISTATUS` stays set → the
+virtual-timer PPI is perpetually pending at the redistributor → the idle WFI never
+traps → 100% CPU spin. This explains why masking the vtimer, zeroing `IGRPEN`, and
+using a fresh GIC all failed: none of them clear the redistributor pending bit that
+the enabled+expired comparator keeps re-setting.
 
-**Recommended next step — binary-search the restored registers.** Restore only
-half of `SAVED_SYSREGS` (or skip groups: timer regs, debug `MDSCR_EL1`, the PAC
-keys, etc.), and see which subset makes WFI park again. Strong individual suspects:
-`MDSCR_EL1` (debug/halting — bit interactions can change WFI), the `CNTKCTL_EL1` /
-timer-control set, and any reg whose restored value differs from a fresh vCPU's
-reset value in a WFI-relevant way. Also worth trying: **do NOT restore the
-`CNTV_*`/`CNTP_*` timer comparators** (let the kernel re-arm) — a comparator left
-"already expired" can keep the PPI perpetually pending at the redistributor even
-with the vtimer masked, which would explain WFI-never-traps while IGRPEN/mask don't
-help. The `IGNITION_SAMPLE` PC sampler + `HvfVcpu::read_pc` are left in (gated) for
-this.
+### The remaining blocker (well-defined): re-anchor the comparator
+
+Skip-timer parks but is **non-functional** (timer disabled → no scheduler tick →
+unresponsive). The guest needs the timer enabled with a comparator that is NOT
+expired in the restored counter domain. Every host-side way to achieve that was
+tried and is blocked by missing HVF primitives:
+
+- **Adjust `vtimer_offset` by the mach-counter delta** — `mach_absolute_time` is a
+  different counter domain than the guest's `CNTVCT`; both signs still spin.
+- **Anchor the offset to the captured `CNTV_CVAL`** — same domain problem.
+- **Binary-search the offset using `CNTV_CTL.ISTATUS`** — `ISTATUS` is not
+  recomputed while the vCPU is stopped, so the host reads a stale value and the
+  search never converges.
+- **Write the relative `CNTV_TVAL`** (which would set `CVAL = CNTVCT + TVAL`,
+  domain-independent) — HVF's sysreg enum exposes `CNTP_TVAL_EL0` but **not**
+  `CNTV_TVAL_EL0`.
+- HVF exposes no gettable `CNTVCT_EL0`/`CNTPCT_EL0` to compute a correct offset.
+
+**Next-session options:** (a) run the restored vCPU for a single bounded step so the
+timer hardware recomputes `ISTATUS`, then binary-search the offset across real
+runs (slower but `ISTATUS` becomes live); (b) find the exact relationship between
+`hv_vcpu_set_vtimer_offset` and `mach_absolute_time` (Apple HVF docs / a calibration
+that reads back something live) and set the offset so `CNTVCT` continues from the
+snapshot; (c) capture the guest's `CNTVCT` at snapshot via a guest-cooperative read
+and re-anchor `CNTV_CVAL` to `CNTVCT_fresh + tick`. Note there may ALSO be a second
+issue (serial-RX delivery on restore) to verify once the timer is fixed — skip-timer
+parked but did not respond to typed input.
+
+The `IGNITION_SAMPLE` PC sampler + `HvfVcpu::read_pc` + the `host_counter` capture
+are left in (gated/harmless) for this work.
 
 ## Tests / gate
 

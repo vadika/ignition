@@ -739,13 +739,16 @@ impl HvfVcpu<'_> {
         for &(r, v) in &s.sysregs {
             self.write_sys_reg(r as u16, v)?;
         }
-        // Keep the guest's virtual counter continuous across the snapshot gap: add
-        // the host-counter elapsed since snapshot to the saved offset. Without this
-        // CNTVCT jumps to the host's uptime and the guest spins on a flood of
-        // already-expired vtimer interrupts.
-        let elapsed = unsafe { mach_absolute_time() }.wrapping_sub(s.host_counter);
-        let vtimer_offset = s.vtimer_offset.wrapping_add(elapsed);
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, vtimer_offset) };
+        // KNOWN ISSUE (see docs/snapshot-restore-result.md): the captured virtual
+        // timer comparator (CNTV_CVAL, absolute) is already-expired in the restored
+        // vCPU's counter domain, so the timer PPI stays perpetually pending, the idle
+        // WFI never traps, and the guest spins at 100% CPU. Proven root cause (not
+        // restoring the timer regs makes the guest park). The fix needs to re-anchor
+        // the virtual counter, which HVF does not currently give us the primitives
+        // for (no gettable CNTVCT, no CNTV_TVAL, ISTATUS is stale while the vCPU is
+        // stopped, mach_absolute_time is a different counter domain). Restoring the
+        // captured offset as-is until that is resolved.
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, s.vtimer_offset) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
         }
