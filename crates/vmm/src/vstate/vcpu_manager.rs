@@ -49,11 +49,14 @@ impl Vcpus for NoIrqVcpus {
 pub struct VcpuManager {
     bus: Arc<Bus>,
     mpidrs: HashSet<u64>,
+    /// MPIDRs that have been brought up. Bring-up-only: entries are never
+    /// cleared (PSCI bring-up is one-way here; CPU_OFF/hotplug is out of scope),
+    /// so a second CPU_ON for a live MPIDR is rejected as AlreadyRunning.
     running: Mutex<HashSet<u64>>,
     /// Live hvf vCPU ids, registered before each vCPU's first run() for the shutdown broadcast.
     vcpuids: Mutex<Vec<u64>>,
     threads: Mutex<Vec<JoinHandle<Result<(), hvf::Error>>>>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: AtomicBool,
 }
 
 impl VcpuManager {
@@ -66,7 +69,7 @@ impl VcpuManager {
             running: Mutex::new(HashSet::new()),
             vcpuids: Mutex::new(Vec::new()),
             threads: Mutex::new(Vec::new()),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -145,6 +148,11 @@ impl VcpuManager {
     /// The shared per-vCPU run loop (primary and secondary).
     fn run_loop(self: &Arc<Self>, mut vcpu: HvfVcpu) -> Result<(), hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
+        // Termination relies on this top-of-loop shutdown check, not the
+        // vcpu_request_exit broadcast: the broadcast only interrupts a vcpu
+        // already blocked in run(); a vcpu that exits for any other reason
+        // re-checks the (monotonic) flag here on the next iteration. Bounded by
+        // one vcpu.run() (MAX_PARK on WFI).
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
