@@ -109,24 +109,31 @@ Symptom → cause:
 - **`image_size` > file size (BSS):** `load_kernel` copies only `image.len()`
   bytes; the delta is satisfied by pre-zeroed guest RAM. Correct — don't "fix" it
   to copy `image_size` bytes.
-- **DTB-within-512 MiB / large-RAM:** `layout::fdt_addr` has a `TODO(larger-ram)`
-  — top-of-RAM placement only stays within the kernel's early-map 512 MiB window
-  while `ram_size <= 512 MiB`. Add a guard when bigger RAM lands.
+- ✅ **DONE** (2026-06-12, commits `e19b85e`/`36010f0`) — **DTB-within-512 MiB /
+  large-RAM.** `layout::fdt_addr` now clamps placement to `min(ram_size,
+  DTB_EARLY_MAP_LIMIT=512 MiB)`, so for `ram_size > 512 MiB` the DTB sits just below
+  the 512 MiB early-map limit instead of beyond it. (A kernel at `RAM_BASE` must fit
+  in ~510 MiB to clear it — documented.)
 
 ## FDT interface (milestone 2a) — evolve as consumers land
 
-- **`GicInfo` models a single redistributor region** (`redist_base`/`redist_size`
-  scalars). Correct for the default single-region GICv3. Large vCPU counts need
-  multiple redist regions → `#redistributor-regions` + a region slice in both
-  `GicInfo` and `create_gic_node`. The GIC milestone (2b) produces these values;
-  re-check then.
-- **`FdtConfig.serial: MmioDev` is a single device.** When virtio-mmio / RTC land,
-  switch to `Vec<MmioDev>` (or a typed device list) instead of per-device fields
-  to avoid an `FdtConfig` field explosion. `MmioDev` is already named generically
-  for reuse. Not a lock-in now.
-- **mpidr `& 0x7F_FFFF` mask assumes Aff2 bit 23 == 0.** When the vCPU milestone
-  wires real MPIDRs from Hypervisor.framework (HANDOFF: write vcpuid to Aff1),
-  re-validate the mask against the actual MPIDR scheme.
+- ⏸️ **DEFERRED — moot for HVF.** **`GicInfo` models a single redistributor
+  region.** Multiple `#redistributor-regions` are only needed for *discontiguous*
+  redistributors. Apple's `hv_gic` always lays out ONE contiguous redistributor
+  region (`per_cpu_size × vcpu_count` from a single `redist_base`; see
+  `HvfGicV3::new`), so the single-region `GicInfo` + `create_gic_node` stays correct
+  for any vCPU count on this target. Revisit only if a future host produces split
+  redistributor regions. No code change.
+- ✅ **DONE** (2026-06-12, commit `f69feed`/`62aba00`) — **`FdtConfig.serial:
+  MmioDev` was a single device.** Replaced `serial`/`virtio` fields with a typed
+  `devices: Vec<FdtDevice>` (`enum FdtDevice { Serial(MmioDev), VirtioBlk(MmioDev) }`);
+  `generate` dispatches per kind, so adding RTC/more virtio is a new variant + arm,
+  not a new field. All three `FdtConfig` constructions migrated. The serial-console
+  expectation is documented on `devices` (caller's responsibility, as in Firecracker).
+- ⏸️ **DEFERRED — SMP-gated.** **mpidr `& 0x7F_FFFF` mask.** Single-vCPU MPIDR is 0,
+  so the mask is a no-op today. Re-validating it against a real MPIDR scheme requires
+  the SMP/vCPU milestone to first wire actual MPIDRs (vcpuid → Aff1) from
+  Hypervisor.framework — nothing meaningful to validate until then. Carry into SMP.
 
 ## Constraints to remember (not bugs)
 
