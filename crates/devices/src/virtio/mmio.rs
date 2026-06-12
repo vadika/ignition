@@ -55,6 +55,7 @@ struct QueueState {
 }
 
 /// Serializable snapshot of a single virtqueue's driver-programmed state and ring indices.
+// Serde mirror of QueueState's driver-programmed fields + ring indices; intentionally decoupled from the runtime struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueSnapshot {
     pub num: u16,
@@ -275,6 +276,7 @@ impl VirtioMmio {
         self.queue_sel = s.queue_sel;
         self.device_features_sel = s.device_features_sel;
         self.interrupt_status = s.interrupt_status;
+        debug_assert_eq!(self.queues.len(), s.queues.len(), "restore queue-count mismatch");
         for (q, snap) in self.queues.iter_mut().zip(&s.queues) {
             q.num = snap.num;
             q.ready = snap.ready;
@@ -291,6 +293,8 @@ impl VirtioMmio {
                 let mut vq = Virtqueue::new(snap.num, desc, driver, device);
                 vq.set_indices(snap.last_avail, snap.used);
                 q.vq = Some(vq);
+            } else {
+                q.vq = None;
             }
         }
     }
