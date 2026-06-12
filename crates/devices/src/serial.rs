@@ -62,9 +62,14 @@ impl<W: Write + Send> Serial<W> {
     /// the RX interrupt (via the wired Trigger) if the guest enabled it. Returns
     /// the number of bytes accepted.
     pub fn enqueue(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.inner
-            .enqueue_raw_bytes(bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serial enqueue: {e:?}")))
+        use vm_superio::serial::Error as SerialError;
+        self.inner.enqueue_raw_bytes(bytes).map_err(|e| {
+            let kind = match e {
+                SerialError::FullFifo => io::ErrorKind::WouldBlock,
+                _ => io::ErrorKind::Other,
+            };
+            io::Error::new(kind, format!("serial enqueue: {e}"))
+        })
     }
 }
 
@@ -125,7 +130,7 @@ mod tests {
     #[test]
     fn enqueue_sets_data_ready_and_reads_back() {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let mut serial = Serial::new(SharedSink(buf));
+        let mut serial = Serial::new(SharedSink(buf.clone()));
         let n = serial.enqueue(b"hi").unwrap();
         assert_eq!(n, 2);
 
@@ -140,5 +145,7 @@ mod tests {
         assert_eq!(b[0], b'h');
         serial.read(0, 0, &mut b);
         assert_eq!(b[0], b'i');
+
+        assert!(buf.lock().unwrap().is_empty(), "enqueue must not write to the TX sink");
     }
 }
