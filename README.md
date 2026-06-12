@@ -9,12 +9,22 @@ Reference implementation for the HVF layer is [libkrun](https://github.com/conta
 `firecracker-hvf-porting-map.md` for the full plan and source analysis, and
 `SPIKE_RESULTS.md` for the validation spike that de-risked this structure.
 
-## Status: Phase 0 — skeleton
+## Status: boots Linux to a shell, with snapshot/restore
 
-The `hvf` crate (lifted verbatim from libkrun) is validated end-to-end on
-macOS 26.5 / Apple Silicon: it creates a VM, runs a vCPU, and decodes MMIO + WFI
-exits correctly (`cargo run -p hvf-spike` after signing). Everything above it is
-stubs awaiting Phase 1 (boot-to-shell).
+Validated end-to-end on macOS 26.5 / Apple Silicon. Working today (each with a
+spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
+
+- **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive
+  16550 console (TX + RX).
+- **virtio-blk** — rootfs from a disk image.
+- **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
+- **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
+- **Snapshot / restore** — single-vCPU, clone-capable (`--snap-dir` + `Ctrl-A s`,
+  `--restore`); restored guest idles at ~0% CPU and stays responsive.
+
+The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
+load-bearing layer; the `hvf-spike` smoke test still exercises it in isolation
+(`cargo run -p hvf-spike` after signing).
 
 ## Layout
 
