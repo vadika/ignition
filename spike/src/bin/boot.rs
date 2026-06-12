@@ -23,7 +23,7 @@ use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use hvf::gic::HvfGicV3;
-use vmm::vstate::hvf_vcpu::Vcpu;
+use vmm::vstate::vcpu_manager::VcpuManager;
 use vmm::vstate::hvf_vm::Vm;
 
 const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
@@ -215,12 +215,31 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: {} <kernel-Image> [rootfs-disk]", args[0]);
+    // Parse `--smp N` (default 1, capped at 8); kernel/rootfs stay positional.
+    const MAX_VCPUS: u64 = 8;
+    let mut smp: u64 = 1;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--smp" => {
+                let n = it
+                    .next()
+                    .expect("--smp needs a value")
+                    .parse::<u64>()
+                    .expect("--smp value must be a number");
+                assert!((1..=MAX_VCPUS).contains(&n), "--smp must be 1..={MAX_VCPUS}");
+                smp = n;
+            }
+            other => positionals.push(other.to_string()),
+        }
+    }
+    if positionals.is_empty() {
+        eprintln!("usage: {} [--smp N] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
-    let kernel_image = fs::read(&args[1]).expect("failed to read kernel image");
-    let disk_path = args.get(2).cloned();
+    let kernel_image = fs::read(&positionals[0]).expect("failed to read kernel image");
+    let disk_path = positionals.get(1).cloned();
 
     // Allocate guest RAM on the host.
     let host = unsafe {
@@ -246,7 +265,7 @@ fn main() {
 
     // VM, then the in-kernel GIC (must be created before any vCPU).
     let mut vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
-    let gic = Arc::new(HvfGicV3::new(1, layout::RAM_BASE).expect("hv_gic_create failed"));
+    let gic = Arc::new(HvfGicV3::new(smp, layout::RAM_BASE).expect("hv_gic_create failed"));
 
     // Build and place the device tree.
     let mut fdt_devices = vec![fdt::FdtDevice::Serial(MmioDev {
@@ -264,7 +283,7 @@ fn main() {
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
         mem_size: RAM_SIZE,
-        cpu_mpidrs: vec![0],
+        cpu_mpidrs: (0..smp).map(vmm::vstate::vcpu_manager::mpidr_for).collect(),
         cmdline: layout::default_cmdline(),
         devices: fdt_devices,
         gic: gic.fdt_info(),
@@ -329,12 +348,12 @@ fn main() {
     // it before process::exit on Ctrl-A x.
     let termios = TermiosGuard::new();
     spawn_stdin_reader(serial.clone(), termios.saved());
-    eprintln!("--- console attached (quit: Ctrl-A x) ---");
+    eprintln!("--- console attached (quit: Ctrl-A x), {smp} vCPU(s) ---");
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
-    let vcpu = Vcpu::new(0, entry, fdt_addr, bus);
-    match vcpu.start().join().expect("vCPU thread panicked") {
-        Ok(()) => eprintln!("\n[vcpu exited cleanly]"),
+    let manager = VcpuManager::new(smp, bus);
+    match manager.run(entry, fdt_addr) {
+        Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
         Err(e) => eprintln!("\n[vcpu error: {e}]"),
     }
 }
