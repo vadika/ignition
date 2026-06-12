@@ -6,3 +6,5 @@
 
 pub mod sysreg;
 pub mod fdt;
+pub mod layout;
+pub mod kernel;
