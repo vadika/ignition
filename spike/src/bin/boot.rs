@@ -37,6 +37,20 @@ impl IrqLine for GicIrq {
     }
 }
 
+/// Unbuffered stdout sink for the guest console: writes each byte straight
+/// through and flushes, so a newline-less prompt is visible immediately.
+struct FlushWriter;
+impl Write for FlushWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = io::stdout().write(buf)?;
+        io::stdout().flush()?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -114,8 +128,10 @@ fn main() {
     io::stderr().flush().ok();
 
     // Device bus: 16550 serial to stdout, plus an optional virtio-blk disk.
+    // Flush each byte: a prompt like "login: " has no trailing newline and would
+    // otherwise sit forever in stdout's line buffer, looking like a hang.
     let mut bus = Bus::new();
-    let serial: Arc<Mutex<dyn BusDevice>> = Arc::new(Mutex::new(Serial::new(io::stdout())));
+    let serial: Arc<Mutex<dyn BusDevice>> = Arc::new(Mutex::new(Serial::new(FlushWriter)));
     bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial);
 
     if let Some(path) = &disk_path {
