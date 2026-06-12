@@ -8,10 +8,16 @@
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use devices::bus::Bus;
 
 pub use hvf::{HvfVcpu, InterruptType, VcpuExit, Vcpus};
+
+/// Upper bound on how long the run loop sleeps on an idle exit. Caps a large
+/// timer deadline so the loop stays responsive, and bounds the busy-wait on a
+/// no-deadline WFI on the earlycon path.
+const MAX_PARK: Duration = Duration::from_millis(10);
 
 /// Interrupt source with no GIC yet: the guest receives no injected IRQs, and
 /// trapped system-register accesses are acknowledged so the vCPU keeps running.
@@ -78,9 +84,16 @@ impl Vcpu {
                     return Ok(());
                 }
                 VcpuExit::Canceled => return Ok(()),
-                // No idle-park yet; the milestone guest does not WFI on the
-                // success path. TODO(phase1-smp): WFE/WFI parking with a
-                // CNTV_CVAL-derived timeout, lifted from libkrun macos/vstate.rs.
+                // Idle/timer exits. Earlycon-grade parking: bounded sleeps keep
+                // the CPU off the floor and let wall-clock advance toward the
+                // next CNTV deadline. Proper channel parking that wakes on an
+                // injected IRQ is a later milestone. On re-entry hvf_sync_vtimer
+                // unmasks the vtimer and sets the IRQ; when a GIC is present (the
+                // boot harness creates the in-kernel hv_gic) it redelivers it.
+                VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
+                // TODO(phase1-smp): wake on a sibling vCPU's SEV instead of polling.
+                VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
+                VcpuExit::WaitForEventExpired | VcpuExit::VtimerActivated => {}
                 other => log::debug!("unhandled vCPU exit: {other:?}"),
             }
         }

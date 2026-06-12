@@ -1,0 +1,3 @@
+# Built guest artifacts — large and fully reproducible via build/*.sh.
+# Rebuild with build/build-kernel.sh and build/build-rootfs.sh (see README.md).
+out/

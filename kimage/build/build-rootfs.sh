@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Build minimal aarch64 rootfs (busybox shell + openrc init) and pack to ext4.
+# Output: ~/kbuild/out/rootfs.ext4
+set -euo pipefail
+
+OUT="$HOME/kbuild/out"
+STAGE="$HOME/kbuild"          # user-owned; out/ may be root-owned from kernel build
+mkdir -p "$OUT"
+TAR="$STAGE/rootfs.tar"
+
+# 1. Provision rootfs inside an arm64 alpine container (init, console, dirs).
+docker rm -f fcroot_build >/dev/null 2>&1 || true
+docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
+  apk add --no-cache openrc util-linux
+
+  # serial console on ttyS0 (Firecracker default)
+  ln -sf agetty /etc/init.d/agetty.ttyS0
+  echo ttyS0 > /etc/securetty
+  rc-update add agetty.ttyS0 default
+  rc-update add devfs boot
+  rc-update add procfs boot
+  rc-update add sysfs boot
+
+  # root has no password for console login
+  passwd -d root || true
+'
+
+# Export the built container filesystem to a tarball (host-user writable path).
+docker export fcroot_build -o "$TAR"
+docker rm fcroot_build >/dev/null
+
+# 2. Unpack tar into a dir and create runtime mountpoints, then build ext4
+#    image with mke2fs -d (no privileged mount needed). Container runs as root,
+#    so it can write rootfs.ext4 into a root-owned out/.
+docker run --rm -v "$STAGE:/work" ubuntu:22.04 bash -euxc '
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends e2fsprogs >/dev/null
+
+  rm -rf /tmp/rootfs && mkdir -p /tmp/rootfs
+  tar xf /work/rootfs.tar -C /tmp/rootfs
+  # Docker export leaves these as files; ensure they are dirs.
+  rm -f /tmp/rootfs/.dockerenv
+  for d in dev proc run sys tmp mnt; do mkdir -p /tmp/rootfs/$d; done
+
+  # 96 MiB image, sized for the staged tree.
+  rm -f /work/out/rootfs.ext4
+  mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs /work/out/rootfs.ext4 96M
+  ls -la /work/out/rootfs.ext4
+'
+
+rm -f "$TAR"
