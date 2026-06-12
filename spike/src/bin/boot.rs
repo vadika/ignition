@@ -76,6 +76,63 @@ fn step(state: &mut EscState, byte: u8) -> Action {
     }
 }
 
+/// Restore previously-saved terminal settings on stdin. No-op if `saved` is
+/// `None` (stdin was not a TTY).
+fn restore_termios(saved: &Option<libc::termios>) {
+    if let Some(t) = saved {
+        // SAFETY: `t` is a termios we read from this same fd; tcsetattr on
+        // STDIN_FILENO with a valid pointer is sound.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+        }
+    }
+}
+
+/// Puts stdin into raw mode for the lifetime of the guard and restores the
+/// original settings on drop. No-op for non-TTY stdin (pipes / CI), so
+/// output-only runs are unaffected.
+struct TermiosGuard {
+    original: Option<libc::termios>,
+}
+
+impl TermiosGuard {
+    fn new() -> Self {
+        // SAFETY: STDIN_FILENO is a valid fd; termios is plain-old-data; all
+        // libc calls below receive valid pointers.
+        unsafe {
+            if libc::isatty(libc::STDIN_FILENO) != 1 {
+                return Self { original: None };
+            }
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+                return Self { original: None };
+            }
+            let original = t;
+            // Raw: drop canonical mode, echo, signal chars (so Ctrl-C reaches the
+            // guest), and extended input; drop XON/XOFF and CR->NL translation so
+            // every keystroke passes through verbatim.
+            t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+            t.c_iflag &= !(libc::IXON | libc::ICRNL);
+            t.c_cc[libc::VMIN] = 1;
+            t.c_cc[libc::VTIME] = 0;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t);
+            Self { original: Some(original) }
+        }
+    }
+
+    /// A copy of the saved termios for the reader thread to restore before
+    /// `process::exit` (which skips `Drop`).
+    fn saved(&self) -> Option<libc::termios> {
+        self.original
+    }
+}
+
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        restore_termios(&self.original);
+    }
+}
+
 /// Adapts the in-kernel GIC to the device `IrqLine`. The virtio SPI index is the
 /// bare FDT index; hv_gic_set_spi wants the absolute INTID (32 + index).
 struct GicIrq {
