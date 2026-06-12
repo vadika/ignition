@@ -38,6 +38,9 @@ pub enum FdtDevice {
     Serial(MmioDev),
     /// virtio-mmio block device -> `virtio,mmio` node.
     VirtioBlk(MmioDev),
+    /// virtio-mmio network device -> `virtio,mmio` node (same node builder as
+    /// `VirtioBlk`; the kernel reads the device id from the mmio registers).
+    VirtioNet(MmioDev),
 }
 
 /// GICv3 placement, supplied by the GIC milestone. Parameterized so FDT
@@ -90,6 +93,7 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
         match dev {
             FdtDevice::Serial(m) => create_serial_node(&mut fdt, m)?,
             FdtDevice::VirtioBlk(m) => create_virtio_node(&mut fdt, m)?,
+            FdtDevice::VirtioNet(m) => create_virtio_node(&mut fdt, m)?,
         }
     }
 

@@ -291,7 +291,7 @@ fn main() {
         }));
     }
     if net {
-        fdt_devices.push(fdt::FdtDevice::VirtioBlk(MmioDev {
+        fdt_devices.push(fdt::FdtDevice::VirtioNet(MmioDev {
             addr: layout::NET_BASE,
             size: layout::NET_SIZE,
             irq: layout::NET_SPI,
