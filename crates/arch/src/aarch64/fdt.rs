@@ -66,10 +66,44 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     fdt.property_u32("#size-cells", SIZE_CELLS)?;
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
 
+    create_cpu_nodes(&mut fdt, &cfg.cpu_mpidrs)?;
     create_memory_node(&mut fdt, cfg.mem_base, cfg.mem_size)?;
+    create_chosen_node(&mut fdt, &cfg.cmdline, cfg.initrd)?;
 
     fdt.end_node(root)?;
     fdt.finish()
+}
+
+fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), vm_fdt::Error> {
+    let cpus = fdt.begin_node("cpus")?;
+    fdt.property_u32("#address-cells", 0x02)?;
+    fdt.property_u32("#size-cells", 0x0)?;
+    for (i, mpidr) in mpidrs.iter().enumerate() {
+        let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
+        fdt.property_string("device_type", "cpu")?;
+        fdt.property_string("compatible", "arm,arm-v8")?;
+        fdt.property_string("enable-method", "psci")?;
+        // First 24 bits of MPIDR (affinity).
+        fdt.property_u64("reg", mpidr & 0x7F_FFFF)?;
+        fdt.end_node(cpu)?;
+    }
+    fdt.end_node(cpus)?;
+    Ok(())
+}
+
+fn create_chosen_node(
+    fdt: &mut FdtWriter,
+    cmdline: &str,
+    initrd: Option<(u64, u64)>,
+) -> Result<(), vm_fdt::Error> {
+    let chosen = fdt.begin_node("chosen")?;
+    fdt.property_string("bootargs", cmdline)?;
+    if let Some((addr, size)) = initrd {
+        fdt.property_u64("linux,initrd-start", addr)?;
+        fdt.property_u64("linux,initrd-end", addr + size)?;
+    }
+    fdt.end_node(chosen)?;
+    Ok(())
 }
 
 fn create_memory_node(fdt: &mut FdtWriter, base: u64, size: u64) -> Result<(), vm_fdt::Error> {
@@ -131,5 +165,47 @@ mod tests {
         let mem = dt.find_node("/memory@ram").unwrap();
         assert_eq!(dt_str(mem.property("device_type").unwrap().value), "memory");
         assert_eq!(be_u64s(mem.property("reg").unwrap().value), vec![0x4000_0000, 0x2000_0000]);
+    }
+
+    #[test]
+    fn cpu_nodes_match_mpidrs() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let cpus = dt.find_node("/cpus").unwrap();
+        let cpu_children: Vec<_> =
+            cpus.children().filter(|c| c.name.starts_with("cpu@")).collect();
+        assert_eq!(cpu_children.len(), 2);
+
+        let cpu0 = dt.find_node("/cpus/cpu@0").unwrap();
+        assert_eq!(dt_str(cpu0.property("device_type").unwrap().value), "cpu");
+        assert_eq!(dt_str(cpu0.property("enable-method").unwrap().value), "psci");
+        assert_eq!(be_u64s(cpu0.property("reg").unwrap().value), vec![0x0]);
+
+        let cpu1 = dt.find_node("/cpus/cpu@1").unwrap();
+        assert_eq!(be_u64s(cpu1.property("reg").unwrap().value), vec![0x1]);
+    }
+
+    #[test]
+    fn chosen_has_bootargs_and_no_initrd_by_default() {
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let chosen = dt.find_node("/chosen").unwrap();
+        assert_eq!(
+            dt_str(chosen.property("bootargs").unwrap().value),
+            "console=ttyS0 earlycon=uart8250,mmio,0x9000000"
+        );
+        assert!(chosen.property("linux,initrd-start").is_none());
+        assert!(chosen.property("linux,initrd-end").is_none());
+    }
+
+    #[test]
+    fn chosen_includes_initrd_when_set() {
+        let mut cfg = sample();
+        cfg.initrd = Some((0x4800_0000, 0x10_0000));
+        let blob = generate(&cfg).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let chosen = dt.find_node("/chosen").unwrap();
+        assert_eq!(be_u64s(chosen.property("linux,initrd-start").unwrap().value), vec![0x4800_0000]);
+        assert_eq!(be_u64s(chosen.property("linux,initrd-end").unwrap().value), vec![0x4810_0000]);
     }
 }
