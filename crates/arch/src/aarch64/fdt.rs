@@ -53,6 +53,8 @@ pub struct FdtConfig {
     pub gic: GicInfo,
     /// (guest addr, size) when an initramfs is loaded.
     pub initrd: Option<(u64, u64)>,
+    /// The virtio-mmio block device, when attached.
+    pub virtio: Option<MmioDev>,
 }
 
 /// Build the DTB blob. All errors originate in `vm-fdt` (e.g. an interior NUL in
@@ -74,6 +76,9 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     create_timer_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
     create_serial_node(&mut fdt, &cfg.serial)?;
+    if let Some(virtio) = &cfg.virtio {
+        create_virtio_node(&mut fdt, virtio)?;
+    }
 
     fdt.end_node(root)?;
     fdt.finish()
@@ -191,6 +196,17 @@ fn create_serial_node(fdt: &mut FdtWriter, serial: &MmioDev) -> Result<(), vm_fd
     Ok(())
 }
 
+fn create_virtio_node(fdt: &mut FdtWriter, dev: &MmioDev) -> Result<(), vm_fdt::Error> {
+    let node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev.addr))?;
+    fdt.property_string("compatible", "virtio,mmio")?;
+    fdt.property_array_u64("reg", &[dev.addr, dev.size])?;
+    fdt.property_null("dma-coherent")?;
+    fdt.property_array_u32("interrupts", &[IRQ_TYPE_SPI, dev.irq, IRQ_TYPE_EDGE_RISING])?;
+    fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+    fdt.end_node(node)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +240,7 @@ mod tests {
                 maint_irq: 9,
             },
             initrd: None,
+            virtio: None,
         }
     }
 
@@ -343,5 +360,23 @@ mod tests {
         assert_eq!(dt_str(clk.property("compatible").unwrap().value), "fixed-clock");
         assert_eq!(be_u32s(clk.property("clock-frequency").unwrap().value), vec![24_000_000]);
         assert_eq!(be_u32s(clk.property("phandle").unwrap().value), vec![2]);
+    }
+
+    #[test]
+    fn virtio_node_present_only_when_set() {
+        // Absent by default.
+        let blob = generate(&sample()).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        assert!(dt.find_node("/virtio_mmio@a000000").is_none());
+
+        // Present when configured.
+        let mut cfg = sample();
+        cfg.virtio = Some(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 });
+        let blob = generate(&cfg).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let node = dt.find_node("/virtio_mmio@a000000").unwrap();
+        assert_eq!(dt_str(node.property("compatible").unwrap().value), "virtio,mmio");
+        assert_eq!(be_u64s(node.property("reg").unwrap().value), vec![0x0a00_0000, 0x200]);
+        assert_eq!(be_u32s(node.property("interrupts").unwrap().value), vec![0, 1, 1]);
     }
 }

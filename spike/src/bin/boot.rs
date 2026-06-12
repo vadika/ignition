@@ -87,6 +87,7 @@ fn main() {
         },
         gic: gic.fdt_info(),
         initrd,
+        virtio: None,
     };
     let dtb = fdt::generate(&cfg).expect("fdt generate failed");
     assert!(fdt_off + dtb.len() <= ram.len(), "DTB does not fit in RAM");

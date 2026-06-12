@@ -52,6 +52,7 @@ fn main() {
         serial: MmioDev { addr: 0x0900_0000, size: 0x1000, irq: 33 },
         gic: info,
         initrd: None,
+        virtio: None,
     };
     let blob = arch::aarch64::fdt::generate(&cfg).expect("fdt generate failed");
     assert!(!blob.is_empty(), "empty DTB");
