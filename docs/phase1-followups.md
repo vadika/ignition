@@ -24,26 +24,25 @@ all matter once a real aarch64 Linux kernel boots.
   at 1–2 devices. When GIC + virtio land, have `register` return a `Result` with
   an overlap check before the device table grows.
 
-## NEXT MILESTONE (2f): interrupt delivery → shell + interactivity
+## NEXT MILESTONE (2f): interrupt delivery → shell — RE-DIAGNOSED
 
-Confirmed at the 2e boot: after `OpenRC 0.52.1` the guest is **0.0% CPU, parked in
-WFI** waiting for an interrupt that never comes (see `docs/2e-virtio-result.md`).
-virtio-blk works (rootfs mounts, init runs); the shell is blocked on IRQ delivery.
+⚠️ The original 2f theory (vtimer PPI not delivered) was **DISPROVEN** during
+implementation. See `docs/2f-findings.md` (commit 50e7b38) for the corrected,
+evidence-backed diagnosis. Summary:
 
-1. **vtimer PPI injection (in-kernel GIC).** `NoIrqVcpus::set_vtimer_irq` is a
-   no-op and `hv_gic` has no `set_ppi`. On `VtimerActivated`, the EL1 virtual
-   timer PPI must reach the guest or every userspace `sleep`/timeout hangs.
-   Investigate: does `hv_vcpu_set_pending_interrupt` (IRQ line) work with the
-   in-kernel GIC, or does the redistributor deliver the vtimer once we stop
-   masking? This is the unproven path from 2b — experiment against the live boot.
-2. **Channel-based WFI parking.** Replace the bounded-sleep parking in
-   `crates/vmm/src/vstate/hvf_vcpu.rs` with a per-vCPU crossbeam channel (libkrun
-   `macos/vstate.rs` pattern): park on `recv_timeout(cntv_deadline)`; wake when a
-   device calls `set_spi` (the virtio `IrqLine` / GIC path must signal the parked
-   thread, e.g. via `hv::vcpu_request_exit`). Without this, an IRQ raised while
-   parked doesn't promptly wake the guest.
-3. **Serial RX** (rides along): host stdin → 16550 RBR + RX interrupt for an
-   interactive shell.
+1. **The timer already works.** `HV_EXIT_REASON_VTIMER_ACTIVATED` never fires —
+   the in-kernel `hv_gic` delivers the vtimer natively. Do NOT chase the vtimer.
+2. **The real blocker is virtio completion-IRQ delivery.** An MMIO trace shows
+   the guest stuck in a `QueueNotify → InterruptStatus → InterruptACK` loop at
+   ~10 ms (= the run loop's `MAX_PARK` WFI timeout). The guest WFIs for the
+   virtio IRQ and only limps forward on the timeout, because `hv_gic_set_spi(33)`
+   returns success but does NOT wake the parked guest. Fix that:
+   - verify the SPI INTID against `hv_gic_get_spi_interrupt_range`/`hv_gic_get_intid`;
+   - fix the edge/level/pulse timing of `set_spi` (assert during the paused exit
+     vs after; deassert→assert);
+   - confirm the guest enabled INTID 33 in the distributor.
+3. Then: channel-based WFI parking (replace `MAX_PARK`; a no-timeout `recv()`
+   will EXPOSE the IRQ bug, so fix delivery first) and serial RX for interactivity.
 
 ## GIC (milestone 2b) — confirmed facts for 2d integration
 
