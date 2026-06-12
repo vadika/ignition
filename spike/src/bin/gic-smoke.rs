@@ -8,7 +8,7 @@
 // Creates a VM, then the in-kernel GICv3, asserts its placement, exercises
 // set_spi, and confirms the GIC placement composes with FDT generation.
 
-use arch::aarch64::fdt::{FdtConfig, MmioDev};
+use arch::aarch64::fdt::{FdtConfig, FdtDevice, MmioDev};
 use hvf::gic::HvfGicV3;
 use vmm::vstate::hvf_vm::Vm;
 
@@ -49,10 +49,9 @@ fn main() {
         mem_size: 0x2000_0000,
         cpu_mpidrs: vec![0],
         cmdline: "console=ttyS0".to_string(),
-        serial: MmioDev { addr: 0x0900_0000, size: 0x1000, irq: 33 },
+        devices: vec![FdtDevice::Serial(MmioDev { addr: 0x0900_0000, size: 0x1000, irq: 33 })],
         gic: info,
         initrd: None,
-        virtio: None,
     };
     let blob = arch::aarch64::fdt::generate(&cfg).expect("fdt generate failed");
     assert!(!blob.is_empty(), "empty DTB");

@@ -249,21 +249,26 @@ fn main() {
     let gic = Arc::new(HvfGicV3::new(1, layout::RAM_BASE).expect("hv_gic_create failed"));
 
     // Build and place the device tree.
+    let mut fdt_devices = vec![fdt::FdtDevice::Serial(MmioDev {
+        addr: layout::SERIAL_BASE,
+        size: layout::SERIAL_SIZE,
+        irq: layout::SERIAL_SPI,
+    })];
+    if disk_path.is_some() {
+        fdt_devices.push(fdt::FdtDevice::VirtioBlk(MmioDev {
+            addr: layout::VIRTIO_BASE,
+            size: layout::VIRTIO_SIZE,
+            irq: layout::VIRTIO_SPI,
+        }));
+    }
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
         mem_size: RAM_SIZE,
         cpu_mpidrs: vec![0],
         cmdline: layout::default_cmdline(),
-        serial: MmioDev {
-            addr: layout::SERIAL_BASE,
-            size: layout::SERIAL_SIZE,
-            irq: layout::SERIAL_SPI,
-        },
+        devices: fdt_devices,
         gic: gic.fdt_info(),
         initrd: None,
-        virtio: disk_path
-            .as_ref()
-            .map(|_| MmioDev { addr: layout::VIRTIO_BASE, size: layout::VIRTIO_SIZE, irq: layout::VIRTIO_SPI }),
     };
     let dtb = fdt::generate(&cfg).expect("fdt generate failed");
     assert!(fdt_off + dtb.len() <= ram.len(), "DTB does not fit in RAM");

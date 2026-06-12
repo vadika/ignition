@@ -30,6 +30,16 @@ pub struct MmioDev {
     pub irq: u32,
 }
 
+/// An MMIO device to emit as an FDT node. Each variant maps to a node builder,
+/// so adding a device kind (RTC, more virtio) is a new variant + match arm rather
+/// than a new `FdtConfig` field.
+pub enum FdtDevice {
+    /// 16550-compatible serial -> `ns16550a` node.
+    Serial(MmioDev),
+    /// virtio-mmio block device -> `virtio,mmio` node.
+    VirtioBlk(MmioDev),
+}
+
 /// GICv3 placement, supplied by the GIC milestone. Parameterized so FDT
 /// generation stays pure.
 pub struct GicInfo {
@@ -49,12 +59,11 @@ pub struct FdtConfig {
     pub cpu_mpidrs: Vec<u64>,
     /// Kernel command line -> /chosen bootargs.
     pub cmdline: String,
-    pub serial: MmioDev,
+    /// MMIO devices to emit, in node order.
+    pub devices: Vec<FdtDevice>,
     pub gic: GicInfo,
     /// (guest addr, size) when an initramfs is loaded.
     pub initrd: Option<(u64, u64)>,
-    /// The virtio-mmio block device, when attached.
-    pub virtio: Option<MmioDev>,
 }
 
 /// Build the DTB blob. All errors originate in `vm-fdt` (e.g. an interior NUL in
@@ -75,9 +84,11 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     create_clock_node(&mut fdt)?;
     create_timer_node(&mut fdt)?;
     create_psci_node(&mut fdt)?;
-    create_serial_node(&mut fdt, &cfg.serial)?;
-    if let Some(virtio) = &cfg.virtio {
-        create_virtio_node(&mut fdt, virtio)?;
+    for dev in &cfg.devices {
+        match dev {
+            FdtDevice::Serial(m) => create_serial_node(&mut fdt, m)?,
+            FdtDevice::VirtioBlk(m) => create_virtio_node(&mut fdt, m)?,
+        }
     }
 
     fdt.end_node(root)?;
@@ -244,7 +255,7 @@ mod tests {
             mem_size: 0x2000_0000,
             cpu_mpidrs: vec![0x0, 0x1],
             cmdline: "console=ttyS0 earlycon=uart8250,mmio,0x9000000".to_string(),
-            serial: MmioDev { addr: 0x0900_0000, size: 0x1000, irq: 33 },
+            devices: vec![FdtDevice::Serial(MmioDev { addr: 0x0900_0000, size: 0x1000, irq: 33 })],
             gic: GicInfo {
                 dist_base: 0x0800_0000,
                 dist_size: 0x1_0000,
@@ -253,7 +264,6 @@ mod tests {
                 maint_irq: 9,
             },
             initrd: None,
-            virtio: None,
         }
     }
 
@@ -393,7 +403,7 @@ mod tests {
 
         // Present when configured.
         let mut cfg = sample();
-        cfg.virtio = Some(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 });
+        cfg.devices.push(FdtDevice::VirtioBlk(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 }));
         let blob = generate(&cfg).unwrap();
         let dt = Fdt::new(&blob).unwrap();
         let node = dt.find_node("/virtio_mmio@a000000").unwrap();
