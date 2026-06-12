@@ -12,14 +12,13 @@ all matter once a real aarch64 Linux kernel boots.
   `debug_assert` on size); removed the dead `MmioRead::addr` field. See the
   hardening plan `docs/superpowers/plans/2026-06-12-phase1-hardening.md`.
 
-- **Unknown PSCI/HVC function id panics the vCPU.** `crates/hvf/src/lib.rs`
-  `handle_psci_request` ends in `val => panic!("Unexpected val={val}")`, so a guest
-  issuing an unmodeled PSCI call (e.g. `CPU_OFF`, `AFFINITY_INFO`) hard-panics the
-  vCPU thread (and, via panic-on-join, the process) instead of returning
-  `NOT_SUPPORTED` (`0xffff_ffff_ffff_ffff`). Pre-existing, but the SMP milestone
-  widened the guest surface that can reach it (secondaries may probe affinity / try
-  hotplug). Return `NOT_SUPPORTED` for unrecognized ids instead of panicking. Track
-  it. (CPU hotplug / `CPU_OFF` modeling is itself out of scope per the SMP spec.)
+- ✅ **DONE** (2026-06-12, commit `6c4d676`) — **Unknown PSCI/HVC function id
+  panicked the vCPU.** `handle_psci_request` now returns `NOT_SUPPORTED` (-1 in X0)
+  + `VcpuExit::PsciHandled` for unrecognized ids instead of `panic!`, so a guest
+  probing `CPU_OFF`/`AFFINITY_INFO` gets a clean error rather than killing the vCPU
+  thread/process. (HVC needs no PC advance — ELR already points past it, verified by
+  the working CPU_ON path; SMC advances as before.) CPU hotplug / `CPU_OFF` modeling
+  remains out of scope.
 
 ## Layering migrations (do early in the next milestone)
 
@@ -68,10 +67,11 @@ evidence-backed diagnosis. Summary:
 - **`hv_gic_config_t` is leaked** (retained OS object, never `os_release`d) —
   matches `hv_vm_config_t`. Fine at process scope; add a Drop wrapper if GICs
   ever become dynamic.
-- **`set_spi` reuses `Error::GicCreate`** on failure (single-variant choice).
-  When `set_spi` moves onto the hot IRQ-injection path in 2d, split out
-  `Error::GicSetSpi` — the "creating GIC" Display string misleads for a runtime
-  injection failure.
+- ✅ **DONE** (2026-06-12, commit `25246f0`) — **`set_spi` reused
+  `Error::GicCreate`.** Split out `Error::GicSetSpi` ("Error setting HVF GIC SPI
+  level"); `HvfGicV3::set_spi` now returns it, the create-path returns stay
+  `GicCreate`. (`hvf::Error` and `KernelError` also gained `impl std::error::Error`
+  in the same commit — see the kernel-loader item below.)
 - **`HvfGicV3::new(vcpu_count, gic_top)`**: `gic_top` = the address the GIC sits
   just below (in the smoke, guest RAM base `0x4000_0000`). When the 2c layout
   module lands, pass the real value (likely RAM base) — not the serial MMIO
@@ -109,9 +109,10 @@ Symptom → cause:
   address. Feed both to `HvfVcpu::set_initial_state(entry, fdt_addr)` (already
   built) and write the DTB bytes into the host RAM slice at `fdt_addr - RAM_BASE`.
   `load_kernel` takes `&mut [u8]` so pass the HVF mmap slice directly.
-- **`KernelError` should impl `std::error::Error`** once it propagates through the
-  VMM error chain in 2d (trivial: `impl std::error::Error for KernelError {}`).
-  Same applies to `hvf::Error`.
+- ✅ **DONE** (2026-06-12, commit `25246f0`) — **`KernelError` / `hvf::Error` impl
+  `std::error::Error`.** Both now `impl std::error::Error` (Display + Debug were
+  already present), so they compose into `?`/`Box<dyn Error>` chains. Compile-checked
+  by `error_is_std_error` / `kernel_error_is_std_error` tests.
 - **`text_offset` alignment:** a real-kernel validator could warn (not error) if
   `text_offset % 0x20_0000 != 0` — modern kernels are 2 MiB-aligned. The copy
   works regardless.
@@ -153,7 +154,10 @@ Symptom → cause:
   for the milestone guest (`strb`/`ldrb`), but a driver doing wider register
   access would silently no-op. Intentional, logged.
 
-- **`NoIrqVcpus` stubs the whole interrupt/sysreg path** (no GIC): `handle_sysreg_read`
-  returns `Some(0)`, `handle_sysreg_write` returns `true`, no IRQ injection. A
-  booting kernel needs a real GIC-backed `Vcpus` impl (in-kernel `hv_gic` is the
-  fast path; see HANDOFF GIC decision).
+- **`NoIrqVcpus` stubs the userspace interrupt/sysreg path** (`handle_sysreg_read`
+  => `Some(0)`, `handle_sysreg_write` => `true`, no userspace IRQ injection). This is
+  the **correct permanent impl** for our design: the in-kernel `hv_gic` delivers all
+  interrupts and per-cpu timers natively, so the userspace `Vcpus` path is
+  intentionally inert — not a stopgap. As of 2026-06-12 (commit `7e1e73d`) it lives
+  once in the `hvf` crate (`hvf::NoIrqVcpus`), shared by both vCPU runners (was
+  duplicated in `hvf_vcpu.rs` + `vcpu_manager.rs`).
