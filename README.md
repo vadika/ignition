@@ -21,8 +21,14 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
 
 - **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive
   16550 console (TX + RX).
-- **virtio-blk** — rootfs from a disk image.
-- **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
+- **Device model** — a uniform `DeviceManager` (MMIO/SPI allocation, bus, FDT,
+  snapshot) behind one `MmioDevice` trait. The full Firecracker aarch64 device set:
+  - **virtio-blk** — rootfs from a disk image.
+  - **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
+  - **virtio-rng** — entropy source (`getentropy`-backed), always-on.
+  - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`).
+  - **virtio-vsock** — guest→host streams over a host Unix socket (`--vsock-uds`); host→guest is a TODO (E2).
+  - **PL031 RTC** — wall clock; the kernel sets system time from it.
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
 - **Snapshot / restore** — single-vCPU, clone-capable (`--snap-dir` + `Ctrl-A s`,
   `--restore`); restored guest idles at ~0% CPU and stays responsive.
