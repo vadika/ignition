@@ -17,6 +17,7 @@ use std::{env, fs, process};
 
 use arch::aarch64::fdt::{self, FdtConfig};
 use arch::aarch64::{kernel, layout};
+use devices::boot_timer::BootTimer;
 use devices::rtc::Pl031;
 use devices::serial::Serial;
 use devices::virtio::balloon::Balloon;
@@ -315,6 +316,9 @@ fn main() {
         eprintln!("usage: {} [--smp N] [--net] [--vsock-uds <path>] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
+    // Capture the start instant as early as possible in the fresh-boot path so
+    // the boot-timer measures total VM startup time, not just kernel load.
+    let boot_start = std::time::Instant::now();
     let kernel_image = fs::read(&positionals[0]).expect("failed to read kernel image");
     let disk_path = positionals.get(1).cloned();
 
@@ -428,6 +432,15 @@ fn main() {
         spawn_vsock_reactor(vsock_mmio);
         eprintln!("virtio-vsock: enabled (host uds base {})", uds.display());
     }
+
+    // Boot-timer: plain BusDevice at a fixed MMIO address (no FDT node, no SPI).
+    // The guest writes magic byte 123 to signal userspace-reached; we log elapsed ms.
+    mgr.add_fixed(
+        layout::BOOT_TIMER_ADDR,
+        0x1000,
+        Arc::new(Mutex::new(BootTimer::new(boot_start))),
+    )
+    .expect("add boot_timer");
 
     // Build and place the device tree.
     let cfg = FdtConfig {

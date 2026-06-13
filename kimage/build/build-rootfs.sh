@@ -41,6 +41,10 @@ docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
   # local service (runs at boot, after device nodes exist).
   printf "#!/bin/sh\nifup -a\n" > /etc/local.d/network.start
   chmod +x /etc/local.d/network.start
+  # boot-timer: signal boot-complete to the VMM by writing the magic byte 123 to
+  # the boot-timer MMIO address (out-of-band fixed address; see layout::BOOT_TIMER_ADDR).
+  printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
+  chmod +x /etc/local.d/boottime.start
   rc-update add local boot
 '
 

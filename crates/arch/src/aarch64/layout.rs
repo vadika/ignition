@@ -7,6 +7,11 @@ pub const RAM_BASE: u64 = 0x4000_0000;
 /// Device MMIO region; serial + virtio windows are bump-allocated here.
 pub const MMIO_BASE: u64 = 0x0900_0000;
 pub const MMIO_LEN: u64 = 0x0020_0000; // 2 MiB of device space
+/// Fixed MMIO address of the boot-timer pseudo device. Placed at the TOP of the
+/// device MMIO region so it never collides with the DeviceManager's bump allocator
+/// (which grows up from MMIO_BASE). The guest writes the magic byte here via devmem;
+/// there is no FDT node (the address is an out-of-band contract, like Firecracker).
+pub const BOOT_TIMER_ADDR: u64 = MMIO_BASE + MMIO_LEN - 0x1000; // 0x091F_F000
 /// Per-device window size; 16550 and virtio-mmio both fit in 0x1000.
 pub const MMIO_WINDOW: u64 = 0x1000;
 /// SPI allocation range (FDT interrupt index; GIC INTID = index + 32).
