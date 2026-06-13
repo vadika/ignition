@@ -29,6 +29,8 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`).
   - **virtio-vsock** — guest→host streams over a host Unix socket (`--vsock-uds`); host→guest is a TODO (E2).
   - **PL031 RTC** — wall clock; the kernel sets system time from it.
+  - **boot-timer** — pseudo device; the guest pokes a magic byte at boot's end and
+    the VMM logs `Guest-boot-time = N ms` (~200 ms here).
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
 - **Snapshot / restore** — single-vCPU, clone-capable (`--snap-dir` + `Ctrl-A s`,
   `--restore`); restored guest idles at ~0% CPU and stays responsive.
