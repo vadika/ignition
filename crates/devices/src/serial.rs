@@ -174,6 +174,7 @@ impl<W: Write + Send + Default> MmioDevice for Serial<W> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use crate::virtio::NoopIrq;
 
     /// `Write` sink capturing into a shared buffer for assertions.
     #[derive(Clone)]
@@ -226,11 +227,6 @@ mod tests {
         assert!(buf.lock().unwrap().is_empty(), "enqueue must not write to the TX sink");
     }
 
-    struct NoIrq;
-    impl crate::virtio::IrqLine for NoIrq {
-        fn set_spi(&self, _: bool) {}
-    }
-
     #[derive(Clone, Default)]
     struct SinkWriter;
     impl Write for SinkWriter {
@@ -244,15 +240,13 @@ mod tests {
         let mut s = Serial::new(SharedSink(buf.clone()));
         s.write(0, 1, &[0x0f]); // IER = 0x0f (offset 1)
         let st = s.save_state();
-        let s2 = Serial::from_snapshot(SharedSink(buf), Arc::new(NoIrq), &st);
+        let s2 = Serial::from_snapshot(SharedSink(buf), Arc::new(NoopIrq), &st);
         assert_eq!(s2.save_state(), st);
     }
 
     #[test]
     fn serial_mmio_device_roundtrips() {
         use crate::device::{FdtKind, MmioDevice};
-        use crate::virtio::NoopIrq;
-        use std::sync::Arc;
         let irq = Arc::new(NoopIrq);
         let mut s = Serial::with_irq(SinkWriter, irq);
         s.write(0, 1, &[0xab]); // IER register — dirty some state
