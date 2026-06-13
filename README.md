@@ -132,6 +132,25 @@ target/debug/boot --store vmstore --restore mysnap   # run in separate terminals
 A restored guest can re-snapshot: its `Ctrl-A s` writes a **new** named base.
 Reusing the source name is refused unless you pass `--force`.
 
+### Diff snapshots
+
+`--track-dirty` arms write-protect dirty tracking: guest RAM is mapped read-only and
+the first write to each 16 KiB page traps, faults the page back to writable, and marks
+it dirty. A restored guest armed this way writes a **Diff** layer on `Ctrl-A s` — only
+the changed pages, with `parent` set to the leaf it restored from — forming an
+immutable delta chain. Restore reassembles the chain transparently: `clonefile` the
+root base, then overlay each diff's pages in order. vmstate/GIC/devices are always
+written full per layer (only RAM is deltified); the first write per page carries a
+small vmexit cost. Snapshotting under the same name as the parent — or the base it was
+restored from — is refused without `--force`.
+
+```sh
+# boot armed for diff tracking, snapshot a root, then restore + diff-snapshot
+target/debug/boot --store vmstore --name base --track-dirty kimage/out/Image kimage/out/rootfs.ext4
+target/debug/boot --store vmstore --restore base --track-dirty --name base-diff
+python3 scripts/diff_snapshot_test.py  # full cycle: diff ~3% of RAM, mutation survives, bases immutable
+```
+
 Headless drivers that run the whole cycle:
 
 ```sh

@@ -21,7 +21,7 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 /// The sysregs captured for snapshot/restore (EL1 guest-resume set + the EL2 regs
@@ -203,6 +203,7 @@ pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
     MemoryMap,
+    MemoryProtect,
     MemoryUnmap,
     NestedCheck,
     VcpuCreate,
@@ -230,6 +231,7 @@ impl Display for Error {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
+            MemoryProtect => write!(f, "Error re-protecting memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
@@ -285,6 +287,30 @@ impl Vcpus for NoIrqVcpus {
     fn get_pending_irq(&self, _vcpuid: u64) -> u32 { 0 }
     fn handle_sysreg_read(&self, _vcpuid: u64, _reg: u32) -> Option<u64> { Some(0) }
     fn handle_sysreg_write(&self, _vcpuid: u64, _reg: u32, _val: u64) -> bool { true }
+}
+
+/// Re-protect an already-mapped guest range, process-globally. HVF's VM is a
+/// per-process singleton (`hv_vm_create` takes no handle), so `hv_vm_protect`
+/// needs no `Vm` reference — the dirty-fault run loop, which has no `Vm` handle,
+/// calls this to re-grant WRITE on a faulting page. `flags` is a bitwise-or of
+/// `HV_MEMORY_READ`/`HV_MEMORY_WRITE`/`HV_MEMORY_EXEC`; `guest_addr` must be
+/// page-aligned and `size` a page multiple.
+/// Serializes `hv_vm_protect`. The HVF VM is a per-process singleton and
+/// `hv_vm_protect` mutates its stage-2 page tables VM-wide; Apple does not
+/// document it as safe for concurrent calls. With multiple vCPU threads under
+/// `--track-dirty`, each first-write-per-page fault re-grants WRITE on its own
+/// page concurrently, so we hold this lock across the call. It is taken only on
+/// first-write faults (~5µs each), so contention is negligible.
+static PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn vm_protect_memory(guest_addr: u64, size: u64, flags: u64) -> Result<(), Error> {
+    let _guard = PROTECT_LOCK.lock().unwrap();
+    let ret = unsafe { hv_vm_protect(guest_addr, size.try_into().unwrap(), flags as hv_memory_flags_t) };
+    if ret != HV_SUCCESS {
+        Err(Error::MemoryProtect)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
@@ -422,6 +448,7 @@ pub enum VcpuExit<'a> {
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
+    DirtyFault(u64),
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
@@ -449,6 +476,9 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    dirty_tracking: bool,
+    ram_base: u64,
+    ram_size: u64,
 }
 
 /// Write the low `len` little-endian bytes of `val` into `buf` (the MMIO data
@@ -516,7 +546,18 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            dirty_tracking: false,
+            ram_base: 0,
+            ram_size: 0,
         })
+    }
+
+    /// Enable dirty-page tracking and set the guest-RAM window used to
+    /// disambiguate write-protect dirty faults from MMIO data aborts.
+    pub fn set_dirty_window(&mut self, base: u64, size: u64) {
+        self.ram_base = base;
+        self.ram_size = size;
+        self.dirty_tracking = true;
     }
 
     /// Full initial register/system-register setup shared by the primary
@@ -900,6 +941,21 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
+
+                // Write-protect dirty fault: a guest store into the tracked RAM
+                // window. HVF reports this as a *translation* fault (DFSC 0x07/0x0f),
+                // NOT a permission fault, so the only reliable discriminator is a
+                // write data abort whose physical address falls inside the RAM
+                // region. Re-grant of write permission happens in the caller; we
+                // must NOT advance PC here so the trapping store re-executes.
+                if self.dirty_tracking
+                    && iswrite
+                    && pa >= self.ram_base
+                    && pa < self.ram_base + self.ram_size
+                {
+                    return Ok(VcpuExit::DirtyFault(pa));
+                }
+
                 self.pending_advance_pc = true;
 
                 if iswrite {

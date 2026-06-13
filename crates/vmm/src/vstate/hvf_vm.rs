@@ -24,4 +24,12 @@ impl Vm {
     pub fn map_memory(&mut self, host_addr: u64, guest_addr: u64, size: u64) -> Result<(), ignition_hvf::Error> {
         self.hvf.map_memory(host_addr, guest_addr, size)
     }
+
+    /// Re-protect an already-mapped guest range. `flags` is a bitwise-or of
+    /// `ignition_hvf::bindings::HV_MEMORY_{READ,WRITE,EXEC}` (as u64). Dropping
+    /// WRITE arms write-protect dirty tracking; re-adding WRITE re-grants a
+    /// faulting page. Delegates to the process-global `hv_vm_protect`.
+    pub fn protect_memory(&self, guest_addr: u64, size: u64, flags: u64) -> Result<(), ignition_hvf::Error> {
+        ignition_hvf::vm_protect_memory(guest_addr, size, flags)
+    }
 }

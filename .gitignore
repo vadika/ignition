@@ -11,9 +11,11 @@ target/
 /snapshot2/
 /snapshot_smp/
 /vmnetsnap/
-# snapshot stores (--store dir, default ./vmstore; restore_test uses ./vmstore-test)
+# snapshot stores (--store dir, default ./vmstore; restore_test uses ./vmstore-test,
+# diff_snapshot_test uses ./vmstore-difftest)
 /vmstore/
 /vmstore-test/
+/vmstore-difftest/
 # snapshot artifacts (any --store/--snap-dir name) — never source files
 memory.bin
 gic.bin
