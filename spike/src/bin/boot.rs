@@ -287,6 +287,7 @@ struct DeviceContext {
     balloon: Option<Arc<Mutex<VirtioMmio>>>,
     vsock_mmio: Option<Arc<Mutex<VirtioMmio>>>,
     net_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+    rx_stop: Option<std::sync::Arc<AtomicBool>>, // set when a net feeder is running
 }
 
 impl DeviceContext {
@@ -319,7 +320,6 @@ where
 }
 
 /// The vmnet RX feeder injects a frame only when not quiesced for a snapshot.
-#[expect(dead_code, reason = "wired up in a later task")]
 fn rx_should_inject(stop_rx: &std::sync::Arc<AtomicBool>) -> bool {
     !stop_rx.load(Ordering::Acquire)
 }
@@ -369,18 +369,35 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
             move |irq| VirtioMmio::new("virtio-blk", Box::new(blk), mem, irq))?;
     }
 
-    // virtio-net — boot-only (snapshots are blocked under --net, so no restore arm).
-    if ctx.net {
+    // virtio-net — boot iff --net; restore iff a record exists. A fresh vmnet
+    // interface each time (new MAC), so clones get distinct MAC + DHCP lease.
+    let want_net = match &mode {
+        Mode::Boot => ctx.net,
+        Mode::Restore(recs) => recs.iter().any(|r| r.id == "virtio-net"),
+    };
+    if want_net {
         let (backend, rx) = ignition_vmnet::VmnetBackend::start()
-            .expect("vmnet start failed (run boot under sudo for --net)");
+            .map_err(|e| io::Error::other(format!("vmnet start failed (need sudo for --net): {e}")))?;
         let mem = ctx.guest_ram();
         let net_dev = VirtioNet::new(backend);
         if let Some(h) = place(mgr, &mode, "virtio-net", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new("virtio-net", Box::new(net_dev), mem, irq))? {
+            let stop_rx = std::sync::Arc::new(AtomicBool::new(false));
             let h2 = h.clone();
+            let stop2 = stop_rx.clone();
             std::thread::spawn(move || {
-                for frame in rx { h2.lock().unwrap().inject_rx(&frame); }
+                for frame in rx {
+                    // Hold the device lock across the stop-check + inject so the
+                    // snapshot handler's drain-lock is a true barrier: once it sets
+                    // stop=true and acquires this lock once, no inject can be
+                    // in-flight or begin afterward.
+                    let mut dev = h2.lock().unwrap();
+                    if rx_should_inject(&stop2) {
+                        dev.inject_rx(&frame);
+                    }
+                }
             });
+            ctx.rx_stop = Some(stop_rx);
             ctx.net_mmio = Some(h);
         }
     }
@@ -516,6 +533,7 @@ fn main() {
         vsock_uds: vsock_uds.clone(),
         net,
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
+        rx_stop: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
     let serial = ctx.serial.clone().expect("serial device");
@@ -575,11 +593,13 @@ fn main() {
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
 
-    // Build the VcpuManager and (for single-vCPU + no-net) install the
-    // snapshot handler before run.
+    // Build the VcpuManager and (for single-vCPU) install the snapshot handler before run.
     let mut manager = VcpuManager::new(smp, bus);
 
-    if smp == 1 && !net {
+    let rx_stop_snap = ctx.rx_stop.clone();
+    let net_mmio_snap = ctx.net_mmio.clone();
+
+    if smp == 1 {
         // Build a closure capturing all state needed to write the snapshot.
         // Clone Arcs and scalars; raw pointer is captured as usize for Send+Sync.
         let gic_snap = gic.clone();
@@ -588,10 +608,11 @@ fn main() {
         let snap_dir_snap = snap_dir.clone();
         // The guest RAM base pointer captured as usize: raw *const u8 is neither
         // Send nor Sync, but usize is. Sound because the closure only reads the
-        // slice at a Canceled exit, when the (single, non-net) vCPU is paused
-        // and is the sole RAM writer. Rust 2021 partial-capture would see through
-        // a newtype wrapper and capture the *const u8 field directly, defeating
-        // the unsafe impl — so usize is the correct approach here.
+        // slice at a Canceled exit, when the single vCPU is paused. The vmnet RX
+        // feeder is quiesced below before RAM is read, so it cannot write guest
+        // RAM mid-snapshot. Rust 2021 partial-capture would see through a newtype
+        // wrapper and capture the *const u8 field directly, defeating the unsafe
+        // impl — so usize is the correct approach here.
         let host_usize = host as usize;
 
         manager.set_snapshot_handler(Box::new(move |vcpu: &HvfVcpu| {
@@ -608,6 +629,14 @@ fn main() {
             let devices = snap_devices.save();
             let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: 1 };
             let snap = VmSnapshot::new(config, vcpu_state, devices);
+
+            // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
+            if let Some(stop) = &rx_stop_snap {
+                stop.store(true, Ordering::Release);
+                if let Some(net) = &net_mmio_snap {
+                    drop(net.lock().unwrap()); // drain any in-flight inject
+                }
+            }
 
             // The RAM slice — host_usize round-trip avoids capturing *const u8.
             let ram_slice: &[u8] = unsafe {
@@ -628,11 +657,13 @@ fn main() {
                 Ok(()) => eprintln!("[snapshot] written to {}", snap_dir_snap.display()),
                 Err(e) => eprintln!("[snapshot] write failed: {e}"),
             }
+
+            if let Some(stop) = &rx_stop_snap {
+                stop.store(false, Ordering::Release);
+            }
         }));
-    } else if !net {
-        eprintln!("[snapshot] handler not installed: smp={smp} (snapshot is single-vCPU only)");
     } else {
-        eprintln!("[snapshot] handler not installed: --net active (snapshot requires no net)");
+        eprintln!("[snapshot] handler not installed: smp={smp} (snapshot is single-vCPU only)");
     }
 
     // Raw terminal + host stdin reader for the interactive console. The guard
@@ -731,8 +762,9 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
         ram_size: RAM_SIZE,
         disk,
         vsock_uds: vsock_uds.clone(),
-        net: false, // snapshots never contain net
+        net: false, // snapshots never contain net; setup_devices will re-wire if record exists
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
+        rx_stop: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
 
