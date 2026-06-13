@@ -17,26 +17,34 @@ pub struct VmConfig {
     pub vcpu_count: u64,
 }
 
+/// One vCPU's saved state plus the MPIDR identifying which core it is. A
+/// multi-vCPU snapshot carries one of these per online core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcpuCheckpoint {
+    pub mpidr: u64,
+    pub state: VcpuState,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub magic: String,
     pub version: u32,
     pub config: VmConfig,
-    pub vcpu: VcpuState,
+    pub vcpus: Vec<VcpuCheckpoint>,
     pub devices: Vec<crate::device_manager::DeviceRecord>,
 }
 
 impl VmSnapshot {
     pub fn new(
         config: VmConfig,
-        vcpu: VcpuState,
+        vcpus: Vec<VcpuCheckpoint>,
         devices: Vec<crate::device_manager::DeviceRecord>,
     ) -> Self {
         Self {
             magic: SNAP_MAGIC.to_string(),
             version: SNAP_VERSION,
             config,
-            vcpu,
+            vcpus,
             devices,
         }
     }
@@ -130,7 +138,7 @@ mod tests {
         use devices::device::FdtKind;
         let snap = VmSnapshot::new(
             VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
-            sample_vcpu(),
+            vec![VcpuCheckpoint { mpidr: 0, state: sample_vcpu() }],
             vec![DeviceRecord {
                 id: "serial".into(),
                 base: 0x900_0000,
@@ -153,7 +161,7 @@ mod tests {
         let bad = serde_json::json!({
             "magic": SNAP_MAGIC, "version": 0,
             "config": {"mem_size": 1, "vcpu_count": 1},
-            "vcpu": serde_json::to_value(sample_vcpu()).unwrap(), "devices": []
+            "vcpus": [{"mpidr": 0, "state": serde_json::to_value(sample_vcpu()).unwrap()}], "devices": []
         });
         let parsed: VmSnapshot = serde_json::from_value(bad).unwrap();
         assert!(check_version(&parsed).is_err());
@@ -166,7 +174,7 @@ mod tests {
         std::fs::write(&disk, b"DISK").unwrap();
         let snap = VmSnapshot::new(
             VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
-            sample_vcpu(),
+            vec![VcpuCheckpoint { mpidr: 0, state: sample_vcpu() }],
             vec![],
         );
         write_snapshot(dir.path(), &snap, &[0u8; 16], &[1u8, 2, 3], &disk).unwrap();
@@ -185,7 +193,7 @@ mod tests {
         std::fs::write(&disk, b"D").unwrap();
         let snap = VmSnapshot::new(
             VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
-            sample_vcpu(),
+            vec![VcpuCheckpoint { mpidr: 0, state: sample_vcpu() }],
             vec![],
         );
         write_snapshot(dir.path(), &snap, &[0u8; 8], &[0u8], &disk).unwrap();
@@ -197,5 +205,25 @@ mod tests {
         std::fs::write(&p.state, serde_json::to_vec(&bad).unwrap()).unwrap();
         let err = read_snapshot(dir.path()).unwrap_err();
         assert!(err.to_string().contains("magic"), "error should mention magic: {err}");
+    }
+
+    #[test]
+    fn snapshot_roundtrips_multiple_vcpus() {
+        let snap = VmSnapshot::new(
+            VmConfig { mem_size: 0x2000_0000, vcpu_count: 4 },
+            vec![
+                VcpuCheckpoint { mpidr: 0, state: sample_vcpu() },
+                VcpuCheckpoint { mpidr: 1, state: sample_vcpu() },
+                VcpuCheckpoint { mpidr: 2, state: sample_vcpu() },
+                VcpuCheckpoint { mpidr: 3, state: sample_vcpu() },
+            ],
+            vec![],
+        );
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: VmSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.config.vcpu_count, 4);
+        assert_eq!(back.vcpus.len(), 4);
+        let mpidrs: Vec<u64> = back.vcpus.iter().map(|c| c.mpidr).collect();
+        assert_eq!(mpidrs, vec![0, 1, 2, 3]);
     }
 }
