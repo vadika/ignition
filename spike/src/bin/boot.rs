@@ -27,7 +27,7 @@ use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
 use devices::virtio::vsock::VsockDevice;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
 use vmm::device_manager::{DeviceManager, DeviceRecord};
@@ -316,6 +316,12 @@ where
             None => Ok(None),
         },
     }
+}
+
+/// The vmnet RX feeder injects a frame only when not quiesced for a snapshot.
+#[expect(dead_code, reason = "wired up in a later task")]
+fn rx_should_inject(stop_rx: &std::sync::Arc<AtomicBool>) -> bool {
+    !stop_rx.load(Ordering::Acquire)
 }
 
 /// The single device-wiring site. Lists every snapshot-able device once; both
@@ -819,5 +825,15 @@ mod tests {
         assert!(super::check_known_ids(&ok).is_ok());
         let bad = vec![rec("serial"), rec("mystery-device")];
         assert!(super::check_known_ids(&bad).is_err());
+    }
+
+    #[test]
+    fn rx_gate_skips_when_stopped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(super::rx_should_inject(&stop));
+        stop.store(true, Ordering::Release);
+        assert!(!super::rx_should_inject(&stop));
     }
 }
