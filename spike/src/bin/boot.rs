@@ -29,9 +29,8 @@ use devices::virtio::rng::VirtioRng;
 use devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use hvf::gic::HvfGicV3;
-use hvf::HvfVcpu;
 use vmm::device_manager::{DeviceManager, DeviceRecord};
-use vmm::snapshot::{self, VmConfig, VmSnapshot};
+use vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
 use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
 
@@ -599,36 +598,31 @@ fn main() {
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
 
-    if smp == 1 {
-        // Build a closure capturing all state needed to write the snapshot.
-        // Clone Arcs and scalars; raw pointer is captured as usize for Send+Sync.
+    // Install the snapshot handler for any vCPU count. The manager rendezvouses
+    // every vCPU and hands us their checkpoints; we capture the global state
+    // (GIC + RAM + device records) and write the snapshot.
+    {
         let gic_snap = gic.clone();
         let snap_devices = frozen.clone();
         let disk_path_snap = disk_path.clone();
         let snap_dir_snap = snap_dir.clone();
         // The guest RAM base pointer captured as usize: raw *const u8 is neither
         // Send nor Sync, but usize is. Sound because the closure only reads the
-        // slice at a Canceled exit, when the single vCPU is paused. The vmnet RX
-        // feeder is quiesced below before RAM is read, so it cannot write guest
-        // RAM mid-snapshot. Rust 2021 partial-capture would see through a newtype
-        // wrapper and capture the *const u8 field directly, defeating the unsafe
-        // impl — so usize is the correct approach here.
+        // slice at the rendezvous, when every vCPU is parked at the barrier. The
+        // vmnet RX feeder is quiesced below before RAM is read. usize avoids the
+        // 2021+ partial-capture seeing through a newtype to the *const u8 field.
         let host_usize = host as usize;
 
-        manager.set_snapshot_handler(Box::new(move |vcpu: &HvfVcpu| {
-            // All of this runs on the vCPU thread.
-            let vcpu_state = match vcpu.save_state() {
-                Ok(s) => s,
-                Err(e) => { eprintln!("[snapshot] save_state failed: {e}"); return; }
-            };
+        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
+            // Runs on the leader vCPU thread with all vCPUs parked.
             let gic_blob = match gic_snap.save_state() {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
             };
 
             let devices = snap_devices.save();
-            let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: 1 };
-            let snap = VmSnapshot::new(config, vcpu_state, devices);
+            let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: checkpoints.len() as u64 };
+            let snap = VmSnapshot::new(config, checkpoints, devices);
 
             // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
             if let Some(stop) = &rx_stop_snap {
@@ -646,7 +640,6 @@ fn main() {
             let disk_src = match &disk_path_snap {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    // Write an empty placeholder so the snapshot dir is complete.
                     let placeholder = snap_dir_snap.join("disk.img");
                     let _ = std::fs::write(&placeholder, b"");
                     placeholder
@@ -662,8 +655,6 @@ fn main() {
                 stop.store(false, Ordering::Release);
             }
         }));
-    } else {
-        eprintln!("[snapshot] handler not installed: smp={smp} (snapshot is single-vCPU only)");
     }
 
     // Raw terminal + host stdin reader for the interactive console. The guard
@@ -691,10 +682,6 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     let restore_start = std::time::Instant::now();
     // 1. Read the snapshot metadata.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
-    assert_eq!(
-        snap.config.vcpu_count, 1,
-        "restore only supports single-vCPU snapshots"
-    );
     assert_eq!(
         snap.config.mem_size, RAM_SIZE,
         "snapshot mem_size does not match this binary's RAM_SIZE"
@@ -782,7 +769,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
-    let manager = VcpuManager::new(1, bus);
+    let manager = VcpuManager::new(snap.config.vcpu_count, bus);
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
@@ -802,7 +789,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     io::stderr().flush().ok();
 
     // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
-    match manager.run_restored(snap.vcpu, Some(gic_blob)) {
+    match manager.run_restored(snap.vcpus, Some(gic_blob)) {
         Ok(()) => {}
         Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
     }
