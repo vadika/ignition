@@ -107,6 +107,25 @@ impl DeviceManager {
         Ok(typed)
     }
 
+    /// Restore one device at its SAVED base/SPI (exact replay, not freshly
+    /// allocated). `build` constructs the device fresh; `rec.state` is then applied
+    /// via `MmioDevice::restore`. Returns the typed handle.
+    pub fn add_restored<D, F>(&mut self, rec: &DeviceRecord, build: F) -> Result<Arc<Mutex<D>>, DeviceMgrError>
+    where
+        D: MmioDevice + 'static,
+        F: FnOnce(Arc<dyn IrqLine>) -> D,
+    {
+        let mut dev = build(self.irq_for(rec.spi));
+        dev.restore(&rec.state)?;
+        let typed = Arc::new(Mutex::new(dev));
+        let dyn_dev: Arc<Mutex<dyn MmioDevice>> = typed.clone();
+        // keep the bump allocators ahead of restored resources so a later add() won't collide
+        self.mmio_next = self.mmio_next.max(rec.base + rec.size);
+        self.spi_next = self.spi_next.max(rec.spi + 1);
+        self.place(rec.base, rec.size, rec.spi, dyn_dev)?;
+        Ok(typed)
+    }
+
     /// FDT device descriptors for `fdt::generate` (call before `freeze`).
     pub fn fdt_devices(&self) -> Vec<FdtDevice> {
         self.records
@@ -175,6 +194,16 @@ mod tests {
         assert_eq!(alloc(0x200), Ok((0x1200, 6)));
         assert_eq!(alloc(0x200), Ok((0x1400, 7)));
         assert_eq!(alloc(0x200), Err("window"));
+    }
+
+    #[test]
+    fn restored_record_state_serde_roundtrips() {
+        let r = DeviceRecord {
+            id: "serial".into(), base: 0x900_0000, size: 0x1000, spi: 0,
+            fdt_kind: FdtKind::Ns16550a, state: serde_json::json!({"scratch": 9}),
+        };
+        let back: DeviceRecord = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back.state, serde_json::json!({"scratch": 9}));
     }
 
     #[test]
