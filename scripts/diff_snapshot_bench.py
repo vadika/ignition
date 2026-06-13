@@ -109,6 +109,7 @@ def run_cmd(fd, cmd, wait=1.2, drain_s=3):
 # env_logger colorizes; match the number after "Guest-boot-time = ".
 RE_BOOT    = re.compile(rb"Guest-boot-time = (\d+) ms")
 RE_RESTORE = re.compile(rb"Restore-time = (\d+) ms")
+RE_SNAPW   = re.compile(rb"Snapshot-write-time = (\d+) ms")
 RE_SNAPDONE = re.compile(rb"\[snapshot\] (full|diff) '([^']+)'")
 RE_DD_MBS  = re.compile(rb"([\d.]+)\s*(MB|MiB|GB|kB)/s")
 
@@ -118,6 +119,10 @@ def parse_boot_ms(buf):
 
 def parse_restore_ms(buf):
     m = RE_RESTORE.search(buf)
+    return int(m.group(1)) if m else None
+
+def parse_snapw_ms(buf):
+    m = RE_SNAPW.search(buf)
     return int(m.group(1)) if m else None
 
 def parse_dd_mbs(buf):
@@ -209,18 +214,23 @@ def boot_snapshot(name, track, mem, dirty_mb=0, login_first=True):
     sink = []
     t0 = time.monotonic()
     os.write(fd, b"\x01s")
-    write_ms = None
+    wall_ms = None
     end = time.monotonic() + 30
     while time.monotonic() < end:
-        drain(fd, 0.3, sink=sink)
+        drain(fd, 0.05, sink=sink)
         joined = b"".join(sink)
         m = RE_SNAPDONE.search(joined)
         if m:
-            write_ms = (time.monotonic() - t0) * 1000.0
+            wall_ms = (time.monotonic() - t0) * 1000.0
             snap_type = m.group(1).decode()
             break
     else:
         snap_type = None
+    drain(fd, 0.3, sink=sink)  # let the Snapshot-write-time line land
+    # internal VMM timer is the precise number; wall is console-quantized fallback.
+    write_ms = parse_snapw_ms(b"".join(sink))
+    if write_ms is None:
+        write_ms = wall_ms
     time.sleep(0.4)
     kill(pid, fd)
     return write_ms, snap_type
@@ -241,15 +251,19 @@ def diff_layer_from(parent, new_name, mem, dirty_mb):
     sink = []
     t0 = time.monotonic()
     os.write(fd, b"\x01s")
-    write_ms = None; snap_type = None
+    wall_ms = None; snap_type = None
     end = time.monotonic() + 30
     while time.monotonic() < end:
-        drain(fd, 0.3, sink=sink)
+        drain(fd, 0.05, sink=sink)
         m = RE_SNAPDONE.search(b"".join(sink))
         if m:
-            write_ms = (time.monotonic() - t0) * 1000.0
+            wall_ms = (time.monotonic() - t0) * 1000.0
             snap_type = m.group(1).decode()
             break
+    drain(fd, 0.3, sink=sink)  # let the Snapshot-write-time line land
+    write_ms = parse_snapw_ms(b"".join(sink))
+    if write_ms is None:
+        write_ms = wall_ms
     time.sleep(0.4)
     kill(pid, fd)
     idx = os.path.join(SNAPS, new_name, "dirty.idx")
@@ -299,6 +313,8 @@ def main():
     ap.add_argument("--restore-samples", type=int, default=3)
     ap.add_argument("--out", default=os.path.join(ROOT, "docs/diff-snapshot-benchmarks.md"))
     ap.add_argument("--json", default=None, help="dump raw results json")
+    ap.add_argument("--write-only", action="store_true",
+                    help="only the snapshot WRITE phase (skip boot/dd/restore)")
     args = ap.parse_args()
     MEM = args.mem
     BOOT = os.path.join(ROOT, "target/release/boot" if args.release else "target/debug/boot")
@@ -308,23 +324,24 @@ def main():
     R = {"build": build, "mem": MEM}
     os.system(f"rm -rf {STORE}")
 
-    # --- 1a. boot time tracked vs untracked ---
-    print("\n--- 1a. boot time: untracked ---", flush=True)
-    dev_u, wall_u = measure_boot(False, args.boot_samples, MEM)
-    print("--- 1a. boot time: --track-dirty ---", flush=True)
-    dev_t, wall_t = measure_boot(True, args.boot_samples, MEM)
-    R["boot_dev_untracked"] = med_spread(dev_u)
-    R["boot_dev_tracked"]   = med_spread(dev_t)
-    R["boot_wall_untracked"] = med_spread(wall_u)
-    R["boot_wall_tracked"]   = med_spread(wall_t)
+    if not args.write_only:
+        # --- 1a. boot time tracked vs untracked ---
+        print("\n--- 1a. boot time: untracked ---", flush=True)
+        dev_u, wall_u = measure_boot(False, args.boot_samples, MEM)
+        print("--- 1a. boot time: --track-dirty ---", flush=True)
+        dev_t, wall_t = measure_boot(True, args.boot_samples, MEM)
+        R["boot_dev_untracked"] = med_spread(dev_u)
+        R["boot_dev_tracked"]   = med_spread(dev_t)
+        R["boot_wall_untracked"] = med_spread(wall_u)
+        R["boot_wall_tracked"]   = med_spread(wall_t)
 
-    # --- 1b. dd throughput tracked vs untracked ---
-    print("\n--- 1b. dd 64MiB throughput: untracked ---", flush=True)
-    dd_u = measure_dd(False, args.dd_samples, MEM)
-    print("--- 1b. dd 64MiB throughput: --track-dirty ---", flush=True)
-    dd_t = measure_dd(True, args.dd_samples, MEM)
-    R["dd_untracked"] = med_spread(dd_u)
-    R["dd_tracked"]   = med_spread(dd_t)
+        # --- 1b. dd throughput tracked vs untracked ---
+        print("\n--- 1b. dd 64MiB throughput: untracked ---", flush=True)
+        dd_u = measure_dd(False, args.dd_samples, MEM)
+        print("--- 1b. dd 64MiB throughput: --track-dirty ---", flush=True)
+        dd_t = measure_dd(True, args.dd_samples, MEM)
+        R["dd_untracked"] = med_spread(dd_u)
+        R["dd_tracked"]   = med_spread(dd_t)
 
     # --- 2. snapshot write time: Full vs Diff (8MiB, 64MiB) ---
     # Full root write time: fresh boot --track-dirty, no dirtying, Ctrl-A s.
@@ -363,44 +380,45 @@ def main():
     R["full_mem_logical"] = os.path.getsize(golden_mem)
     R["full_mem_phys"]    = phys_bytes(golden_mem)
 
-    # --- 3. restore latency by chain depth ---
-    # (a) Full-only: restore golden (1 layer).
-    print("\n--- 3a. restore Full-only (golden, 1 layer) ---", flush=True)
-    w0, i0 = measure_restore("golden", args.restore_samples)
-    R["restore_full"] = (med_spread(w0), med_spread(i0))
+    if not args.write_only:
+        # --- 3. restore latency by chain depth ---
+        # (a) Full-only: restore golden (1 layer).
+        print("\n--- 3a. restore Full-only (golden, 1 layer) ---", flush=True)
+        w0, i0 = measure_restore("golden", args.restore_samples)
+        R["restore_full"] = (med_spread(w0), med_spread(i0))
 
-    # (b) golden + 1 diff. Build d1 off golden (8 MiB dirtied), keep it.
-    print("\n--- build chain: golden -> d1 -> d2 -> d3 (8 MiB each, kept) ---", flush=True)
-    chain = ["golden"]
-    diff_footprint = []
-    for depth, parent in [(1, "golden"), (2, "d1"), (3, "d2")]:
-        nm = f"d{depth}"
-        ms, npg, st = diff_layer_from(parent, nm, MEM, 8)
-        memp = os.path.join(SNAPS, nm, "memory.bin")
-        log = os.path.getsize(memp); phys = phys_bytes(memp)
-        diff_footprint.append((nm, npg, log, phys))
-        print(f"   [chain {nm}] write={ms}ms pages={npg} mem_logical={log/1e6:.2f}MB phys={phys/1e6:.2f}MB type={st}", flush=True)
-        chain.append(nm)
-    R["diff_footprint"] = diff_footprint
+        # (b) golden + 1 diff. Build d1 off golden (8 MiB dirtied), keep it.
+        print("\n--- build chain: golden -> d1 -> d2 -> d3 (8 MiB each, kept) ---", flush=True)
+        chain = ["golden"]
+        diff_footprint = []
+        for depth, parent in [(1, "golden"), (2, "d1"), (3, "d2")]:
+            nm = f"d{depth}"
+            ms, npg, st = diff_layer_from(parent, nm, MEM, 8)
+            memp = os.path.join(SNAPS, nm, "memory.bin")
+            log = os.path.getsize(memp); phys = phys_bytes(memp)
+            diff_footprint.append((nm, npg, log, phys))
+            print(f"   [chain {nm}] write={ms}ms pages={npg} mem_logical={log/1e6:.2f}MB phys={phys/1e6:.2f}MB type={st}", flush=True)
+            chain.append(nm)
+        R["diff_footprint"] = diff_footprint
 
-    print("\n--- 3b. restore golden+1 diff (d1) ---", flush=True)
-    w1, i1 = measure_restore("d1", args.restore_samples)
-    R["restore_diff1"] = (med_spread(w1), med_spread(i1))
+        print("\n--- 3b. restore golden+1 diff (d1) ---", flush=True)
+        w1, i1 = measure_restore("d1", args.restore_samples)
+        R["restore_diff1"] = (med_spread(w1), med_spread(i1))
 
-    print("\n--- 3c. restore golden+3 diffs (d3) ---", flush=True)
-    w3, i3 = measure_restore("d3", args.restore_samples)
-    R["restore_diff3"] = (med_spread(w3), med_spread(i3))
+        print("\n--- 3c. restore golden+3 diffs (d3) ---", flush=True)
+        w3, i3 = measure_restore("d3", args.restore_samples)
+        R["restore_diff3"] = (med_spread(w3), med_spread(i3))
 
-    # total store size for the chain (golden + d1..d3) — du-style
-    def dir_size(p):
-        tot = 0
-        for dp, _, fs in os.walk(p):
-            for f in fs:
-                fp = os.path.join(dp, f)
-                try: tot += os.stat(fp).st_blocks * 512
-                except OSError: pass
-        return tot
-    R["chain_store_phys"] = dir_size(SNAPS)
+        # total store size for the chain (golden + d1..d3) — du-style
+        def dir_size(p):
+            tot = 0
+            for dp, _, fs in os.walk(p):
+                for f in fs:
+                    fp = os.path.join(dp, f)
+                    try: tot += os.stat(fp).st_blocks * 512
+                    except OSError: pass
+            return tot
+        R["chain_store_phys"] = dir_size(SNAPS)
 
     if args.json:
         with open(args.json, "w") as f:

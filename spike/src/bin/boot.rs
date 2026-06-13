@@ -440,9 +440,11 @@ fn write_named_snapshot(
     let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
     let vcpu_count = config.vcpu_count;
     let snap = VmSnapshot::new(config, checkpoints, devices);
+    let t0 = std::time::Instant::now();
     snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
     let manifest = SnapshotManifest::new_full(write_name.to_string(), mem_size, vcpu_count);
     snapshot::write_manifest(&base, &manifest)?;
+    eprintln!("Snapshot-write-time = {} ms", t0.elapsed().as_millis());
     eprintln!("[snapshot] full '{write_name}' written to {}", base.display());
     Ok(())
 }
@@ -469,10 +471,12 @@ fn write_named_diff(
     let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
     let vcpu_count = config.vcpu_count;
     let snap = VmSnapshot::new(config, checkpoints, devices);
+    let t0 = std::time::Instant::now();
     snapshot::write_diff_snapshot(&base, &snap, dirty, ram, gic_blob, disk_src)?;
     let manifest =
         SnapshotManifest::new_diff(write_name.to_string(), parent.to_string(), mem_size, vcpu_count);
     snapshot::write_manifest(&base, &manifest)?;
+    eprintln!("Snapshot-write-time = {} ms", t0.elapsed().as_millis());
     eprintln!(
         "[snapshot] diff '{write_name}' (parent '{parent}', {} dirty pages) written to {}",
         dirty.len(),
