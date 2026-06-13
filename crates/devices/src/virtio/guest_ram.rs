@@ -11,6 +11,8 @@
 //! (Apple Silicon), so disjoint cross-thread accesses need no extra fencing here
 //! (the virtio used/avail ring indices carry the ordering).
 
+use libc;
+
 pub struct GuestRam {
     ptr: *mut u8,
     len: usize,
@@ -87,6 +89,25 @@ impl GuestRam {
     pub fn write_u32(&self, gpa: u64, v: u32) -> bool {
         self.write_slice(gpa, &v.to_le_bytes())
     }
+
+    /// Return the host physical pages backing `[gpa, gpa+len)` to the OS via
+    /// MADV_FREE_REUSABLE (the macOS flag that actually frees anonymous pages;
+    /// MADV_DONTNEED is a no-op for anon memory there). The HVF mapping stays
+    /// valid — the guest re-faults to a zero page on next access. Returns false if
+    /// the range is outside guest RAM.
+    pub fn madvise_free(&self, gpa: u64, len: usize) -> bool {
+        let off = match gpa.checked_sub(self.base) {
+            Some(o) => o as usize,
+            None => return false,
+        };
+        if off.checked_add(len).is_none_or(|end| end > self.len) {
+            return false;
+        }
+        let ret = unsafe {
+            libc::madvise(self.ptr.add(off) as *mut libc::c_void, len, libc::MADV_FREE_REUSABLE)
+        };
+        ret == 0
+    }
 }
 
 #[cfg(test)]
@@ -116,5 +137,23 @@ mod tests {
         assert!(!m.write_u32(0x4000_00fe, 0)); // crosses the end
         assert_eq!(m.read_u32(0x3fff_ffff), None); // below base
         assert_eq!(m.read_u64(0x5000_0000), None); // far above
+    }
+
+    #[test]
+    fn madvise_free_bounds() {
+        let len = 0x4000usize;
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+                       libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let base = 0x4000_0000u64;
+        let mem = GuestRam::new(ptr as *mut u8, len, base);
+
+        assert!(mem.madvise_free(base, 0x1000));            // in range
+        assert!(!mem.madvise_free(base - 0x1000, 0x1000));  // below base
+        assert!(!mem.madvise_free(base + len as u64, 0x1000)); // past end
+
+        unsafe { libc::munmap(ptr, len) };
     }
 }
