@@ -38,7 +38,14 @@ impl std::fmt::Display for DeviceMgrError {
     }
 }
 
-impl std::error::Error for DeviceMgrError {}
+impl std::error::Error for DeviceMgrError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DeviceMgrError::BusOverlap(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 /// A memory-mapped device the `DeviceManager` can place, describe in the FDT, and
 /// snapshot. Extends `BusDevice`: a single `Arc<Mutex<dyn MmioDevice>>` is upcast
