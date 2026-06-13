@@ -119,10 +119,13 @@ impl DeviceManager {
         dev.restore(&rec.state)?;
         let typed = Arc::new(Mutex::new(dev));
         let dyn_dev: Arc<Mutex<dyn MmioDevice>> = typed.clone();
-        // keep the bump allocators ahead of restored resources so a later add() won't collide
+        self.place(rec.base, rec.size, rec.spi, dyn_dev)?;
+        // Only after a successful placement: keep the bump allocators ahead of the
+        // restored resources so a later add() won't collide. Bumping before place()
+        // would leave the allocator advanced even on a failed (e.g. overlapping)
+        // placement.
         self.mmio_next = self.mmio_next.max(rec.base + rec.size);
         self.spi_next = self.spi_next.max(rec.spi + 1);
-        self.place(rec.base, rec.size, rec.spi, dyn_dev)?;
         Ok(typed)
     }
 
