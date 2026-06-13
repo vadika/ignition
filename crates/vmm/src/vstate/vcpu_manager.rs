@@ -13,7 +13,7 @@ use devices::bus::Bus;
 use hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
 use crate::snapshot::VcpuCheckpoint;
 
-/// Upper bound on an idle WFI/timer park, matching the single-vCPU runner.
+/// Upper bound on an idle WFI/timer park (per-vCPU run loop).
 const MAX_PARK: Duration = Duration::from_millis(10);
 
 /// MPIDR for a given logical cpu index. Linear Aff0 = index — valid for the
@@ -105,9 +105,13 @@ impl VcpuManager {
             return;
         }
         // Freeze CPU_ON under the `running` lock so no claim races the latch.
+        // Reject a re-entrant request while a snapshot is still in flight — it
+        // would clear `collected` before the in-flight leader drains it.
         {
             let _running = self.running.lock().unwrap();
-            self.snapshot_active.store(true, Ordering::Relaxed);
+            if self.snapshot_active.swap(true, Ordering::Relaxed) {
+                return;
+            }
         }
         // Participants = the vCPUs already registered (running their loop). A
         // CPU_ON mid-spawn (claimed but not yet registered) is the documented
