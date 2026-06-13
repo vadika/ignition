@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use ignition_hvf::VcpuState;
@@ -22,6 +24,26 @@ pub const SNAP_VERSION: u32 = 2;
 pub struct VmConfig {
     pub mem_size: u64,
     pub vcpu_count: u64,
+}
+
+/// Human/management metadata for a base snapshot, written as `manifest.json`
+/// alongside the machine state. Distinct from `vmstate.json` (the machine state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub name: String,
+    pub created: u64, // seconds since the Unix epoch
+    pub mem_size: u64,
+    pub vcpu_count: u64,
+}
+
+impl SnapshotManifest {
+    pub fn new(name: String, mem_size: u64, vcpu_count: u64) -> Self {
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self { name, created, mem_size, vcpu_count }
+    }
 }
 
 /// One vCPU's saved state plus the MPIDR identifying which core it is. A
@@ -74,6 +96,7 @@ pub struct Paths {
     pub gic: PathBuf,
     pub disk: PathBuf,
     pub state: PathBuf,
+    pub manifest: PathBuf,
 }
 
 pub fn paths(dir: &Path) -> Paths {
@@ -82,7 +105,30 @@ pub fn paths(dir: &Path) -> Paths {
         gic: dir.join("gic.bin"),
         disk: dir.join("disk.img"),
         state: dir.join("vmstate.json"),
+        manifest: dir.join("manifest.json"),
     }
+}
+
+/// `<store>/snapshots/<name>` — the immutable base directory for a named snapshot.
+pub fn base_dir(store: &Path, name: &str) -> PathBuf {
+    store.join("snapshots").join(name)
+}
+
+/// `<store>/instances/<name>-<pid>` — the ephemeral CoW instance directory.
+pub fn instance_dir(store: &Path, name: &str, pid: u32) -> PathBuf {
+    store.join("instances").join(format!("{name}-{pid}"))
+}
+
+/// Write `manifest.json` into an existing base directory.
+pub fn write_manifest(dir: &Path, manifest: &SnapshotManifest) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
+    fs::write(paths(dir).manifest, json)
+}
+
+/// Read `manifest.json` from a base directory.
+pub fn read_manifest(dir: &Path) -> io::Result<SnapshotManifest> {
+    let bytes = fs::read(paths(dir).manifest)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
 /// Copy `src` to `dst` using APFS `clonefile(2)` (O(1), copy-on-write) when
@@ -239,6 +285,27 @@ mod tests {
         std::fs::write(&p.state, serde_json::to_vec(&bad).unwrap()).unwrap();
         let err = read_snapshot(dir.path()).unwrap_err();
         assert!(err.to_string().contains("magic"), "error should mention magic: {err}");
+    }
+
+    #[test]
+    fn manifest_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SnapshotManifest::new("brave-hopper".to_string(), 1 << 30, 4);
+        write_manifest(dir.path(), &m).unwrap();
+        let back = read_manifest(dir.path()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.mem_size, 1 << 30);
+        assert_eq!(back.vcpu_count, 4);
+    }
+
+    #[test]
+    fn store_paths_are_well_formed() {
+        let store = Path::new("/tmp/vmstore");
+        assert_eq!(base_dir(store, "foo"), Path::new("/tmp/vmstore/snapshots/foo"));
+        assert_eq!(
+            instance_dir(store, "foo", 1234),
+            Path::new("/tmp/vmstore/instances/foo-1234")
+        );
     }
 
     #[test]
