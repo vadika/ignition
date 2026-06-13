@@ -547,6 +547,10 @@ fn run_restore(dir: &Path) -> io::Result<()> {
                 })
                 .map_err(io::Error::other)?;
             }
+            // No "virtio-net" arm: snapshots are only taken on the single-vCPU,
+            // no-net path (the handler is installed only when `smp == 1 && !net`),
+            // so a net record never reaches here. If that gate is relaxed, this
+            // arm fails loudly rather than silently dropping the device.
             other => {
                 return Err(io::Error::other(format!(
                     "unknown device id in snapshot: {other}"

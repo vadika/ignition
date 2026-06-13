@@ -6,6 +6,14 @@ be snapshotted (`Ctrl-A s`), and the snapshot directory restored (`boot --restor
 console input. The same snapshot can be restored multiple times into independent
 guests (clone).
 
+> Update (2026-06-13): device wiring now goes through a uniform `DeviceManager`
+> (`vmm::device_manager`) — MMIO-window/SPI allocation, bus registration, FDT-node
+> description, and snapshot enumeration are centralized behind the `MmioDevice`
+> trait. The snapshot format is **v2** (`SNAP_MAGIC = "ignition-snapshot-v2"`): a
+> self-describing device-record list replaces the hand-listed `VmConfig` device
+> fields, with a `check_version` guard rejecting older snapshots. Live
+> snapshot/restore/clone re-verified green after the refactor.
+
 ## What works, end to end
 
 - **Snapshot** (`Ctrl-A s`): writes a complete directory — `memory.bin` (RAM dump),
