@@ -443,7 +443,41 @@ fn write_named_snapshot(
     snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
     let manifest = SnapshotManifest::new_full(write_name.to_string(), mem_size, vcpu_count);
     snapshot::write_manifest(&base, &manifest)?;
-    eprintln!("[snapshot] '{write_name}' written to {}", base.display());
+    eprintln!("[snapshot] full '{write_name}' written to {}", base.display());
+    Ok(())
+}
+
+/// Write a Diff layer into `<store>/snapshots/<write_name>/`: full GIC / vmstate /
+/// disk (clonefile of the live `disk_src`) plus only the drained dirty pages for
+/// memory (packed `memory.bin` + `dirty.idx`), with a `new_diff` manifest pointing
+/// at `parent`. Shares the GIC / vmstate / disk write with the Full path; only the
+/// memory write and manifest constructor differ.
+#[allow(clippy::too_many_arguments)]
+fn write_named_diff(
+    store: &Path,
+    write_name: &str,
+    parent: &str,
+    ram: &[u8],
+    dirty: &[u64],
+    gic_blob: &[u8],
+    disk_src: &Path,
+    checkpoints: Vec<VcpuCheckpoint>,
+    devices: Vec<DeviceRecord>,
+    mem_size: u64,
+) -> io::Result<()> {
+    let base = snapshot::base_dir(store, write_name);
+    let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
+    let vcpu_count = config.vcpu_count;
+    let snap = VmSnapshot::new(config, checkpoints, devices);
+    snapshot::write_diff_snapshot(&base, &snap, dirty, ram, gic_blob, disk_src)?;
+    let manifest =
+        SnapshotManifest::new_diff(write_name.to_string(), parent.to_string(), mem_size, vcpu_count);
+    snapshot::write_manifest(&base, &manifest)?;
+    eprintln!(
+        "[snapshot] diff '{write_name}' (parent '{parent}', {} dirty pages) written to {}",
+        dirty.len(),
+        base.display()
+    );
     Ok(())
 }
 
@@ -672,6 +706,15 @@ fn main() {
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
 
+    // The "current parent" carried across Ctrl-A s invocations. None on a fresh
+    // boot, so the first snapshot is a Full root even with tracking armed (nothing
+    // to diff against yet). After any write, the handler stores the just-written
+    // name here, so the NEXT Ctrl-A s is a Diff against it. The handler is a
+    // `Fn` (Box<dyn Fn + Send + Sync>), so this mutable-across-calls state lives
+    // behind an Arc<Mutex<_>>. Task 9 (restore) seeds it with the restored leaf by
+    // handing the restore handler an equivalent Arc primed to Some(leaf).
+    let current_parent: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     // Install the snapshot handler for any vCPU count. The manager rendezvouses
     // every vCPU and hands us their checkpoints; we capture the global state
     // (GIC + RAM + device records) and write the snapshot.
@@ -688,16 +731,26 @@ fn main() {
         // 2021+ partial-capture seeing through a newtype to the *const u8 field.
         let host_usize = host as usize;
         let ram_size_snap = ram_size;
-        // Task 8 hook: the dirty tracker (Some iff --track-dirty). The handler
-        // will `drain()` it to decide Full vs Diff and which pages to write.
-        // Captured here so Task 8 only adds the drain + diff-write logic.
+        // The dirty tracker (Some iff --track-dirty). A Diff requires it; the
+        // handler `drain()`s it for the dirty page set and re-protects RAM after.
         let dirty_snap = dirty_tracker.clone();
+        let parent_snap = current_parent.clone();
 
         manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
-            // Task 8 will use `dirty_snap` (the DirtyTracker) here: drain the
-            // dirty set and write a Diff layer instead of a Full snapshot.
-            let _ = &dirty_snap;
+            //
+            // Layer type is decided by the carried current_parent:
+            //   None    -> Full root (first snapshot; nothing to diff against).
+            //   Some(p) -> Diff against p; requires the tracker to be armed.
+            let parent = parent_snap.lock().unwrap().clone();
+
+            // A Diff is only possible with a tracker. Refuse rather than silently
+            // writing a Full under a name the user expects to chain off a parent.
+            if parent.is_some() && dirty_snap.is_none() {
+                eprintln!("dirty tracking not enabled; restart with --track-dirty for diffs");
+                return;
+            }
+
             let gic_blob = match gic_snap.save_state() {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
@@ -728,11 +781,51 @@ fn main() {
                 }
             };
 
-            match write_named_snapshot(
-                &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
-                checkpoints, devices, ram_size_snap,
-            ) {
-                Ok(()) => {}
+            let result = match &parent {
+                // Full root: write exactly as before (whole RAM, new_full manifest).
+                None => {
+                    // Full captures whole RAM, so any pages dirtied since boot are
+                    // already in it. Clear the bitmap (if armed) so the re-protect
+                    // below starts the next interval clean and the next Diff carries
+                    // only pages dirtied after THIS snapshot.
+                    if let Some(t) = &dirty_snap {
+                        let _ = t.drain();
+                    }
+                    write_named_snapshot(
+                        &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
+                        checkpoints, devices, ram_size_snap,
+                    )
+                }
+                // Diff: drain the dirty set (tracker presence checked above) and
+                // write only those pages, with a new_diff manifest pointing at p.
+                Some(p) => {
+                    let dirty = dirty_snap.as_ref().expect("tracker checked above").drain();
+                    write_named_diff(
+                        &store_snap, &write_name_snap, p, ram_slice, &dirty, &gic_blob,
+                        &disk_src, checkpoints, devices, ram_size_snap,
+                    )
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    // Carry the just-written layer forward: the next Ctrl-A s diffs
+                    // against it.
+                    *parent_snap.lock().unwrap() = Some(write_name_snap.clone());
+                    // Re-protect ALL RAM (drop WRITE) so the next interval starts
+                    // clean. drain() already cleared the bitmap; this rearms the
+                    // write-protect faults via the same process-global path used at
+                    // boot. No-op when tracking is off.
+                    if dirty_snap.is_some()
+                        && let Err(e) = ignition_hvf::vm_protect_memory(
+                            layout::RAM_BASE,
+                            ram_size_snap,
+                            (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                        )
+                    {
+                        eprintln!("[snapshot] re-protect RAM failed: {e}");
+                    }
+                }
                 Err(e) => eprintln!("[snapshot] write failed: {e}"),
             }
 

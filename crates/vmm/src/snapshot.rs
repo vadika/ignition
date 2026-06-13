@@ -239,6 +239,32 @@ pub fn write_snapshot(
     Ok(())
 }
 
+/// Write a Diff layer atomically. Same staging-then-rename discipline as
+/// [`write_snapshot`], but `memory.bin` holds only the `dirty` pages packed
+/// back-to-back (plus a `dirty.idx` sidecar) instead of the whole RAM. GIC,
+/// `vmstate.json`, and `disk.img` (clonefile of `disk_src`) are written in full.
+pub fn write_diff_snapshot(
+    dir: &Path,
+    snap: &VmSnapshot,
+    dirty: &[u64],
+    ram: &[u8],
+    gic_blob: &[u8],
+    disk_src: &Path,
+) -> io::Result<()> {
+    let tmp = dir.with_extension("tmp");
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp)?;
+    let p = paths(&tmp);
+    fs::File::create(&p.gic)?.write_all(gic_blob)?;
+    clonefile_or_copy(disk_src, &p.disk)?;
+    let json = serde_json::to_vec_pretty(snap).map_err(io::Error::other)?;
+    fs::write(&p.state, json)?;
+    write_diff_pages(&tmp, dirty, ram)?; // memory.bin (packed) + dirty.idx
+    let _ = fs::remove_dir_all(dir);
+    fs::rename(&tmp, dir)?;
+    Ok(())
+}
+
 /// Read + validate a snapshot's metadata (the raw artifacts are loaded by the
 /// caller, which owns the mmap/disk lifetimes).
 pub fn read_snapshot(dir: &Path) -> io::Result<(VmSnapshot, Vec<u8>, Paths)> {
