@@ -203,6 +203,7 @@ pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
     MemoryMap,
+    MemoryProtect,
     MemoryUnmap,
     NestedCheck,
     VcpuCreate,
@@ -230,6 +231,7 @@ impl Display for Error {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
             FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
+            MemoryProtect => write!(f, "Error re-protecting memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
                 f,
@@ -285,6 +287,21 @@ impl Vcpus for NoIrqVcpus {
     fn get_pending_irq(&self, _vcpuid: u64) -> u32 { 0 }
     fn handle_sysreg_read(&self, _vcpuid: u64, _reg: u32) -> Option<u64> { Some(0) }
     fn handle_sysreg_write(&self, _vcpuid: u64, _reg: u32, _val: u64) -> bool { true }
+}
+
+/// Re-protect an already-mapped guest range, process-globally. HVF's VM is a
+/// per-process singleton (`hv_vm_create` takes no handle), so `hv_vm_protect`
+/// needs no `Vm` reference — the dirty-fault run loop, which has no `Vm` handle,
+/// calls this to re-grant WRITE on a faulting page. `flags` is a bitwise-or of
+/// `HV_MEMORY_READ`/`HV_MEMORY_WRITE`/`HV_MEMORY_EXEC`; `guest_addr` must be
+/// page-aligned and `size` a page multiple.
+pub fn vm_protect_memory(guest_addr: u64, size: u64, flags: u64) -> Result<(), Error> {
+    let ret = unsafe { hv_vm_protect(guest_addr, size.try_into().unwrap(), flags as hv_memory_flags_t) };
+    if ret != HV_SUCCESS {
+        Err(Error::MemoryProtect)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {

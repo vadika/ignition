@@ -31,10 +31,12 @@ use ignition_devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ignition_hvf::gic::HvfGicV3;
 use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
+use ignition_vmm::dirty::DirtyTracker;
 use ignition_vmm::names;
 use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
-use ignition_vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
+use ignition_vmm::vstate::vcpu_manager::{mpidr_for, DirtyConfig, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
+use ignition_hvf::bindings::{HV_MEMORY_EXEC, HV_MEMORY_READ};
 
 
 /// Host console escape key: Ctrl-A (0x01).
@@ -459,6 +461,7 @@ fn main() {
     let mut store: PathBuf = PathBuf::from("./vmstore");
     let mut name: Option<String> = None;
     let mut force = false;
+    let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
@@ -494,6 +497,9 @@ fn main() {
             "--force" => {
                 force = true;
             }
+            "--track-dirty" => {
+                track_dirty = true;
+            }
             "--vsock-uds" => {
                 let v = it.next().expect("--vsock-uds needs a path");
                 vsock_uds = Some(PathBuf::from(v));
@@ -524,7 +530,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -618,6 +624,29 @@ fn main() {
     vm.map_memory(host_addr, layout::RAM_BASE, ram_size)
         .expect("hv_vm_map failed");
 
+    // Arm dirty-page tracking: write-protect all guest RAM (drop WRITE) so the
+    // first guest write to each page traps as a DirtyFault. The shared tracker
+    // bitmap is marked by every vCPU's run loop on fault and drained by the
+    // snapshot handler (wired in Task 8). vCPU windows are armed inside the
+    // VcpuManager via set_dirty_config below (vCPUs are created per-thread).
+    let dirty_tracker: Option<DirtyTracker> = if track_dirty {
+        vm.protect_memory(
+            layout::RAM_BASE,
+            ram_size,
+            (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+        )
+        .expect("write-protect guest RAM for dirty tracking");
+        let tracker = DirtyTracker::new(layout::RAM_BASE, ram_size);
+        eprintln!(
+            "dirty  : tracking armed ({} pages of {} bytes, RAM write-protected)",
+            tracker.page_count(),
+            ignition_vmm::dirty::PAGE
+        );
+        Some(tracker)
+    } else {
+        None
+    };
+
     // Diagnostics (stderr) so a silent boot is debuggable.
     let g = gic.fdt_info();
     eprintln!("== ignition boot ==");
@@ -659,9 +688,16 @@ fn main() {
         // 2021+ partial-capture seeing through a newtype to the *const u8 field.
         let host_usize = host as usize;
         let ram_size_snap = ram_size;
+        // Task 8 hook: the dirty tracker (Some iff --track-dirty). The handler
+        // will `drain()` it to decide Full vs Diff and which pages to write.
+        // Captured here so Task 8 only adds the drain + diff-write logic.
+        let dirty_snap = dirty_tracker.clone();
 
         manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
+            // Task 8 will use `dirty_snap` (the DirtyTracker) here: drain the
+            // dirty set and write a Diff layer instead of a Full snapshot.
+            let _ = &dirty_snap;
             let gic_blob = match gic_snap.save_state() {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
@@ -704,6 +740,17 @@ fn main() {
                 stop.store(false, Ordering::Release);
             }
         }));
+    }
+
+    // Arm dirty tracking on the manager BEFORE it is cloned (set_dirty_config,
+    // like set_snapshot_handler, needs sole Arc ownership). Each vCPU thread
+    // then sets its dirty window and the run loop handles DirtyFault.
+    if let Some(tracker) = &dirty_tracker {
+        manager.set_dirty_config(DirtyConfig {
+            base: layout::RAM_BASE,
+            size: ram_size,
+            tracker: tracker.clone(),
+        });
     }
 
     // Raw terminal + host stdin reader for the interactive console. The guard

@@ -11,7 +11,19 @@ use std::time::Duration;
 
 use ignition_devices::bus::Bus;
 use ignition_hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
+use crate::dirty::{DirtyTracker, PAGE};
 use crate::snapshot::VcpuCheckpoint;
+
+/// Dirty-page tracking config, armed by the boot harness before `run` when
+/// `--track-dirty` is set. The window (`base`, `size`) is the write-protected
+/// guest-RAM range; `tracker` is the shared atomic bitmap each vCPU thread
+/// marks on a write-protect fault. Cloning shares the underlying bitmap.
+#[derive(Clone)]
+pub struct DirtyConfig {
+    pub base: u64,
+    pub size: u64,
+    pub tracker: DirtyTracker,
+}
 
 /// Upper bound on an idle WFI/timer park (per-vCPU run loop).
 const MAX_PARK: Duration = Duration::from_millis(10);
@@ -60,6 +72,10 @@ pub struct VcpuManager {
     collected: Mutex<Vec<(u64, Result<ignition_hvf::VcpuState, ignition_hvf::Error>)>>,
     /// Installed by the boot harness before `run`; invoked on the leader thread.
     snapshot_handler: Option<SnapshotHandler>,
+    /// Installed by the boot harness before `run` when `--track-dirty` is set.
+    /// When present, each vCPU thread arms `set_dirty_window` before its loop,
+    /// and the `DirtyFault` arm marks the page + re-grants WRITE.
+    dirty: Option<DirtyConfig>,
 }
 
 /// A snapshot handler: invoked on the elected leader vCPU thread once every
@@ -83,7 +99,17 @@ impl VcpuManager {
             snap_barrier: Mutex::new(None),
             collected: Mutex::new(Vec::new()),
             snapshot_handler: None,
+            dirty: None,
         })
+    }
+
+    /// Arm dirty-page tracking. MUST be called before `run` (same `Arc::get_mut`
+    /// sole-ownership constraint as `set_snapshot_handler`). Each vCPU thread
+    /// then calls `set_dirty_window` before its run loop so in-RAM write faults
+    /// surface as `DirtyFault`, and the run loop marks + re-grants those pages.
+    pub fn set_dirty_config(self: &mut Arc<Self>, config: DirtyConfig) {
+        let me = Arc::get_mut(self).expect("set_dirty_config must be called before run");
+        me.dirty = Some(config);
     }
 
     /// Install a snapshot handler. MUST be called before `run`. The handler is
@@ -289,6 +315,13 @@ impl VcpuManager {
     /// The shared per-vCPU run loop (primary and secondary).
     fn run_loop(self: &Arc<Self>, mpidr: u64, mut vcpu: HvfVcpu) -> Result<(), ignition_hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
+        // Arm dirty-page tracking on this vCPU before it runs (every vCPU must
+        // have the window set, else its in-RAM write faults are misclassified).
+        // The tracker handle is cloned per thread; its bitmap is shared (Arc).
+        let dirty = self.dirty.clone();
+        if let Some(cfg) = &dirty {
+            vcpu.set_dirty_window(cfg.base, cfg.size);
+        }
         // Termination relies on this top-of-loop shutdown check, not the
         // vcpu_request_exit broadcast: the broadcast only interrupts a vcpu
         // already blocked in run(); a vcpu that exits for any other reason
@@ -302,6 +335,26 @@ impl VcpuManager {
                 VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
                 VcpuExit::MmioRead(addr, data) => self.bus.read(addr, data),
                 VcpuExit::CpuOn(mpidr, entry, ctx) => self.spawn(mpidr, entry, ctx),
+                VcpuExit::DirtyFault(pa) => {
+                    // A guest write trapped on the write-protected RAM window.
+                    // Record the page, re-grant WRITE on its granule, and resume
+                    // WITHOUT advancing PC so the store re-executes. The tracker
+                    // bitmap is atomic, so concurrent vCPU threads need no lock.
+                    if let Some(cfg) = &dirty {
+                        cfg.tracker.mark(pa);
+                        let page_base = pa & !((PAGE as u64) - 1);
+                        ignition_hvf::vm_protect_memory(
+                            page_base,
+                            PAGE as u64,
+                            (ignition_hvf::bindings::HV_MEMORY_READ
+                                | ignition_hvf::bindings::HV_MEMORY_WRITE
+                                | ignition_hvf::bindings::HV_MEMORY_EXEC)
+                                as u64,
+                        )?;
+                    } else {
+                        log::warn!("DirtyFault at {pa:#x} but dirty tracking is not armed");
+                    }
+                }
                 VcpuExit::Shutdown => {
                     log::info!("guest requested shutdown (PSCI SYSTEM_OFF)");
                     self.request_shutdown();
