@@ -5,12 +5,13 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use devices::bus::Bus;
 use hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
+use crate::snapshot::VcpuCheckpoint;
 
 /// Upper bound on an idle WFI/timer park, matching the single-vCPU runner.
 const MAX_PARK: Duration = Duration::from_millis(10);
@@ -31,6 +32,8 @@ pub enum Claim {
     Unknown,
     /// Already running — duplicate CPU_ON, reject.
     AlreadyRunning,
+    /// A snapshot is in progress — CPU_ON is frozen, reject.
+    Frozen,
 }
 
 pub struct VcpuManager {
@@ -44,16 +47,25 @@ pub struct VcpuManager {
     vcpuids: Mutex<Vec<u64>>,
     threads: Mutex<Vec<JoinHandle<Result<(), hvf::Error>>>>,
     shutdown: AtomicBool,
-    /// Set by `request_snapshot`; cleared atomically inside `run_loop` when handled.
+    /// Set by `request_snapshot`; cleared by the leader inside `run_loop`.
     snapshot_req: AtomicBool,
-    /// Installed by the boot harness before `run`; called on the vCPU thread when
-    /// `snapshot_req` fires. Single-vCPU only (asserted at install time).
+    /// True for the duration of a snapshot rendezvous; freezes CPU_ON. Read and
+    /// written only while holding the `running` lock, so it cannot race a claim.
+    snapshot_active: AtomicBool,
+    /// Per-snapshot barrier sized to the participant count, published by
+    /// `request_snapshot` and read by each vCPU thread at the rendezvous.
+    snap_barrier: Mutex<Option<Arc<Barrier>>>,
+    /// Each participating vCPU thread pushes `(mpidr, save_state())` here; the
+    /// leader drains it after the barrier.
+    collected: Mutex<Vec<(u64, Result<hvf::VcpuState, hvf::Error>)>>,
+    /// Installed by the boot harness before `run`; invoked on the leader thread.
     snapshot_handler: Option<SnapshotHandler>,
 }
 
-/// A snapshot handler: runs on the vCPU thread at a `Canceled` exit to capture and
-/// write the snapshot. Reads the vCPU's state via the passed `&HvfVcpu`.
-type SnapshotHandler = Box<dyn Fn(&HvfVcpu) + Send + Sync>;
+/// A snapshot handler: invoked on the elected leader vCPU thread once every
+/// vCPU has saved its register state. Receives the per-vCPU checkpoints and
+/// performs the global capture (RAM + GIC + device records) and file write.
+type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>;
 
 impl VcpuManager {
     /// Create a manager for `vcpu_count` cpus (MPIDRs `mpidr_for(0..vcpu_count)`).
@@ -67,32 +79,51 @@ impl VcpuManager {
             threads: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             snapshot_req: AtomicBool::new(false),
+            snapshot_active: AtomicBool::new(false),
+            snap_barrier: Mutex::new(None),
+            collected: Mutex::new(Vec::new()),
             snapshot_handler: None,
         })
     }
 
-    /// Install a snapshot handler. MUST be called before `run` and only with
-    /// `vcpu_count == 1`. The handler is invoked on the vCPU thread (required by
-    /// HVF thread-affinity) when the snapshot request fires.
+    /// Install a snapshot handler. MUST be called before `run`. The handler is
+    /// invoked on the leader vCPU thread (HVF thread-affinity) once every vCPU
+    /// has rendezvoused and saved its state.
     pub fn set_snapshot_handler(
         self: &mut Arc<Self>,
-        handler: Box<dyn Fn(&HvfVcpu) + Send + Sync>,
+        handler: Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>,
     ) {
         let me = Arc::get_mut(self).expect("set_snapshot_handler must be called before run");
-        assert_eq!(me.mpidrs.len(), 1, "snapshot is single-vCPU only");
         me.snapshot_handler = Some(handler);
     }
 
-    /// Request a snapshot. Sets the flag and interrupts the (single) vCPU so the
-    /// handler fires at the next `Canceled` exit. No-op if no handler is installed.
+    /// Request a snapshot. Freezes CPU_ON, latches the participant set, sizes the
+    /// rendezvous barrier, and interrupts every registered vCPU so each exits to
+    /// `Canceled` and joins the rendezvous. No-op if no handler is installed.
     pub fn request_snapshot(&self) {
         if self.snapshot_handler.is_none() {
             return;
         }
+        // Freeze CPU_ON under the `running` lock so no claim races the latch.
+        {
+            let _running = self.running.lock().unwrap();
+            self.snapshot_active.store(true, Ordering::Relaxed);
+        }
+        // Participants = the vCPUs already registered (running their loop). A
+        // CPU_ON mid-spawn (claimed but not yet registered) is the documented
+        // mid-boot exclusion; snapshots are taken after boot.
+        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
+        if ids.is_empty() {
+            // No vCPU has registered yet; nothing to snapshot. Unfreeze and bail
+            // so a later snapshot still works.
+            self.snapshot_active.store(false, Ordering::Relaxed);
+            return;
+        }
+        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
-        // Interrupt the primary vCPU so it exits to `Canceled` promptly.
-        if let Some(&vcpuid) = self.vcpuids.lock().unwrap().first() {
-            let _ = hvf::vcpu_request_exit(vcpuid);
+        for id in ids {
+            let _ = hvf::vcpu_request_exit(id);
         }
     }
 
@@ -108,6 +139,9 @@ impl VcpuManager {
             return Claim::Unknown;
         }
         let mut running = self.running.lock().unwrap();
+        if self.snapshot_active.load(Ordering::Relaxed) {
+            return Claim::Frozen;
+        }
         if running.contains(&mpidr) {
             Claim::AlreadyRunning
         } else {
@@ -158,7 +192,7 @@ impl VcpuManager {
         }
         // Restore state instead of set_initial_state.
         vcpu.restore_state(&vcpu_state)?;
-        self.run_loop(vcpu)
+        self.run_loop(mpidr, vcpu)
     }
 
     fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), hvf::Error> {
@@ -167,7 +201,7 @@ impl VcpuManager {
         let vcpu = HvfVcpu::new(mpidr, false)?;
         self.vcpuids.lock().unwrap().push(vcpu.id());
         vcpu.set_initial_state(entry, fdt_addr)?;
-        self.run_loop(vcpu)
+        self.run_loop(mpidr, vcpu)
     }
 
     fn run_secondary(self: &Arc<Self>, mpidr: u64, entry: u64, ctx: u64) -> Result<(), hvf::Error> {
@@ -175,7 +209,7 @@ impl VcpuManager {
         // Register before the first run() so a shutdown broadcast reaches us.
         self.vcpuids.lock().unwrap().push(vcpu.id());
         vcpu.set_secondary_state(entry, ctx)?;
-        self.run_loop(vcpu)
+        self.run_loop(mpidr, vcpu)
     }
 
     /// Spawn a secondary for a PSCI CPU_ON, guarding against unknown/duplicate
@@ -194,6 +228,10 @@ impl VcpuManager {
                 log::warn!("CPU_ON for already-running mpidr {mpidr:#x} ignored");
                 return;
             }
+            Claim::Frozen => {
+                log::warn!("CPU_ON for mpidr {mpidr:#x} ignored: snapshot in progress");
+                return;
+            }
         }
         let me = Arc::clone(self);
         let handle = thread::spawn(move || me.run_secondary(mpidr, entry, ctx));
@@ -209,7 +247,7 @@ impl VcpuManager {
     }
 
     /// The shared per-vCPU run loop (primary and secondary).
-    fn run_loop(self: &Arc<Self>, mut vcpu: HvfVcpu) -> Result<(), hvf::Error> {
+    fn run_loop(self: &Arc<Self>, mpidr: u64, mut vcpu: HvfVcpu) -> Result<(), hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
         // Termination relies on this top-of-loop shutdown check, not the
         // vcpu_request_exit broadcast: the broadcast only interrupts a vcpu
@@ -230,16 +268,26 @@ impl VcpuManager {
                     return Ok(());
                 }
                 VcpuExit::Canceled => {
-                    if self.snapshot_req.swap(false, Ordering::AcqRel) {
-                        if let Some(h) = &self.snapshot_handler {
-                            // A panic in the handler must not unwind the vCPU thread —
-                            // log and resume.
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(&vcpu)));
-                            if r.is_err() {
-                                log::error!("snapshot handler panicked; guest resumed");
-                            }
+                    if self.snapshot_req.load(Ordering::Acquire) {
+                        // Save our own registers (HVF thread-affinity) and meet
+                        // every other vCPU at the barrier.
+                        let st = vcpu.save_state();
+                        self.collected.lock().unwrap().push((mpidr, st));
+                        let bar = self
+                            .snap_barrier
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("snap_barrier set when snapshot_req is set");
+                        // Barrier 1: a full happens-before edge — every push is
+                        // visible to the leader after this returns.
+                        if bar.wait().is_leader() {
+                            self.run_snapshot_leader();
                         }
-                        continue; // resume the guest after snapshotting
+                        // Barrier 2: peers wait here while the leader writes;
+                        // release together and resume.
+                        bar.wait();
+                        continue;
                     }
                     return Ok(());
                 }
@@ -249,6 +297,48 @@ impl VcpuManager {
                 other => log::debug!("unhandled vCPU exit: {other:?}"),
             }
         }
+    }
+
+    /// Runs on the single leader thread between the two rendezvous barriers, with
+    /// every other vCPU parked. Drains the collected per-vCPU states, aborts on
+    /// any save failure (no torn snapshot), else invokes the handler. Always
+    /// clears the snapshot flags before returning so the second barrier resumes a
+    /// clean state.
+    fn run_snapshot_leader(self: &Arc<Self>) {
+        let mut items = std::mem::take(&mut *self.collected.lock().unwrap());
+        items.sort_by_key(|(mpidr, _)| *mpidr);
+
+        let mut checkpoints = Vec::with_capacity(items.len());
+        let mut failed = None;
+        for (mpidr, res) in items {
+            match res {
+                Ok(state) => checkpoints.push(VcpuCheckpoint { mpidr, state }),
+                Err(e) => {
+                    failed = Some((mpidr, e));
+                    break;
+                }
+            }
+        }
+
+        match failed {
+            Some((mpidr, e)) => {
+                log::error!("snapshot aborted: vcpu {mpidr:#x} save_state failed: {e}");
+            }
+            None => {
+                if let Some(h) = &self.snapshot_handler {
+                    // A panic in the handler must not unwind the vCPU thread.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        h(checkpoints)
+                    }));
+                    if r.is_err() {
+                        log::error!("snapshot handler panicked; guest resumed");
+                    }
+                }
+            }
+        }
+
+        self.snapshot_req.store(false, Ordering::Release);
+        self.snapshot_active.store(false, Ordering::Relaxed);
     }
 
     /// Join every spawned vCPU thread, draining the registry so threads spawned
@@ -296,5 +386,12 @@ mod tests {
     fn claim_rejects_unconfigured_mpidr() {
         let m = mgr(2); // mpidrs {0, 1}
         assert_eq!(m.claim(2), Claim::Unknown);
+    }
+
+    #[test]
+    fn claim_rejected_while_snapshot_active() {
+        let m = mgr(4);
+        m.snapshot_active.store(true, Ordering::Relaxed);
+        assert_eq!(m.claim(1), Claim::Frozen);
     }
 }
