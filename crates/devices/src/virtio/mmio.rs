@@ -54,6 +54,15 @@ pub trait VirtioDevice: Send {
     fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
         Vec::new()
     }
+
+    /// Serialize device-specific state for a snapshot. Default: stateless (Null).
+    fn save(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+    /// Apply restored device-specific state. Default: stateless (no-op).
+    fn restore(&mut self, _v: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Per-queue driver-programmed state.
@@ -86,7 +95,8 @@ pub struct QueueSnapshot {
     pub used: u16,
 }
 
-/// Serializable snapshot of the full virtio-mmio transport state (registers + queues).
+/// Serializable snapshot of the full virtio-mmio transport state (registers + queues)
+/// + inner device state blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtioMmioState {
     pub status: u32,
@@ -94,6 +104,10 @@ pub struct VirtioMmioState {
     pub device_features_sel: u32,
     pub interrupt_status: u32,
     pub queues: Vec<QueueSnapshot>,
+    /// Inner `VirtioDevice` state blob (Null for stateless devices). `serde(default)`
+    /// keeps pre-inner-state snapshots loadable.
+    #[serde(default)]
+    pub dev: serde_json::Value,
 }
 
 /// A virtio-mmio transport hosting one `VirtioDevice`.
@@ -317,6 +331,7 @@ impl VirtioMmio {
             device_features_sel: self.device_features_sel,
             interrupt_status: self.interrupt_status,
             queues,
+            dev: self.dev.save(),
         }
     }
 
@@ -389,6 +404,10 @@ impl MmioDevice for VirtioMmio {
             });
         }
         self.restore_state(&s);
+        self.dev.restore(&s.dev).map_err(|reason| DeviceMgrError::StateInvalid {
+            id: self.id.into(),
+            reason,
+        })?;
         Ok(())
     }
 }
@@ -639,5 +658,47 @@ mod tests {
         let mut d2 = dev(&mut backing2, Arc::new(FakeIrq::default()));
         d2.restore_state(&st);
         assert_eq!(d2.save_state(), st); // round-trips
+    }
+
+    /// A stateful mock VirtioDevice: its save/restore carries a single counter,
+    /// proving the transport round-trips inner device state.
+    struct StatefulMock {
+        counter: u32,
+    }
+    impl VirtioDevice for StatefulMock {
+        fn device_id(&self) -> u32 { 0xABCD }
+        fn device_features(&self, _sel: u32) -> u32 { 0 }
+        fn config_read(&self, _offset: u64, data: &mut [u8]) { data.fill(0); }
+        fn queue_count(&self) -> usize { 1 }
+        fn handle_notify(&mut self, _q: usize, _vq: &mut Virtqueue, _mem: &GuestRam) -> bool { false }
+        fn save(&self) -> serde_json::Value { serde_json::json!({ "counter": self.counter }) }
+        fn restore(&mut self, v: &serde_json::Value) -> Result<(), String> {
+            self.counter = v.get("counter").and_then(|c| c.as_u64()).ok_or("missing counter")? as u32;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn virtio_mmio_roundtrips_inner_device_state() {
+        let mem = GuestRam::new(std::ptr::null_mut(), 0, 0);
+        let irq: Arc<dyn IrqLine> = Arc::new(crate::virtio::NoopIrq);
+        let mut a = VirtioMmio::new("mock", Box::new(StatefulMock { counter: 7 }), mem, irq.clone());
+        let saved = a.save();
+
+        let mem2 = GuestRam::new(std::ptr::null_mut(), 0, 0);
+        let mut b = VirtioMmio::new("mock", Box::new(StatefulMock { counter: 0 }), mem2, irq);
+        b.restore(&saved).expect("restore ok");
+        assert_eq!(b.save(), saved, "inner device counter must survive save/restore");
+    }
+
+    #[test]
+    fn virtio_mmio_state_without_dev_field_deserializes() {
+        // Old (pre-inner-state) snapshots have no `dev` key; serde default fills Null.
+        let json = serde_json::json!({
+            "status": 0, "queue_sel": 0, "device_features_sel": 0,
+            "interrupt_status": 0, "queues": []
+        });
+        let s: VirtioMmioState = serde_json::from_value(json).expect("deserializes with default dev");
+        assert_eq!(s.dev, serde_json::Value::Null);
     }
 }
