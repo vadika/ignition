@@ -151,6 +151,9 @@ target/debug/boot --store vmstore --restore base --track-dirty --name base-diff
 python3 scripts/diff_snapshot_test.py  # full cycle: diff ~3% of RAM, mutation survives, bases immutable
 ```
 
+Worked example — one warm golden base, many cheap divergent forks:
+`docs/examples/diff-snapshot-fanout.md`.
+
 Headless drivers that run the whole cycle:
 
 ```sh
