@@ -11,5 +11,6 @@
 
 pub mod bus;
 pub mod device;
+pub mod rtc;
 pub mod serial;
 pub mod virtio;
