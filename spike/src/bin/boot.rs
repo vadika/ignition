@@ -907,10 +907,14 @@ fn run_restore(
     io::stderr().flush().ok();
 
     // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
-    match manager.run_restored(snap.vcpus, Some(gic_blob)) {
-        Ok(()) => {}
-        Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
-    }
+    let run_result = manager.run_restored(snap.vcpus, Some(gic_blob));
+
+    // Best-effort cleanup of the CoW instance dir (memory.bin + disk.img clones).
+    // A Ctrl-A x exit calls process::exit and intentionally skips this — a leftover
+    // instance dir is harmless because the base is never mutated.
+    let _ = fs::remove_dir_all(&inst_dir);
+
+    run_result.map_err(|e| io::Error::other(format!("run_restored: {e}")))?;
     Ok(())
 }
 
