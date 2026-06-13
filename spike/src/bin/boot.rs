@@ -744,11 +744,11 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
         layout::SPI_BASE,
         layout::SPI_COUNT,
     );
-    // Private disk instance so clones are independent (only if the snapshot has a disk).
+    // Private CoW disk instance so clones are independent and the base disk.img is
+    // never mutated (only if the snapshot has a disk).
     let disk = if snap.devices.iter().any(|r| r.id == "virtio-blk") {
-        let instance_disk = std::env::temp_dir()
-            .join(format!("ignition-instance-{}.img", process::id()));
-        fs::copy(&paths.disk, &instance_disk)?;
+        let instance_disk = inst_dir.join("disk.img");
+        snapshot::clonefile_or_copy(&paths.disk, &instance_disk)?;
         Some(instance_disk)
     } else {
         None
