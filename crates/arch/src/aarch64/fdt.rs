@@ -36,11 +36,9 @@ pub struct MmioDev {
 pub enum FdtDevice {
     /// 16550-compatible serial -> `ns16550a` node.
     Serial(MmioDev),
-    /// virtio-mmio block device -> `virtio,mmio` node.
-    VirtioBlk(MmioDev),
-    /// virtio-mmio network device -> `virtio,mmio` node (same node builder as
-    /// `VirtioBlk`; the kernel reads the device id from the mmio registers).
-    VirtioNet(MmioDev),
+    /// Any virtio-mmio device -> `virtio,mmio` node (kernel reads the device id
+    /// from the mmio registers, so blk/net/rng/... share one node shape).
+    VirtioMmio(MmioDev),
 }
 
 /// GICv3 placement, supplied by the GIC milestone. Parameterized so FDT
@@ -92,8 +90,7 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
     for dev in &cfg.devices {
         match dev {
             FdtDevice::Serial(m) => create_serial_node(&mut fdt, m)?,
-            FdtDevice::VirtioBlk(m) => create_virtio_node(&mut fdt, m)?,
-            FdtDevice::VirtioNet(m) => create_virtio_node(&mut fdt, m)?,
+            FdtDevice::VirtioMmio(m) => create_virtio_node(&mut fdt, m)?,
         }
     }
 
@@ -409,12 +406,23 @@ mod tests {
 
         // Present when configured.
         let mut cfg = sample();
-        cfg.devices.push(FdtDevice::VirtioBlk(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 }));
+        cfg.devices.push(FdtDevice::VirtioMmio(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 }));
         let blob = generate(&cfg).unwrap();
         let dt = Fdt::new(&blob).unwrap();
         let node = dt.find_node("/virtio_mmio@a000000").unwrap();
         assert_eq!(dt_str(node.property("compatible").unwrap().value), "virtio,mmio");
         assert_eq!(be_u64s(node.property("reg").unwrap().value), vec![0x0a00_0000, 0x200]);
         assert_eq!(be_u32s(node.property("interrupts").unwrap().value), vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn two_virtio_devices_both_render() {
+        let mut cfg = sample();
+        cfg.devices.push(FdtDevice::VirtioMmio(MmioDev { addr: 0x0a00_0000, size: 0x200, irq: 1 }));
+        cfg.devices.push(FdtDevice::VirtioMmio(MmioDev { addr: 0x0a00_0200, size: 0x200, irq: 2 }));
+        let blob = generate(&cfg).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        assert!(dt.find_node("/virtio_mmio@a000000").is_some());
+        assert!(dt.find_node("/virtio_mmio@a000200").is_some());
     }
 }

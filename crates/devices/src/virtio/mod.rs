@@ -11,3 +11,10 @@ pub trait IrqLine: Send + Sync {
     /// Assert (`true`) or deassert (`false`) the device's interrupt.
     fn set_spi(&self, level: bool);
 }
+
+/// An `IrqLine` that drops all assertions — for irq-less construction (tests,
+/// and the manager before a real GIC line is attached).
+pub struct NoopIrq;
+impl IrqLine for NoopIrq {
+    fn set_spi(&self, _level: bool) {}
+}

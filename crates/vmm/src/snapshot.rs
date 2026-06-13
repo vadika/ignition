@@ -6,50 +6,51 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use devices::serial::SerialSnapshot;
-use devices::virtio::mmio::VirtioMmioState;
 use hvf::VcpuState;
 
-pub const SNAP_MAGIC: &str = "ignition-snapshot-v1";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MmioWindow {
-    pub base: u64,
-    pub size: u64,
-    pub spi: u32,
-}
+pub const SNAP_MAGIC: &str = "ignition-snapshot-v2";
+pub const SNAP_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {
     pub mem_size: u64,
     pub vcpu_count: u64,
-    pub serial: MmioWindow,
-    pub blk: MmioWindow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceState {
-    pub blk: VirtioMmioState,
-    pub serial: SerialSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub magic: String,
+    pub version: u32,
     pub config: VmConfig,
     pub vcpu: VcpuState,
-    pub devices: DeviceState,
+    pub devices: Vec<crate::device_manager::DeviceRecord>,
 }
 
 impl VmSnapshot {
-    pub fn new(config: VmConfig, vcpu: VcpuState, devices: DeviceState) -> Self {
+    pub fn new(
+        config: VmConfig,
+        vcpu: VcpuState,
+        devices: Vec<crate::device_manager::DeviceRecord>,
+    ) -> Self {
         Self {
             magic: SNAP_MAGIC.to_string(),
+            version: SNAP_VERSION,
             config,
             vcpu,
             devices,
         }
     }
+}
+
+/// Reject snapshots this binary can't restore.
+pub fn check_version(s: &VmSnapshot) -> io::Result<()> {
+    if s.magic != SNAP_MAGIC || s.version != SNAP_VERSION {
+        return Err(io::Error::other(format!(
+            "incompatible snapshot: magic={:?} version={} (want {:?} v{})",
+            s.magic, s.version, SNAP_MAGIC, SNAP_VERSION
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -100,9 +101,7 @@ pub fn read_snapshot(dir: &Path) -> io::Result<(VmSnapshot, Vec<u8>, Paths)> {
     let p = paths(dir);
     let snap: VmSnapshot =
         serde_json::from_slice(&fs::read(&p.state)?).map_err(io::Error::other)?;
-    if snap.magic != SNAP_MAGIC {
-        return Err(io::Error::other(format!("bad snapshot magic: {}", snap.magic)));
-    }
+    check_version(&snap)?;
     let gic = fs::read(&p.gic)?;
     Ok((snap, gic, p))
 }
@@ -111,54 +110,53 @@ pub fn read_snapshot(dir: &Path) -> io::Result<(VmSnapshot, Vec<u8>, Paths)> {
 mod tests {
     use super::*;
 
-    fn sample() -> VmSnapshot {
-        VmSnapshot::new(
-            VmConfig {
-                mem_size: 0x2000_0000,
-                vcpu_count: 1,
-                serial: MmioWindow { base: 0x0900_0000, size: 0x1000, spi: 0 },
-                blk: MmioWindow { base: 0x0a00_0000, size: 0x200, spi: 1 },
-            },
-            VcpuState {
-                gp: (0..33).collect(),
-                sysregs: vec![(1, 2)],
-                vtimer_mask: false,
-                vtimer_offset: 0,
-                simd: vec![0u128; 32],
-                fpcr: 0,
-                fpsr: 0,
-                icc: vec![(1, 2)],
-                host_counter: 0,
-            },
-            DeviceState {
-                blk: VirtioMmioState {
-                    status: 0xf,
-                    queue_sel: 0,
-                    device_features_sel: 0,
-                    interrupt_status: 0,
-                    queues: vec![],
-                },
-                serial: SerialSnapshot {
-                    baud_divisor_low: 1,
-                    baud_divisor_high: 0,
-                    interrupt_enable: 0xf,
-                    interrupt_identification: 1,
-                    line_control: 3,
-                    line_status: 0x60,
-                    modem_control: 0,
-                    modem_status: 0,
-                    scratch: 0,
-                },
-            },
-        )
+    fn sample_vcpu() -> VcpuState {
+        VcpuState {
+            gp: (0..33).collect(),
+            sysregs: vec![(1, 2)],
+            vtimer_mask: false,
+            vtimer_offset: 0,
+            simd: vec![0u128; 32],
+            fpcr: 0,
+            fpsr: 0,
+            icc: vec![(1, 2)],
+            host_counter: 0,
+        }
     }
 
     #[test]
-    fn snapshot_json_round_trips() {
-        let s = sample();
-        let json = serde_json::to_string(&s).unwrap();
+    fn snapshot_roundtrips_with_device_records() {
+        use crate::device_manager::DeviceRecord;
+        use devices::device::FdtKind;
+        let snap = VmSnapshot::new(
+            VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
+            sample_vcpu(),
+            vec![DeviceRecord {
+                id: "serial".into(),
+                base: 0x900_0000,
+                size: 0x1000,
+                spi: 0,
+                fdt_kind: FdtKind::Ns16550a,
+                state: serde_json::json!({"scratch": 7}),
+            }],
+        );
+        let json = serde_json::to_string(&snap).unwrap();
         let back: VmSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(s, back);
+        assert_eq!(back.version, SNAP_VERSION);
+        assert_eq!(back.magic, SNAP_MAGIC);
+        assert_eq!(back.devices.len(), 1);
+        assert_eq!(back.devices[0].id, "serial");
+    }
+
+    #[test]
+    fn check_version_rejects_old() {
+        let bad = serde_json::json!({
+            "magic": SNAP_MAGIC, "version": 0,
+            "config": {"mem_size": 1, "vcpu_count": 1},
+            "vcpu": serde_json::to_value(sample_vcpu()).unwrap(), "devices": []
+        });
+        let parsed: VmSnapshot = serde_json::from_value(bad).unwrap();
+        assert!(check_version(&parsed).is_err());
     }
 
     #[test]
@@ -166,9 +164,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let disk = dir.path().join("src.img");
         std::fs::write(&disk, b"DISK").unwrap();
-        write_snapshot(dir.path(), &sample(), &[0u8; 16], &[1u8, 2, 3], &disk).unwrap();
-        let (snap, gic, p) = read_snapshot(dir.path()).unwrap();
-        assert_eq!(snap, sample());
+        let snap = VmSnapshot::new(
+            VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
+            sample_vcpu(),
+            vec![],
+        );
+        write_snapshot(dir.path(), &snap, &[0u8; 16], &[1u8, 2, 3], &disk).unwrap();
+        let (back, gic, p) = read_snapshot(dir.path()).unwrap();
+        assert_eq!(back.magic, SNAP_MAGIC);
+        assert_eq!(back.version, SNAP_VERSION);
         assert_eq!(gic, vec![1, 2, 3]);
         assert_eq!(std::fs::read(&p.memory).unwrap(), vec![0u8; 16]);
         assert_eq!(std::fs::read(&p.disk).unwrap(), b"DISK");
@@ -179,11 +183,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let disk = dir.path().join("src.img");
         std::fs::write(&disk, b"D").unwrap();
-        write_snapshot(dir.path(), &sample(), &[0u8; 8], &[0u8], &disk).unwrap();
+        let snap = VmSnapshot::new(
+            VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
+            sample_vcpu(),
+            vec![],
+        );
+        write_snapshot(dir.path(), &snap, &[0u8; 8], &[0u8], &disk).unwrap();
         let p = paths(dir.path());
-        let mut snap = sample();
-        snap.magic = "wrong-magic".to_string();
-        std::fs::write(&p.state, serde_json::to_vec(&snap).unwrap()).unwrap();
+        // Corrupt the magic
+        let mut bad: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&p.state).unwrap()).unwrap();
+        bad["magic"] = serde_json::json!("wrong-magic");
+        std::fs::write(&p.state, serde_json::to_vec(&bad).unwrap()).unwrap();
         let err = read_snapshot(dir.path()).unwrap_err();
         assert!(err.to_string().contains("magic"), "error should mention magic: {err}");
     }
