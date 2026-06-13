@@ -160,39 +160,75 @@ impl VcpuManager {
         self.join_all()
     }
 
-    /// Run the restore path: create a fresh primary vCPU, restore its state from
-    /// `vcpu_state`, and run the loop without calling `set_initial_state`. The
-    /// vCPU's PC/regs come exclusively from `vcpu_state`. Single-vCPU only.
+    /// Run the restore path for N cores. Spawns one thread per checkpoint, pre-
+    /// seeds `running` with every restored MPIDR (so a later stray CPU_ON is
+    /// rejected `AlreadyRunning`), restores the GIC once all redistributors
+    /// exist, then resumes each core at its saved PC. Returns the first error.
     pub fn run_restored(
         self: &Arc<Self>,
-        vcpu_state: hvf::VcpuState,
+        checkpoints: Vec<VcpuCheckpoint>,
         gic_blob: Option<Vec<u8>>,
     ) -> Result<(), hvf::Error> {
-        let me = Arc::clone(self);
-        let handle = thread::spawn(move || me.run_restored_primary(vcpu_state, gic_blob));
-        self.threads.lock().unwrap().push(handle);
+        let barrier = Arc::new(Barrier::new(checkpoints.len()));
+        let gic_blob = Arc::new(gic_blob);
+        {
+            let mut running = self.running.lock().unwrap();
+            for cp in &checkpoints {
+                running.insert(cp.mpidr);
+            }
+        }
+        for cp in checkpoints {
+            let me = Arc::clone(self);
+            let bar = Arc::clone(&barrier);
+            let blob = Arc::clone(&gic_blob);
+            let handle = thread::spawn(move || me.run_restored_one(cp, bar, blob));
+            self.threads.lock().unwrap().push(handle);
+        }
         self.join_all()
     }
 
-    fn run_restored_primary(
+    /// One restored vCPU thread. Two barriers bracket the GIC restore so it runs
+    /// exactly once, after every redistributor exists and before any per-vCPU
+    /// register restore (which writes per-cpu ICC state). A creation or GIC
+    /// failure sets `shutdown`; every thread still reaches both barriers, so no
+    /// peer deadlocks, and they all bail after the second barrier.
+    fn run_restored_one(
         self: &Arc<Self>,
-        vcpu_state: hvf::VcpuState,
-        gic_blob: Option<Vec<u8>>,
+        cp: VcpuCheckpoint,
+        barrier: Arc<Barrier>,
+        gic_blob: Arc<Option<Vec<u8>>>,
     ) -> Result<(), hvf::Error> {
-        let mpidr = mpidr_for(0);
-        self.running.lock().unwrap().insert(mpidr);
-        let vcpu = HvfVcpu::new(mpidr, false)?;
-        let vcpuid = vcpu.id();
-        self.vcpuids.lock().unwrap().push(vcpuid);
-        // Restore the in-kernel GIC state AFTER the vCPU exists: the per-cpu
-        // redistributor state (PPI enables, incl. the vtimer PPI 27) can only be
-        // restored once the vCPU/redistributor is present.
-        if let Some(blob) = gic_blob {
-            hvf::gic::gic_restore(&blob)?;
+        let vcpu = HvfVcpu::new(cp.mpidr, false);
+        match &vcpu {
+            Ok(v) => self.vcpuids.lock().unwrap().push(v.id()),
+            Err(_) => self.shutdown.store(true, Ordering::Release),
         }
-        // Restore state instead of set_initial_state.
-        vcpu.restore_state(&vcpu_state)?;
-        self.run_loop(mpidr, vcpu)
+
+        // Barrier 1: every redistributor now exists (or someone failed).
+        let mut gic_err = None;
+        if barrier.wait().is_leader()
+            && !self.shutdown.load(Ordering::Acquire)
+            && let Some(blob) = gic_blob.as_ref()
+            && let Err(e) = hvf::gic::gic_restore(blob)
+        {
+            self.shutdown.store(true, Ordering::Release);
+            gic_err = Some(e);
+        }
+        // Barrier 2: GIC restore (if any) is complete before any register restore.
+        barrier.wait();
+
+        if self.shutdown.load(Ordering::Acquire) {
+            // Some thread failed creation or the GIC restore. Surface our own
+            // error; otherwise bail cleanly so the failing thread's error wins.
+            return match vcpu {
+                Err(e) => Err(e),
+                Ok(_) => gic_err.map_or(Ok(()), Err),
+            };
+        }
+
+        let vcpu = vcpu.expect("not shutdown implies every vcpu was created");
+        vcpu.restore_state(&cp.state)?;
+        self.run_loop(cp.mpidr, vcpu)
     }
 
     fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), hvf::Error> {
