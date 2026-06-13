@@ -157,3 +157,11 @@ effectively what Firecracker does):
 - No disk dirty-block tracking — full copy as today.
 - vsock full reconnect explicitly out of scope.
 - Multi-vCPU snapshot still out of scope.
+
+## Status: implemented 2026-06-13
+
+Delivered via plan `docs/superpowers/plans/2026-06-13-device-model-snapshot.md`.
+The `Vec<DeviceSpec>` was realized as `setup_devices(mode)` + a generic `place()`
+helper (see the plan's realization note). All devices round-trip full state; the
+restore-time `match rec.id` is gone. 119 workspace tests pass, clippy clean, live
+restore verified (idle ~0% CPU, responsive).
