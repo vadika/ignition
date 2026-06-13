@@ -9,8 +9,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use devices::bus::Bus;
-use hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
+use ignition_devices::bus::Bus;
+use ignition_hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
 use crate::snapshot::VcpuCheckpoint;
 
 /// Upper bound on an idle WFI/timer park (per-vCPU run loop).
@@ -45,7 +45,7 @@ pub struct VcpuManager {
     running: Mutex<HashSet<u64>>,
     /// Live hvf vCPU ids, registered before each vCPU's first run() for the shutdown broadcast.
     vcpuids: Mutex<Vec<u64>>,
-    threads: Mutex<Vec<JoinHandle<Result<(), hvf::Error>>>>,
+    threads: Mutex<Vec<JoinHandle<Result<(), ignition_hvf::Error>>>>,
     shutdown: AtomicBool,
     /// Set by `request_snapshot`; cleared by the leader inside `run_loop`.
     snapshot_req: AtomicBool,
@@ -57,7 +57,7 @@ pub struct VcpuManager {
     snap_barrier: Mutex<Option<Arc<Barrier>>>,
     /// Each participating vCPU thread pushes `(mpidr, save_state())` here; the
     /// leader drains it after the barrier.
-    collected: Mutex<Vec<(u64, Result<hvf::VcpuState, hvf::Error>)>>,
+    collected: Mutex<Vec<(u64, Result<ignition_hvf::VcpuState, ignition_hvf::Error>)>>,
     /// Installed by the boot harness before `run`; invoked on the leader thread.
     snapshot_handler: Option<SnapshotHandler>,
 }
@@ -127,7 +127,7 @@ impl VcpuManager {
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
         for id in ids {
-            let _ = hvf::vcpu_request_exit(id);
+            let _ = ignition_hvf::vcpu_request_exit(id);
         }
     }
 
@@ -157,7 +157,7 @@ impl VcpuManager {
     /// Spawn the primary vCPU (MPIDR 0) and block until every vCPU thread exits
     /// (guest PSCI SYSTEM_OFF, or all threads cancelled). Returns the first
     /// vCPU error, if any.
-    pub fn run(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), hvf::Error> {
+    pub fn run(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), ignition_hvf::Error> {
         let me = Arc::clone(self);
         let primary = thread::spawn(move || me.run_primary(entry, fdt_addr));
         self.threads.lock().unwrap().push(primary);
@@ -172,7 +172,7 @@ impl VcpuManager {
         self: &Arc<Self>,
         checkpoints: Vec<VcpuCheckpoint>,
         gic_blob: Option<Vec<u8>>,
-    ) -> Result<(), hvf::Error> {
+    ) -> Result<(), ignition_hvf::Error> {
         let barrier = Arc::new(Barrier::new(checkpoints.len()));
         let gic_blob = Arc::new(gic_blob);
         {
@@ -201,7 +201,7 @@ impl VcpuManager {
         cp: VcpuCheckpoint,
         barrier: Arc<Barrier>,
         gic_blob: Arc<Option<Vec<u8>>>,
-    ) -> Result<(), hvf::Error> {
+    ) -> Result<(), ignition_hvf::Error> {
         let vcpu = HvfVcpu::new(cp.mpidr, false);
         match &vcpu {
             Ok(v) => self.vcpuids.lock().unwrap().push(v.id()),
@@ -213,7 +213,7 @@ impl VcpuManager {
         if barrier.wait().is_leader()
             && !self.shutdown.load(Ordering::Acquire)
             && let Some(blob) = gic_blob.as_ref()
-            && let Err(e) = hvf::gic::gic_restore(blob)
+            && let Err(e) = ignition_hvf::gic::gic_restore(blob)
         {
             self.shutdown.store(true, Ordering::Release);
             gic_err = Some(e);
@@ -235,7 +235,7 @@ impl VcpuManager {
         self.run_loop(cp.mpidr, vcpu)
     }
 
-    fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), hvf::Error> {
+    fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), ignition_hvf::Error> {
         let mpidr = mpidr_for(0);
         self.running.lock().unwrap().insert(mpidr);
         let vcpu = HvfVcpu::new(mpidr, false)?;
@@ -244,7 +244,7 @@ impl VcpuManager {
         self.run_loop(mpidr, vcpu)
     }
 
-    fn run_secondary(self: &Arc<Self>, mpidr: u64, entry: u64, ctx: u64) -> Result<(), hvf::Error> {
+    fn run_secondary(self: &Arc<Self>, mpidr: u64, entry: u64, ctx: u64) -> Result<(), ignition_hvf::Error> {
         let vcpu = HvfVcpu::new(mpidr, false)?;
         // Register before the first run() so a shutdown broadcast reaches us.
         self.vcpuids.lock().unwrap().push(vcpu.id());
@@ -282,12 +282,12 @@ impl VcpuManager {
     fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for id in self.vcpuids.lock().unwrap().iter() {
-            let _ = hvf::vcpu_request_exit(*id);
+            let _ = ignition_hvf::vcpu_request_exit(*id);
         }
     }
 
     /// The shared per-vCPU run loop (primary and secondary).
-    fn run_loop(self: &Arc<Self>, mpidr: u64, mut vcpu: HvfVcpu) -> Result<(), hvf::Error> {
+    fn run_loop(self: &Arc<Self>, mpidr: u64, mut vcpu: HvfVcpu) -> Result<(), ignition_hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
         // Termination relies on this top-of-loop shutdown check, not the
         // vcpu_request_exit broadcast: the broadcast only interrupts a vcpu
@@ -383,7 +383,7 @@ impl VcpuManager {
 
     /// Join every spawned vCPU thread, draining the registry so threads spawned
     /// mid-run are still joined. Returns the first error.
-    fn join_all(&self) -> Result<(), hvf::Error> {
+    fn join_all(&self) -> Result<(), ignition_hvf::Error> {
         let mut result = Ok(());
         loop {
             let handle = self.threads.lock().unwrap().pop();

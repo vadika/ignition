@@ -3,11 +3,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use arch::aarch64::fdt::{FdtDevice, MmioDev};
-use devices::bus::{Bus, BusDevice};
-use devices::device::{DeviceMgrError, FdtKind, MmioDevice};
-use devices::virtio::IrqLine;
-use hvf::gic::HvfGicV3;
+use ignition_arch::aarch64::fdt::{FdtDevice, MmioDev};
+use ignition_devices::bus::{Bus, BusDevice};
+use ignition_devices::device::{DeviceMgrError, FdtKind, MmioDevice};
+use ignition_devices::virtio::IrqLine;
+use ignition_hvf::gic::HvfGicV3;
 
 /// Mints `IrqLine`s backed by the in-kernel GIC. INTID = SPI index + 32.
 struct GicIrq {

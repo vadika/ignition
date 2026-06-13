@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use devices::bus::Bus;
+use ignition_devices::bus::Bus;
 
-pub use hvf::{HvfVcpu, InterruptType, NoIrqVcpus, VcpuExit, Vcpus};
+pub use ignition_hvf::{HvfVcpu, InterruptType, NoIrqVcpus, VcpuExit, Vcpus};
 
 /// Upper bound on how long the run loop sleeps on an idle exit. Caps a large
 /// timer deadline so the loop stays responsive, and bounds the busy-wait on a
@@ -33,13 +33,13 @@ impl Vcpu {
     }
 
     /// Spawn the vCPU thread. The join handle resolves to `Ok(())` on guest
-    /// shutdown (PSCI SYSTEM_OFF) or vCPU cancel, or `Err(hvf::Error)` if an
+    /// shutdown (PSCI SYSTEM_OFF) or vCPU cancel, or `Err(ignition_hvf::Error)` if an
     /// HVF call failed — in which case the VM should be torn down.
-    pub fn start(self) -> JoinHandle<Result<(), hvf::Error>> {
+    pub fn start(self) -> JoinHandle<Result<(), ignition_hvf::Error>> {
         thread::spawn(move || self.run())
     }
 
-    fn run(self) -> Result<(), hvf::Error> {
+    fn run(self) -> Result<(), ignition_hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
 
         // Thread-affine: create the vCPU here, not in `new`.

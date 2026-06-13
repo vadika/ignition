@@ -47,32 +47,31 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   reset, virtio-net link-bounce re-init). `--net` and `--smp N` combine (`sudo`).
 
 The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
-load-bearing layer; the `hvf-spike` smoke test still exercises it in isolation
-(`cargo run -p hvf-spike` after signing).
+load-bearing layer; the `ignition-spike` smoke test still exercises it in isolation
+(`cargo run -p ignition-spike` after signing).
 
 ## Layout
 
 ```
 crates/
-  arch/      ignition-arch  (lib `arch`)  — aarch64 sysreg tables; FDT/boot regs later
-  hvf/       ignition-hvf   (lib `hvf`)   — Hypervisor.framework backend, lifted from libkrun then reworked
-  devices/   ignition-devices             — serial/virtio/GIC (Phase 1)
-  vmm/       ignition-vmm   (lib `vmm`)   — vstate seam (HVF replacement for FC kvm/vm/vcpu)
-spike/       hvf-spike                     — smoke test for the hvf crate
+  arch/      ignition-arch  (lib `ignition_arch`)  — aarch64 sysreg tables; FDT/boot regs later
+  hvf/       ignition-hvf   (lib `ignition_hvf`)   — Hypervisor.framework backend, lifted from libkrun then reworked
+  devices/   ignition-devices (lib `ignition_devices`) — serial/virtio/GIC (Phase 1)
+  vmm/       ignition-vmm   (lib `ignition_vmm`)   — vstate seam (HVF replacement for FC kvm/vm/vcpu)
+spike/       ignition-spike                         — smoke test for the hvf crate
 refs/        libkrun + firecracker clones (gitignored, reference only)
-scripts/     sign.sh                       — ad-hoc codesign with hypervisor entitlement
+scripts/     sign.sh                                — ad-hoc codesign with hypervisor entitlement
 ```
 
-Crate lib names (`arch`, `hvf`, `vmm`) match libkrun's so lifted modules compile
-with zero import edits.
+Crate lib names are `ignition_*`; the `hvf` crate was lifted from libkrun and then reworked, so imports were updated accordingly.
 
 ## Build & run
 
 ```sh
 cargo build
 # binaries need the hypervisor entitlement before they can call hv_vm_create:
-scripts/sign.sh target/debug/hvf-spike
-target/debug/hvf-spike
+scripts/sign.sh target/debug/ignition-spike
+target/debug/ignition-spike
 ```
 
 Requires: Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024).
@@ -84,7 +83,7 @@ interactive 16550 console. **Re-sign after every build** — relinking strips th
 hypervisor entitlement.
 
 ```sh
-cargo build -p hvf-spike --bin boot
+cargo build -p ignition-spike --bin boot
 scripts/sign.sh target/debug/boot
 
 # boot to a shell (log in as root); console keys: Ctrl-A s = snapshot, Ctrl-A x = quit

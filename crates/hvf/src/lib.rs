@@ -118,7 +118,7 @@ pub struct VcpuState {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
+use ignition_arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
 
 unsafe extern "C" {

@@ -3,7 +3,7 @@
 // reaches our 16550 on host stdout.
 //
 // MUST be codesigned with the hypervisor entitlement before running:
-//   cargo build -p hvf-spike --bin boot
+//   cargo build -p ignition-spike --bin boot
 //   scripts/sign.sh target/debug/boot
 //   target/debug/boot <kernel-Image> [rootfs-disk]
 //
@@ -15,24 +15,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
-use arch::aarch64::fdt::{self, FdtConfig};
-use arch::aarch64::{kernel, layout};
-use devices::boot_timer::BootTimer;
-use devices::rtc::Pl031;
-use devices::serial::Serial;
-use devices::virtio::balloon::Balloon;
-use devices::virtio::blk::VirtioBlk;
-use devices::virtio::guest_ram::GuestRam;
-use devices::virtio::mmio::VirtioMmio;
-use devices::virtio::net::VirtioNet;
-use devices::virtio::rng::VirtioRng;
-use devices::virtio::vsock::VsockDevice;
+use ignition_arch::aarch64::fdt::{self, FdtConfig};
+use ignition_arch::aarch64::{kernel, layout};
+use ignition_devices::boot_timer::BootTimer;
+use ignition_devices::rtc::Pl031;
+use ignition_devices::serial::Serial;
+use ignition_devices::virtio::balloon::Balloon;
+use ignition_devices::virtio::blk::VirtioBlk;
+use ignition_devices::virtio::guest_ram::GuestRam;
+use ignition_devices::virtio::mmio::VirtioMmio;
+use ignition_devices::virtio::net::VirtioNet;
+use ignition_devices::virtio::rng::VirtioRng;
+use ignition_devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use hvf::gic::HvfGicV3;
-use vmm::device_manager::{DeviceManager, DeviceRecord};
-use vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
-use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
-use vmm::vstate::hvf_vm::Vm;
+use ignition_hvf::gic::HvfGicV3;
+use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
+use ignition_vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
+use ignition_vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
+use ignition_vmm::vstate::hvf_vm::Vm;
 
 const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
 
@@ -158,9 +158,9 @@ impl Drop for TermiosGuard {
 fn spawn_stdin_reader(
     serial: Arc<Mutex<Serial<FlushWriter>>>,
     saved_termios: Option<libc::termios>,
-    manager: Arc<vmm::vstate::vcpu_manager::VcpuManager>,
+    manager: Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>,
     balloon_target: Arc<AtomicU32>,
-    balloon: Arc<Mutex<devices::virtio::mmio::VirtioMmio>>,
+    balloon: Arc<Mutex<ignition_devices::virtio::mmio::VirtioMmio>>,
 ) {
     // Detached: the reader lives for the process lifetime.
     std::thread::spawn(move || {
@@ -217,7 +217,7 @@ fn spawn_stdin_reader(
 
 /// Poll the vsock device's host connection fds and drive RX. A 200 ms timeout also
 /// re-checks for newly-connected fds (TX adds connections between ticks).
-fn spawn_vsock_reactor(vsock: Arc<Mutex<devices::virtio::mmio::VirtioMmio>>) {
+fn spawn_vsock_reactor(vsock: Arc<Mutex<ignition_devices::virtio::mmio::VirtioMmio>>) {
     use std::os::unix::io::RawFd;
     std::thread::spawn(move || loop {
         let fds: Vec<RawFd> = { vsock.lock().unwrap().vsock_poll_set() };
@@ -306,8 +306,8 @@ fn place<D, F>(
     build: F,
 ) -> io::Result<Option<Arc<Mutex<D>>>>
 where
-    D: devices::device::MmioDevice + 'static,
-    F: FnOnce(Arc<dyn devices::virtio::IrqLine>) -> D,
+    D: ignition_devices::device::MmioDevice + 'static,
+    F: FnOnce(Arc<dyn ignition_devices::virtio::IrqLine>) -> D,
 {
     match mode {
         Mode::Boot => Ok(Some(mgr.add(window, build).map_err(io::Error::other)?)),
@@ -845,8 +845,8 @@ mod tests {
 
     #[test]
     fn check_known_ids_accepts_known_and_rejects_unknown() {
-        use vmm::device_manager::DeviceRecord;
-        use devices::device::FdtKind;
+        use ignition_vmm::device_manager::DeviceRecord;
+        use ignition_devices::device::FdtKind;
         let rec = |id: &str| DeviceRecord {
             id: id.into(), base: 0, size: 0x200, spi: 0,
             fdt_kind: FdtKind::VirtioMmio, state: serde_json::Value::Null,

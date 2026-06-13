@@ -6,7 +6,7 @@ description = "Device models for ignition: serial, virtio-blk/net/vsock, GIC (WI
 license = "Apache-2.0"
 
 [lib]
-name = "devices"
+name = "ignition_devices"
 path = "src/lib.rs"
 
 [dependencies]

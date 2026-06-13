@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use hvf::{HvfVcpu, HvfVm, Vcpus, VcpuExit};
+use ignition_hvf::{HvfVcpu, HvfVm, Vcpus, VcpuExit};
 
 // Guest physical memory layout.
 const GUEST_RAM_BASE: u64 = 0x4000_0000;
