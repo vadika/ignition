@@ -102,10 +102,13 @@ Add fields the run loop can set: `dirty_tracking: bool`, `ram_base: u64`, `ram_s
 At the top of `EC_DATAABORT` (before the existing MMIO decode that sets `pending_advance_pc`):
 ```rust
 let pa = self.vcpu_exit.exception.physical_address;
-let dfsc = syndrome & 0x3f;
-let is_perm_fault = (dfsc & 0x3c) == 0x0c; // DFSC 0b0011xx = permission fault
+let iswrite = ((syndrome >> 6) & 1) != 0; // ISS WnR bit
+// GATE FINDING (Task 1): HVF reports write-protect faults as TRANSLATION faults
+// (DFSC 0x07/0x0f), NOT permission faults — so do NOT key on a DFSC sub-code.
+// Discriminate on: write data abort whose IPA is inside the RAM region. MMIO
+// accesses have pa outside RAM; unprotected RAM accesses don't fault at all.
 if self.dirty_tracking
-    && is_perm_fault
+    && iswrite
     && pa >= self.ram_base
     && pa < self.ram_base + self.ram_size
 {

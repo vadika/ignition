@@ -74,9 +74,13 @@ shelve the feature). Spike code is deleted after the gate; it is not the feature
 
   ```
   let pa = exception.physical_address;
-  let dfsc = syndrome & 0x3f;                       // ISS[5:0]
-  let is_permission_fault = (dfsc & 0x3c) == 0x0c;  // 0b0011xx
-  if dirty_tracking_enabled && is_permission_fault && pa in [RAM_BASE, RAM_BASE+ram_size) {
+  let iswrite = ((syndrome >> 6) & 1) != 0;          // ISS WnR bit
+  // GATE FINDING: HVF reports write-protect faults as TRANSLATION faults
+  // (DFSC 0x07 first-touch / 0x0f PTE-present), NOT permission faults. So we
+  // discriminate on iswrite + IPA-in-RAM, NOT on a DFSC sub-code. A genuine MMIO
+  // access has pa outside the RAM range; a normal RAM read/write to an unprotected
+  // page does not fault. Only a write to a write-protected RAM page lands here.
+  if dirty_tracking_enabled && iswrite && pa >= RAM_BASE && pa < RAM_BASE + ram_size {
       return Ok(VcpuExit::DirtyFault(pa));           // new exit variant
       // NOTE: do NOT set pending_advance_pc — the store must re-execute.
   }
