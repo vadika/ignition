@@ -6,6 +6,10 @@ use super::queue::Virtqueue;
 
 /// Feature bit: the device exposes a MAC in config space.
 pub const VIRTIO_NET_F_MAC: u32 = 5;
+/// Feature bit: the device exposes a link-status word in config space.
+pub const VIRTIO_NET_F_STATUS: u32 = 16;
+/// config.status bit 0: link is up (VIRTIO_NET_S_LINK_UP).
+const VIRTIO_NET_S_LINK_UP: u16 = 1;
 
 const DEVICE_ID_NET: u32 = 1;
 /// `struct virtio_net_hdr` size with num_buffers (virtio 1.0 §5.1.6).
@@ -23,16 +27,23 @@ pub struct VirtioNet<B: NetBackend> {
     backend: B,
     mac: [u8; 6],
     dropped_rx: u64,
+    link_up: bool,
 }
 
 impl<B: NetBackend> VirtioNet<B> {
     pub fn new(backend: B) -> Self {
         let mac = backend.mac();
-        Self { backend, mac, dropped_rx: 0 }
+        Self { backend, mac, dropped_rx: 0, link_up: true }
     }
 
     pub fn dropped_rx(&self) -> u64 {
         self.dropped_rx
+    }
+
+    /// Set the reported link state (config.status LINK_UP). The transport raises a
+    /// config-change interrupt so the guest re-reads status (carrier on/off).
+    pub fn set_link(&mut self, up: bool) {
+        self.link_up = up;
     }
 
     /// Drain the TX queue: strip the 12-byte header, send each frame.
@@ -75,16 +86,15 @@ impl<B: NetBackend> VirtioDevice for VirtioNet<B> {
         DEVICE_ID_NET
     }
     fn device_features(&self, sel: u32) -> u32 {
-        if sel == 0 { 1 << VIRTIO_NET_F_MAC } else { 0 }
+        if sel == 0 { (1 << VIRTIO_NET_F_MAC) | (1 << VIRTIO_NET_F_STATUS) } else { 0 }
     }
     fn config_read(&self, offset: u64, data: &mut [u8]) {
         // virtio-net config: bytes 0..6 = MAC, 6..8 = status. The Linux driver
         // reads the MAC byte-by-byte, so serve any width from this 8-byte image.
         let mut cfg = [0u8; 8];
         cfg[..6].copy_from_slice(&self.mac);
-        // VIRTIO_NET_S_LINK_UP (1) — only read if F_STATUS is negotiated (it isn't);
-        // harmless to expose.
-        cfg[6] = 1;
+        let status: u16 = if self.link_up { VIRTIO_NET_S_LINK_UP } else { 0 };
+        cfg[6..8].copy_from_slice(&status.to_le_bytes());
         let off = offset as usize;
         for (i, b) in data.iter_mut().enumerate() {
             *b = cfg.get(off + i).copied().unwrap_or(0);
@@ -100,6 +110,10 @@ impl<B: NetBackend> VirtioDevice for VirtioNet<B> {
             _ => false,
         }
     }
+    fn set_link(&mut self, up: bool) {
+        VirtioNet::set_link(self, up);
+    }
+
     fn inject_rx(&mut self, vq: &mut Virtqueue, mem: &GuestRam, frame: &[u8]) -> bool {
         let Some(chain) = vq.pop_avail(mem) else {
             self.dropped_rx += 1;
@@ -233,6 +247,21 @@ mod tests {
         // used.len = hdr + frame = 15.
         assert_eq!(m.read_u32(used + 8), Some(15));
         assert_eq!(m.read_u16(used + 2), Some(1));
+    }
+
+    #[test]
+    fn status_feature_negotiated_and_link_reported() {
+        let mut net = VirtioNet::new(FakeBackend::default());
+        assert_ne!(net.device_features(0) & (1 << VIRTIO_NET_F_STATUS), 0);
+        let mut st = [0u8; 2];
+        net.config_read(6, &mut st);
+        assert_eq!(st[0] & 1, 1);
+        net.set_link(false);
+        net.config_read(6, &mut st);
+        assert_eq!(st[0] & 1, 0);
+        net.set_link(true);
+        net.config_read(6, &mut st);
+        assert_eq!(st[0] & 1, 1);
     }
 
     #[test]
