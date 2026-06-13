@@ -47,24 +47,35 @@ impl VsockDevice {
         serviced
     }
 
-    fn write_rx(chain_addr: u64, chain_cap: usize, mem: &GuestRam, pkt: &RxPacket) -> u32 {
+    /// Lay the 44-byte header + payload across the chain's writable descriptors in
+    /// order. The Linux virtio_vsock driver posts each RX buffer as TWO descriptors
+    /// (a header desc + a data desc), so the payload must spill into the second
+    /// descriptor rather than being truncated into the first. Returns bytes written.
+    fn write_rx(chain: &crate::virtio::queue::DescChain, mem: &GuestRam, pkt: &RxPacket) -> u32 {
         let mut buf = pkt.hdr.to_bytes().to_vec();
         buf.extend_from_slice(&pkt.data);
-        let n = std::cmp::min(buf.len(), chain_cap);
-        mem.write_slice(chain_addr, &buf[..n]);
-        n as u32
+        let mut written = 0usize;
+        for d in chain.descriptors.iter().filter(|d| d.writable) {
+            if written >= buf.len() {
+                break;
+            }
+            let take = std::cmp::min(d.len as usize, buf.len() - written);
+            mem.write_slice(d.addr, &buf[written..written + take]);
+            written += take;
+        }
+        written as u32
     }
 
     fn fill_guest_rx(&mut self, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
         let mut delivered = false;
         while self.muxer.rx_pending() {
             let Some(chain) = vq.pop_avail(mem) else { break };
-            let Some(d) = chain.descriptors.iter().find(|d| d.writable) else {
+            if !chain.descriptors.iter().any(|d| d.writable) {
                 vq.push_used(mem, chain.head, 0);
                 continue;
-            };
+            }
             let pkt = self.muxer.pop_rx().unwrap();
-            let len = Self::write_rx(d.addr, d.len as usize, mem, &pkt);
+            let len = Self::write_rx(&chain, mem, &pkt);
             vq.push_used(mem, chain.head, len);
             delivered = true;
         }
