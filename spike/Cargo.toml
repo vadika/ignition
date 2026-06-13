@@ -8,6 +8,10 @@ description = "ignition microVM boot binary (macOS/HVF)"
 name = "boot"
 path = "src/bin/boot.rs"
 
+[[bin]]
+name = "dirty_gate"
+path = "src/bin/dirty_gate.rs"
+
 [dependencies]
 ignition_hvf = { package = "ignition-hvf", path = "../crates/hvf" }
 log = "0.4"
