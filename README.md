@@ -16,6 +16,8 @@ for the source analysis, and `docs/SPIKE_RESULTS.md` for the validation spike.
 
 ## Status: boots Linux to a shell, with snapshot/restore
 
+See `ROADMAP.md` for the full feature roadmap and progress tracking.
+
 Validated end-to-end on macOS 26.5 / Apple Silicon. Working today (each with a
 spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
 
