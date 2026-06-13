@@ -5,6 +5,15 @@ rootfs, single vCPU, **512 MiB RAM**, 16 KiB guest pages. Numbers are the **medi
 of 3 runs** unless noted, with min/max in parentheses. Harness:
 `scripts/diff_snapshot_bench.py` (pty console driving, `time.monotonic()` clocks).
 
+> **Power state: the headline tables below were measured on battery.** A full
+> re-measurement on **AC power** (`pmset -g batt` = "AC Power"; `pmset -g therm`
+> reported no thermal/performance warnings) reproduced the same medians within
+> run-to-run noise — every metric inside ±~10 %, and the prime suspects (dd write
+> throughput, snapshot-write time) did **not** improve on AC. So on this host the
+> power source did **not** materially affect these metrics. See
+> ["Re-measured on AC power"](#re-measured-on-ac-power) at the end for the
+> side-by-side. The numbers in the tables stand as-is.
+
 > **Debug build.** All headline numbers are an **unoptimized `target/debug/boot`**
 > (`cargo build` with no `--release`). A release data point is included at the end —
 > and, perhaps surprisingly, **release is within noise of debug** for these metrics:
@@ -148,6 +157,59 @@ boot/restore/snapshot-write metrics the debug-build caveat is largely moot. (A
 CPU-bound VMM path — e.g. a huge diff pack or page scan — would still benefit from
 `--release`; these workloads just aren't CPU-bound in the VMM.)
 
+## Re-measured on AC power
+
+The headline tables above were taken on **battery**, which can throttle the CPU.
+To check whether that biased the numbers, the full suite was re-run with identical
+parameters (`--mem 512`, n=3, same throwaway `vmstore-bench/` store) on **AC power**
+— `pmset -g batt` → "Now drawing from 'AC Power'", `pmset -g therm` → no thermal or
+performance warning recorded. Same debug build, same host, same day.
+
+**Result: within noise of the battery run. Power source did not materially affect
+these metrics on this host.** Side-by-side medians (n=3 each):
+
+| Metric | Battery median | AC median | Δ | Δ % | Moved >10 %? |
+|--------|---------------:|----------:|--:|----:|:------------:|
+| `Guest-boot-time` untracked | 202 ms | 213 ms (208–224) | +11 ms | +5 % | no |
+| boot wall untracked | 1241 ms | 1254 ms (1249–1608) | +13 ms | +1 % | no |
+| dd 64 MiB untracked | 2100 MB/s | 2000 MB/s (2000–2100) | −100 MB/s | −5 % | no |
+| dd 64 MiB `--track-dirty` | 1500 MB/s | 1500 MB/s (1400–1700) | 0 | 0 % | no |
+| Full snapshot write | 317 ms | 350 ms (327–359) | +33 ms | +10 % | borderline† |
+| Diff write (8 MiB) | 339 ms | 339 ms (336–340) | 0 | 0 % | no |
+| Diff write (64 MiB) | 372 ms | 388 ms (356–391) | +16 ms | +4 % | no |
+| Restore Full (internal) | 245 ms | 239 ms (238–247) | −6 ms | −2 % | no |
+| Restore Full (wall) | 257 ms | 257 ms (256–257) | 0 | 0 % | no |
+| Restore golden+1 (internal) | 243 ms | 243 ms (241–245) | 0 | 0 % | no |
+| Restore golden+3 (internal) | 242 ms | 244 ms (242–245) | +2 ms | +1 % | no |
+| Diff `memory.bin` (d1) | 14.79 MB | 14.88 MB (908 pages) | +0.09 MB | +1 % | no |
+
+† The Full-write +10 % (317 → 350 ms) is at the noise floor, not in AC's favor — AC
+was *slower* here, the opposite of a CPU-throttle story. The AC spread (327–359 ms)
+overlaps the battery band, so this is run-to-run jitter on the snapshot fixed-cost
+floor (quiesce + GIC + device serialize + RAM re-protect), not a power effect.
+
+**Tracked-boot was excluded from the table** because both runs are dominated by a
+cold-start outlier in the first `--track-dirty` boot (write-protect arming), and the
+median lands on different samples run-to-run. Battery medians were 214 ms / 1256 ms
+(steady samples ~211–214 / ~1254–1256, one 584 / 1624 outlier); AC's steady samples
+were ~230 ms / ~1274 ms with two slow 606–608 / 1645–1652 cold samples, so AC's
+*median* fell on the outlier (606 / 1645 ms). Comparing **steady-state** tracked
+boots (AC ~230/1274 vs battery ~211–214/1254–1256) the gap is ≤20 ms — same noise
+regime as the untracked column. This is a cold-cache/arming artifact, not throttling.
+
+**The two metrics most likely to move on AC — dd write throughput and the per-page
+fault tax — did not.** dd untracked was if anything *lower* on AC (2000 vs 2100 MB/s,
+−5 %, inside the documented wide tmpfs spread), and tracked dd was identical at the
+median (1500 MB/s). The first-touch write-protect fault tax is a per-page guest/HVF
+cost, not a CPU-clock-bound one, so AC's higher sustained clock buys nothing here.
+Boot and restore are guest- and I/O-bound and stayed flat as expected.
+
+Net: **the LinkedIn-article headline numbers all still hold on AC** — diff ~14.5–14.9
+MB / ~35× smaller, ~12 ms tracked-boot tax (steady-state), ~28 % first-touch
+write-throughput tax (median; noisy band, reconfirmed), ~340 ms diff vs ~317–350 ms
+full write, and ~240–245 ms flat restore across chain depth. No revision needed for
+the power state.
+
 ## Methodology & caveats
 
 - **Harness:** `scripts/diff_snapshot_bench.py`, driving `boot` over a pty exactly as
@@ -155,6 +217,11 @@ CPU-bound VMM path — e.g. a huge diff pack or page scan — would still benefi
   snapshot escape, root login with no password, and paced (≤8-byte) keystroke bursts
   because the guest UART RX FIFO is only 16 bytes. Throwaway store `vmstore-bench/`
   (gitignored), removed at start and end.
+- **Power state.** Headline tables: **battery**. Full re-run on **AC power** (verified
+  via `pmset -g batt`/`pmset -g therm`, no thermal/perf warnings) reproduced every
+  metric within noise — see ["Re-measured on AC power"](#re-measured-on-ac-power). On
+  this host the power source did not materially change boot, dd throughput, snapshot
+  write, or restore.
 - **Diff chains are built by restore-then-resnapshot.** A single process cannot diff
   against itself (one `write_name` per process + the same-name-as-parent guard), so
   each diff layer is produced by restoring its parent with `--track-dirty --name <new>`,
