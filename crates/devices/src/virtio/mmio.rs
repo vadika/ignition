@@ -55,6 +55,9 @@ pub trait VirtioDevice: Send {
         Vec::new()
     }
 
+    /// Set link state for devices that have one (virtio-net). Default: no-op.
+    fn set_link(&mut self, _up: bool) {}
+
     /// Serialize device-specific state for a snapshot. Default: stateless (Null).
     fn save(&self) -> serde_json::Value {
         serde_json::Value::Null
@@ -302,6 +305,13 @@ impl VirtioMmio {
     pub fn signal_config_change(&mut self) {
         self.interrupt_status |= INT_STATUS_CONFIG;
         self.irq.set_spi(true);
+    }
+
+    /// Flip the inner net device's link state and raise a config-change interrupt
+    /// so the guest re-reads config.status (carrier off/on). No-op for non-net.
+    pub fn net_set_link(&mut self, up: bool) {
+        self.dev.set_link(up);
+        self.signal_config_change();
     }
 
     /// Capture the transport register + queue state for snapshot.
@@ -691,6 +701,25 @@ mod tests {
         let mut b = VirtioMmio::new("mock", Box::new(StatefulMock { counter: 0 }), mem2, irq);
         b.restore(&saved).expect("restore ok");
         assert_eq!(b.save(), saved, "inner device counter must survive save/restore");
+    }
+
+    #[test]
+    fn net_set_link_raises_config_change() {
+        struct LinkMock { up: bool }
+        impl VirtioDevice for LinkMock {
+            fn device_id(&self) -> u32 { 1 }
+            fn device_features(&self, _s: u32) -> u32 { 0 }
+            fn config_read(&self, _o: u64, d: &mut [u8]) { d.fill(0); }
+            fn queue_count(&self) -> usize { 2 }
+            fn handle_notify(&mut self, _q: usize, _vq: &mut Virtqueue, _m: &GuestRam) -> bool { false }
+            fn set_link(&mut self, up: bool) { self.up = up; }
+        }
+        let mem = GuestRam::new(std::ptr::null_mut(), 0, 0);
+        let irq: Arc<dyn IrqLine> = Arc::new(crate::virtio::NoopIrq);
+        let mut t = VirtioMmio::new("virtio-net", Box::new(LinkMock { up: true }), mem, irq);
+        t.net_set_link(false);
+        let saved = t.save_state();
+        assert_ne!(saved.interrupt_status & 2, 0, "config-change interrupt must be raised");
     }
 
     #[test]

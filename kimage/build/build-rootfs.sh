@@ -54,6 +54,32 @@ docker run --platform linux/arm64 --name fcroot_build \
   # Uses /usr/bin/devmem (compiled above) + kernel CONFIG_DEVMEM=y, STRICT_DEVMEM=n.
   printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
   chmod +x /etc/local.d/boottime.start
+
+  # Net re-init on snapshot restore: a restore starts a fresh vmnet interface
+  # (new MAC) and the VMM bounces the virtio-net link down->up. This busybox
+  # poller sees the carrier down->up edge, rebinds virtio_net so it re-reads the
+  # new MAC, then re-DHCPs. Pure busybox (no udev in this image). The rebind
+  # itself flaps the carrier, so a cooldown after acting avoids a rebind loop.
+  # (Verified by the vmnet-snapshot spike: rebind adopts the new MAC, ifup leases.)
+  cat > /etc/local.d/netwatch.start <<'"'"'NETEOF'"'"'
+#!/bin/sh
+( prev=1
+  while :; do
+    cur=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
+    if [ "$prev" = 0 ] && [ "$cur" = 1 ]; then
+      d=$(basename "$(readlink /sys/class/net/eth0/device)")
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+      ifdown eth0 2>/dev/null; ifup eth0
+      sleep 5          # cooldown: ignore the rebind-induced carrier flap
+      prev=1
+      continue
+    fi
+    prev=$cur
+    sleep 1
+  done ) &
+NETEOF
+  chmod +x /etc/local.d/netwatch.start
   rc-update add local boot
 '
 
