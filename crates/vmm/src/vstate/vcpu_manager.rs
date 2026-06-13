@@ -343,6 +343,12 @@ impl VcpuManager {
                     if let Some(cfg) = &dirty {
                         cfg.tracker.mark(pa);
                         let page_base = pa & !((PAGE as u64) - 1);
+                        // Re-granting WRITE on a page that is already mapped in
+                        // the guest must never fail; if it does, the stage-2
+                        // tables are inconsistent and resuming would loop-fault
+                        // forever. Treat it as a fatal invariant violation and
+                        // abort loudly rather than letting `?` silently kill this
+                        // one vCPU thread while the others keep running.
                         ignition_hvf::vm_protect_memory(
                             page_base,
                             PAGE as u64,
@@ -350,7 +356,8 @@ impl VcpuManager {
                                 | ignition_hvf::bindings::HV_MEMORY_WRITE
                                 | ignition_hvf::bindings::HV_MEMORY_EXEC)
                                 as u64,
-                        )?;
+                        )
+                        .expect("dirty-tracking re-grant of guest page failed");
                     } else {
                         log::warn!("DirtyFault at {pa:#x} but dirty tracking is not armed");
                     }

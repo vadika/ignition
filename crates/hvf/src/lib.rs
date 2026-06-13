@@ -21,7 +21,7 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 /// The sysregs captured for snapshot/restore (EL1 guest-resume set + the EL2 regs
@@ -295,7 +295,16 @@ impl Vcpus for NoIrqVcpus {
 /// calls this to re-grant WRITE on a faulting page. `flags` is a bitwise-or of
 /// `HV_MEMORY_READ`/`HV_MEMORY_WRITE`/`HV_MEMORY_EXEC`; `guest_addr` must be
 /// page-aligned and `size` a page multiple.
+/// Serializes `hv_vm_protect`. The HVF VM is a per-process singleton and
+/// `hv_vm_protect` mutates its stage-2 page tables VM-wide; Apple does not
+/// document it as safe for concurrent calls. With multiple vCPU threads under
+/// `--track-dirty`, each first-write-per-page fault re-grants WRITE on its own
+/// page concurrently, so we hold this lock across the call. It is taken only on
+/// first-write faults (~5µs each), so contention is negligible.
+static PROTECT_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn vm_protect_memory(guest_addr: u64, size: u64, flags: u64) -> Result<(), Error> {
+    let _guard = PROTECT_LOCK.lock().unwrap();
     let ret = unsafe { hv_vm_protect(guest_addr, size.try_into().unwrap(), flags as hv_memory_flags_t) };
     if ret != HV_SUCCESS {
         Err(Error::MemoryProtect)
