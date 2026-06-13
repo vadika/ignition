@@ -165,6 +165,15 @@ CPU_ON is in flight. Mid-boot snapshot is explicitly not guaranteed.
   `restore_smp_test.py`) to boot `--smp 4`, snapshot, restore, assert responsive
   and `nproc` == 4.
 
+## Status: implemented 2026-06-13
+
+Via plan `docs/superpowers/plans/2026-06-13-multi-vcpu-snapshot.md`. Schema
+(`Vec<VcpuCheckpoint>`), the stop-the-world snapshot rendezvous, the two-barrier
+restore, and the boot wiring (gates dropped) are in. **Live test PASSED**
+(`scripts/restore_smp_test.py`): `--smp 4` boot → `Ctrl-A s` → `--restore`
+recreated all four cores at their saved PCs — restored guest reports `nproc == 4`,
+idles at ~0.3% CPU, and stays responsive. 124 unit tests pass, clippy clean.
+
 ## Scope / YAGNI
 
 - Multi-vCPU snapshot for all `smp`, including `--net` (still requires `sudo` for
