@@ -2,11 +2,7 @@
 name = "ignition-spike"
 version = "0.1.0"
 edition = "2024"
-description = "Smoke test: boot a minimal guest on the ignition hvf crate (macOS/HVF)"
-
-[[bin]]
-name = "ignition-spike"
-path = "src/main.rs"
+description = "ignition microVM boot binary (macOS/HVF)"
 
 [[bin]]
 name = "boot"

@@ -1,5 +1,12 @@
 # Validation Spike Results
 
+> **Status (2026-06): historical record of the initial validation spike.** Accurate for
+> that moment. Since then the spike binary (`hvf-spike`, later `ignition-spike`) was
+> **removed** — its hvf-crate coverage is subsumed by the `boot` binary and the crate
+> tests; the lifted code now lives in the `crates/` workspace and signing is `scripts/sign.sh`.
+> Kept as the "proved it compiles + runs on macOS 26" milestone; the repro block below is
+> retained verbatim and no longer runs as-is.
+
 Date: 2026-06-12. Machine: Apple Silicon, macOS 26.5.1 (build 25F80), arm64.
 Toolchain: rustc/cargo 1.96.0 (Homebrew). SDK: MacOSX 26.5 (Xcode).
 

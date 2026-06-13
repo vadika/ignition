@@ -1,5 +1,9 @@
 # SMP (multi-vCPU) milestone — DONE
 
+> **Status note (2026-06):** the two follow-ups listed at the end of this doc (unknown-PSCI-fn
+> panic; `NoIrqVcpus` duplication) are RESOLVED — see `docs/phase1-followups.md` (commits
+> 6c4d676, 7e1e73d).
+
 Date: 2026-06-12. Status: **complete, verified.** ignition/HVF boots a real aarch64
 Linux with N vCPUs; all cores come online via PSCI `CPU_ON`, schedule work, and
 stop cleanly on PSCI `SYSTEM_OFF`.

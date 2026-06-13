@@ -1,5 +1,11 @@
 # ignition benchmarks — boot & restore latency
 
+> **Status note (2026-06): numbers predate the fast-restore work.** Restore latency here was
+> measured with eager `read(memory.bin)`; restore now uses clonefile + `mmap(MAP_SHARED)`
+> (lazy, immutable base) and is materially faster — these figures are pre-fast-restore.
+> The `--store`/`--name` store convention, multi-vCPU snapshot, and re-snapshot post-date this
+> doc.
+
 Date: 2026-06-13. Host: Apple Silicon, macOS 26.5. Guest: aarch64 Linux 6.1
 (Firecracker CI microvm config + virtio-balloon/vsock/devmem), Alpine 3.19 busybox
 rootfs, single vCPU, 512 MiB RAM. Warm page cache. `n = 6` (`scripts/benchmark.py 6`).
@@ -81,7 +87,7 @@ For restore there is a third clock:
 ## Reproduce
 
 ```sh
-cargo build -p hvf-spike --bin boot && scripts/sign.sh target/debug/boot
+cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
 python3 scripts/benchmark.py 6      # both fresh-boot methods + restore
 # component scripts:
 python3 scripts/boot_vs_restore_timing.py   # launch -> running, phased

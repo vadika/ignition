@@ -2,7 +2,7 @@
 
 Status: approved design, pre-implementation.
 Date: 2026-06-12.
-Project: ignition (Firecracker → macOS/HVF fork). See `HANDOFF.md`, `SPIKE_RESULTS.md`.
+Project: ignition (Firecracker → macOS/HVF fork). See `docs/HANDOFF.md`, `docs/SPIKE_RESULTS.md`.
 
 ## Goal
 

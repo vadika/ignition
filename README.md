@@ -11,8 +11,8 @@ The one genuinely lifted piece is the HVF backend — the `hvf` crate, taken fro
 [libkrun](https://github.com/containers/libkrun) (Red Hat, Apache-2.0; itself
 Firecracker-inspired) and then substantially reworked here (direct `hv_gic_*`,
 SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
-harness — is original. See `HANDOFF.md` and `firecracker-hvf-porting-map.md` for
-the source analysis, and `SPIKE_RESULTS.md` for the validation spike.
+harness — is original. See `docs/HANDOFF.md` and `docs/firecracker-hvf-porting-map.md`
+for the source analysis, and `docs/SPIKE_RESULTS.md` for the validation spike.
 
 ## Status: boots Linux to a shell, with snapshot/restore
 
@@ -49,8 +49,7 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   reset, virtio-net link-bounce re-init). `--net` and `--smp N` combine (`sudo`).
 
 The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
-load-bearing layer; the `ignition-spike` smoke test still exercises it in isolation
-(`cargo run -p ignition-spike` after signing).
+load-bearing layer, exercised end-to-end by the `boot` binary and the crate tests.
 
 ## Layout
 
@@ -60,7 +59,7 @@ crates/
   hvf/       ignition-hvf   (lib `ignition_hvf`)   — Hypervisor.framework backend, lifted from libkrun then reworked
   devices/   ignition-devices (lib `ignition_devices`) — serial/virtio/GIC (Phase 1)
   vmm/       ignition-vmm   (lib `ignition_vmm`)   — vstate seam (HVF replacement for FC kvm/vm/vcpu)
-spike/       ignition-spike                         — smoke test for the hvf crate
+spike/       ignition-spike                         — the `boot` binary (interactive microVM)
 refs/        libkrun + firecracker clones (gitignored, reference only)
 scripts/     sign.sh                                — ad-hoc codesign with hypervisor entitlement
 ```
@@ -71,9 +70,10 @@ Crate lib names are `ignition_*`; the `hvf` crate was lifted from libkrun and th
 
 ```sh
 cargo build
-# binaries need the hypervisor entitlement before they can call hv_vm_create:
-scripts/sign.sh target/debug/ignition-spike
-target/debug/ignition-spike
+# the runnable artifact is `boot`; it needs the hypervisor entitlement before it
+# can call hv_vm_create — re-sign after every build (relinking strips it):
+scripts/sign.sh target/debug/boot
+# usage (kernel + rootfs) is in "Boot a Linux guest" below.
 ```
 
 Requires: Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024).

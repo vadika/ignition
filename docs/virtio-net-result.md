@@ -1,5 +1,9 @@
 # virtio-net milestone — DONE (verified live)
 
+> **Status note (2026-06):** since this milestone, vmnet snapshot/restore shipped — survives
+> `--smp N` + `--net` (+ sudo) via link-bounce + guest carrier-watch re-DHCP, and clones get
+> distinct MAC/IP. The "Follow-ups" section below is superseded on that point.
+
 Date: 2026-06-12. Status: **working end-to-end.** `sudo boot --net` brings up the
 guest NIC; after `ip link set eth0 up && udhcpc -i eth0` the guest gets a lease and
 `ping` reaches out through vmnet NAT. The full virtio-net data path (TX → vmnet →

@@ -1,5 +1,15 @@
 # Snapshot / restore — WORKING (single-vCPU, clone-capable, no-net)
 
+> **SUPERSEDED (2026-06) — read as a historical record of the FIRST snapshot milestone.**
+> This documents the original **single-vCPU, no-net, eager-read** restore via `--snap-dir`/
+> `--restore <dir>`. Since then: **multi-vCPU** snapshot/restore (every online core saved +
+> resumed), **virtio-net** snapshot/restore (`--smp` + `--net` + sudo, link-bounce re-init),
+> and **fast restore** — `clonefile` + `mmap(MAP_SHARED)` lazy/immutable-base loading, a
+> `--store <dir>`/`--name` store convention (`snapshots/<name>/` + `instances/<name>-<pid>/`),
+> `manifest.json`, auto-generated names, and re-snapshot. The current CLI is `--store`/`--name`,
+> not `--snap-dir`/`--restore <dir>`. See the design+plan under `docs/superpowers/` for the
+> current behavior.
+
 Date: 2026-06-12. Status: **snapshot + restore fully working.** A running guest can
 be snapshotted (`Ctrl-A s`), and the snapshot directory restored (`boot --restore
 <dir>`) into a fresh, responsive guest that idles at ~0% CPU, keeps time, and accepts

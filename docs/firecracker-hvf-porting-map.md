@@ -1,5 +1,13 @@
 # Firecracker → macOS/HVF Porting Map
 
+> **Status (2026-06): historical analysis — kept as the FC↔HVF reference.** The KVM→HVF
+> mapping (§3), run-loop/ESR decode (§4), threading inversion (§5), and interrupt-path (§6)
+> remain accurate. But §1/§7's premise that in-kernel `hv_gic` has "no state get/set API"
+> (opaque, lossy snapshots) is **disproven** — `hv_gic_state_*` gives lossless GIC
+> save/restore (`crates/hvf/src/gic.rs`), so the userspace-GIC tradeoff did not arise.
+> Phases 1–2 and HVF snapshot/restore have shipped; dirty-tracking/diff snapshots and the
+> REST API remain open.
+
 Derived from a side-by-side reading of `containers/libkrun` (HVF backend, originally a Firecracker
 fork) and `firecracker-microvm/firecracker` (current main), June 2026. libkrun is Apache-2.0, same
 license as Firecracker — its HVF code can be lifted nearly verbatim.

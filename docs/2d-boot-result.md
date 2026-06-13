@@ -5,7 +5,7 @@ Guest: Linux 6.1.0 aarch64 (Firecracker `microvm-kernel-ci-aarch64-6.1.config`),
 built via `kimage/build/build-kernel.sh`. Booted with:
 
 ```
-cargo build -p hvf-spike --bin boot
+cargo build -p ignition-spike --bin boot
 scripts/sign.sh target/debug/boot
 target/debug/boot kimage/out/Image          # 2>diag  1>guest-console
 ```
