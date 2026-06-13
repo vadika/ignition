@@ -57,8 +57,7 @@ impl Connection {
         self.host.as_raw_fd()
     }
 
-    // used by Task 3 muxer
-    #[allow(dead_code)]
+    /// Absorb the guest's advertised credit (absolute values) from an inbound header.
     pub fn update_peer_credit(&mut self, buf_alloc: u32, fwd_cnt: u32) {
         self.peer_buf_alloc = Wrapping(buf_alloc);
         self.peer_fwd_cnt = Wrapping(fwd_cnt);
@@ -87,9 +86,7 @@ impl Connection {
                     return;
                 }
                 Ok(n) => {
-                    for _ in 0..n {
-                        self.txbuf.pop_front();
-                    }
+                    self.txbuf.drain(..n);
                     self.fwd_cnt += Wrapping(n as u32);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
