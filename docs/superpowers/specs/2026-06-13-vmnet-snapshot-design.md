@@ -6,8 +6,14 @@ Date: 2026-06-13
 
 Allow a `--net` (vmnet shared/NAT) microVM to be snapshotted and restored,
 including **multiple clones from one image**, with networking re-established on
-restore. No new MMIO device and no guest daemon: drive the guest's own
-udev/DHCP machinery via the existing virtio-net link status.
+restore. No new MMIO device and no new guest package: drive the guest's existing
+busybox/ifupdown DHCP via the existing virtio-net link status plus a tiny
+carrier-watch openrc service.
+
+> Rootfs reality: the image is Alpine busybox + openrc + ifupdown-ng. There is
+> **no udev** — networking is a one-shot `ifup -a` from `/etc/local.d/network.start`
+> at boot (busybox udhcpc). So the guest-side reaction is a small busybox
+> carrier-watch service, not a udev rule.
 
 ## Background — why net is excluded today
 
@@ -73,11 +79,12 @@ distinct IP per clone.
    the current `net: false` hardcode / "net snapshots never happen" assumption in
    `run_restore`. After resume, the VMM pulses link DOWN→UP via `set_link`.
 
-5. **Guest udev rule** (`kimage/build/build-rootfs.sh`). A single rule reacting to
-   the virtio NIC's carrier-change `net` uevent: re-DHCP (`udhcpc`/networkd) for a
-   fresh lease, and — if needed to adopt the new MAC — rebind the virtio-net driver
-   via sysfs (`unbind`→`bind`) so it re-probes and re-reads MAC Y. No daemon, no
-   custom MMIO device.
+5. **Guest carrier-watch service** (`kimage/build/build-rootfs.sh`). A tiny
+   busybox openrc service that polls `/sys/class/net/eth0/carrier`; on a down→up
+   transition it rebinds the virtio-net driver via sysfs (`unbind`→`bind`) so it
+   re-probes and re-reads MAC Y, then `ifdown eth0; ifup eth0` (busybox udhcpc
+   re-leases). Pure busybox shell — no new package, no custom MMIO device. (There
+   is no udev in this rootfs; this service is the equivalent reaction path.)
 
 ### virtio-net needs no inner save/restore
 
@@ -93,21 +100,23 @@ device-specific is persisted — the generic `DeviceRecord` suffices.
   in-flight inject) → read RAM + GIC + device records (generic) → write snapshot.
 - **Restore:** read records → `setup_devices(Mode::Restore)` starts fresh vmnet
   (MAC Y), rebuilds virtio-net, spawns feeder → resume vCPU → VMM pulses link
-  DOWN→UP → guest udev rule re-DHCPs (and rebinds to adopt MAC Y) → connectivity.
+  DOWN→UP → guest carrier-watch service rebinds the driver (adopts MAC Y) and
+  re-DHCPs → connectivity.
 
 ## The open risk (spike-gated)
 
-The DHCP-renew trigger via udev is clean. The **MAC adoption** is the uncertain
-part: a carrier bounce alone does not make the kernel re-read the virtio MAC (it
-is cached at probe), and udev cannot read virtio config space to learn Y. Picking
-up MAC Y requires a driver re-probe, which a udev rule can do (`unbind`→`bind`),
-but distinguishing "restore" from an ordinary carrier flap without a dedicated
-signal is imperfect.
+The carrier-watch + re-DHCP trigger is straightforward. The **MAC adoption** is
+the uncertain part: a carrier bounce alone does not make the kernel re-read the
+virtio MAC (it is cached at probe). Picking up MAC Y requires a driver re-probe,
+which the carrier-watch service does via sysfs `unbind`→`bind`. Open questions the
+spike must answer: does the busybox virtio-net rebind cleanly re-read MAC Y, and
+is a carrier-watch poll a reliable enough restore signal (vs. an ordinary flap)?
 
 **Spike during implementation:** boot a net VM, snapshot, restore, pulse link
-DOWN→UP, confirm the guest adopts MAC Y and re-DHCPs via the udev rule. If
-reliable → pure udev, zero new devices. If not → fall back to reusing **vsock**
-(an existing device) as the out-of-band signal channel; still no new device.
+DOWN→UP, confirm the carrier-watch service rebinds, adopts MAC Y, and re-DHCPs. If
+reliable → done with pure busybox. If the rebind/poll proves unreliable → fall
+back to reusing **vsock** (an existing device) as the out-of-band restore signal;
+still no new device, no new package.
 
 ## Error handling
 
@@ -126,8 +135,8 @@ reliable → pure udev, zero new devices. If not → fall back to reusing **vsoc
 - **Integration:** the snapshot handler is installed for `smp == 1` with net;
   restore wiring starts a vmnet backend and places virtio-net at the saved
   base/SPI from a net record.
-- **Spike (gates the design):** live boot→snapshot→restore→link-bounce; guest
-  adopts MAC Y and re-DHCPs via udev.
+- **Spike (gates the design):** live boot→snapshot→restore→link-bounce; the
+  carrier-watch service rebinds, the guest adopts MAC Y and re-DHCPs.
 - **Live clone test:** restore one net snapshot into two instances; assert
   distinct MAC + IP; both reach the internet.
 
@@ -136,8 +145,9 @@ reliable → pure udev, zero new devices. If not → fall back to reusing **vsoc
 - single-vCPU snapshot only (unchanged); multi-vCPU net out.
 - net restore requires `sudo` (vmnet).
 - active connections reset on restore (link bounce — accepted).
-- no new MMIO device, no guest daemon — `F_STATUS` on the existing virtio-net + one
-  udev rule (+ optional vsock fallback if the spike fails).
+- no new MMIO device, no new guest package — `F_STATUS` on the existing virtio-net
+  + a tiny busybox carrier-watch openrc service (+ optional vsock fallback if the
+  spike fails).
 - suspend-assisted snapshot (PSCI `SYSTEM_SUSPEND` + kernel `PM_SLEEP`, using the
   kernel's own `.freeze`/`.restore` + resume hooks) explicitly out — a cleaner but
   much larger alternative model, documented as future work.
