@@ -140,6 +140,28 @@ still no new device, no new package.
 - **Live clone test:** restore one net snapshot into two instances; assert
   distinct MAC + IP; both reach the internet.
 
+## Spike result (2026-06-13) — PASS
+
+Live boot→snapshot→restore on Apple Silicon. After the VMM's link bounce, the
+manual carrier-watch sequence worked:
+
+- `unbind`→`bind` of the virtio_net driver made the guest **re-read the new MAC**
+  (a fresh locally-administered MAC from the new vmnet interface); `eth0` kept its
+  name. ✓
+- `ifdown eth0; ifup eth0` → `udhcpc` obtained a fresh lease (`192.168.2.5`),
+  `ping 8.8.8.8` ~12 ms. ✓
+
+Findings folded into the plan:
+- busybox `ip` has no `-br` flag — use plain `ip link/addr show`.
+- A pre-existing `ifupdown-ng/dhcp: eval: ... syntax error` spam appears (the
+  boot-time `ifup -a` hits it too); functionally harmless (lease still obtained).
+  Tracked as a separate optional rootfs fix, not part of this work.
+- The rebind itself flaps the carrier (down→up), which would re-trigger the
+  watcher → **the carrier-watch service needs a cooldown after acting** to avoid a
+  rebind loop.
+
+Verdict: proceed with the busybox carrier-watch service (no vsock fallback needed).
+
 ## Scope / YAGNI
 
 - single-vCPU snapshot only (unchanged); multi-vCPU net out.
