@@ -38,8 +38,10 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   - **boot-timer** — pseudo device; the guest pokes a magic byte at boot's end and
     the VMM logs `Guest-boot-time = N ms` (~200 ms here).
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
-- **Snapshot / restore** — clone-capable (`--snap-dir` + `Ctrl-A s`, `--restore`);
-  restored guest idles at ~0% CPU and stays responsive. Multi-vCPU (`--smp N`) is
+- **Snapshot / restore** — clone-capable (`--store` + `Ctrl-A s`, `--restore <name>`);
+  restore is lazy (clonefile + `mmap(MAP_SHARED)`) so the immutable base is never
+  mutated and resume touches only used pages. The restored guest idles at ~0% CPU
+  and stays responsive. Multi-vCPU (`--smp N`) is
   supported via a stop-the-world rendezvous: every vCPU saves its own registers
   and resumes at its saved PC (restored `--smp 4` guest reports `nproc == 4`). Both
   fresh boot and restore drive one device-wiring site; every device restores its
@@ -86,7 +88,7 @@ hypervisor entitlement.
 cargo build -p ignition-spike --bin boot
 scripts/sign.sh target/debug/boot
 
-# boot to a shell (log in as root); console keys: Ctrl-A s = snapshot, Ctrl-A x = quit
+# boot to a shell (log in as root); console keys: Ctrl-A s = snapshot, Ctrl-A x = quit, Ctrl-A b = balloon
 target/debug/boot kimage/out/Image kimage/out/rootfs.ext4
 
 target/debug/boot --smp 4 kimage/out/Image kimage/out/rootfs.ext4   # multi-vCPU (SMP)
@@ -95,31 +97,46 @@ target/debug/boot --net  kimage/out/Image kimage/out/rootfs.ext4    # vmnet NAT 
 
 ## Snapshot & restore
 
-Works with `--smp N` (snapshot after boot completes). A snapshot dir holds
-`memory.bin` + `gic.bin` + `disk.img` + `vmstate.json`.
+Works with `--smp N` (snapshot after boot completes). Snapshots live in a **store**
+(`--store <dir>`, default `./vmstore`), under a name (`--name <name>`; an
+`adjective-surname` name is auto-generated when omitted). The layout is:
+
+- `<store>/snapshots/<name>/` — the **immutable base**, holding `memory.bin` +
+  `gic.bin` + `disk.img` + `vmstate.json` + `manifest.json`.
+- `<store>/instances/<name>-<pid>/` — **ephemeral CoW clones**, one per restored
+  guest, removed on a clean exit.
+
+Restore is lazy: it `clonefile`s the base into an instance dir (copy-on-write) and
+maps memory `MAP_SHARED`, so resume touches only the pages it actually uses and the
+base is never mutated. `--mem <MiB>` sets guest RAM (default 512); restore reads the
+size from the snapshot, so you don't pass `--mem` on the restore side.
 
 ```sh
-# 1. boot with an output dir, then press Ctrl-A s in the console to snapshot
-#    (guest keeps running afterwards)
-target/debug/boot --snap-dir mysnap kimage/out/Image kimage/out/rootfs.ext4
-ls -la mysnap/
+# 1. boot into a store (name auto-generated, or pass --name), then press Ctrl-A s
+#    in the console to snapshot (guest keeps running afterwards)
+target/debug/boot --store vmstore --name mysnap kimage/out/Image kimage/out/rootfs.ext4
+ls -la vmstore/snapshots/mysnap/
 
-# 2. restore — resumes from the saved PC (no kernel re-boot); press Enter for a prompt
-target/debug/boot --restore mysnap
+# 2. restore by name — resumes from the saved PC (no kernel re-boot); press Enter for a prompt
+target/debug/boot --store vmstore --restore mysnap
 
 # 3. confirm it idles (~0% CPU, not spinning)
-target/debug/boot --restore mysnap & BP=$!; sleep 3; ps -o pid,%cpu,command -p $BP; kill $BP
+target/debug/boot --store vmstore --restore mysnap & BP=$!; sleep 3; ps -o pid,%cpu,command -p $BP; kill $BP
 
-# 4. clone — restore the same snapshot into N independent guests (private disk copy each)
-target/debug/boot --restore mysnap   # run in separate terminals
+# 4. clone — restore the same base into N independent guests (private CoW clone each)
+target/debug/boot --store vmstore --restore mysnap   # run in separate terminals
 ```
+
+A restored guest can re-snapshot: its `Ctrl-A s` writes a **new** named base.
+Reusing the source name is refused unless you pass `--force`.
 
 Headless drivers that run the whole cycle:
 
 ```sh
-python3 scripts/restore_test.py        # boot -> snapshot -> restore; prints CPU% + responsive
+python3 scripts/restore_test.py        # boot -> snapshot -> restore; prints CPU% + latency + immutability
 python3 scripts/restore_clone_test.py  # login + run a command + two clones
 ```
 
-Restore expects the same `RAM_SIZE` the snapshot was taken with. `/snapshot/` and
-`/snapshot2/` are gitignored; any other `--snap-dir` name is tracked unless you ignore it.
+Restore expects the same RAM size the snapshot was taken with (read from the
+snapshot). The snapshot artifacts (`memory.bin`/`gic.bin`/`disk.img`/`vmstate.json`)
+are gitignored by name wherever they land, so a store dir's bases aren't tracked.

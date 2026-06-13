@@ -251,6 +251,7 @@ dependencies = [
  "ignition-arch",
  "ignition-devices",
  "ignition-hvf",
+ "libc",
  "log",
  "serde",
  "serde_json",

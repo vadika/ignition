@@ -11,6 +11,7 @@
 // earlycon lines are cleanly separable.
 
 use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
@@ -30,11 +31,11 @@ use ignition_devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ignition_hvf::gic::HvfGicV3;
 use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
-use ignition_vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
+use ignition_vmm::names;
+use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
 
-const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
 
 /// Host console escape key: Ctrl-A (0x01).
 const CTRL_A: u8 = 0x01;
@@ -420,6 +421,30 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
     Ok(())
 }
 
+/// Write a named base snapshot into `<store>/snapshots/<write_name>/`, plus its
+/// manifest, and print the resolved name. Shared by the boot and restore handlers.
+#[allow(clippy::too_many_arguments)]
+fn write_named_snapshot(
+    store: &Path,
+    write_name: &str,
+    ram: &[u8],
+    gic_blob: &[u8],
+    disk_src: &Path,
+    checkpoints: Vec<VcpuCheckpoint>,
+    devices: Vec<DeviceRecord>,
+    mem_size: u64,
+) -> io::Result<()> {
+    let base = snapshot::base_dir(store, write_name);
+    let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
+    let vcpu_count = config.vcpu_count;
+    let snap = VmSnapshot::new(config, checkpoints, devices);
+    snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
+    let manifest = SnapshotManifest::new(write_name.to_string(), mem_size, vcpu_count);
+    snapshot::write_manifest(&base, &manifest)?;
+    eprintln!("[snapshot] '{write_name}' written to {}", base.display());
+    Ok(())
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -428,10 +453,13 @@ fn main() {
     // Cap matches the FDT/GIC sizing we exercise; raise if a guest needs more.
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
+    let mut mem_mib: u64 = 512; // default 512 MiB (the historical RAM_SIZE)
     let mut net = false;
     let mut vsock_uds: Option<PathBuf> = None;
-    let mut snap_dir: PathBuf = PathBuf::from("./snapshot");
-    let mut restore_dir: Option<PathBuf> = None;
+    let mut store: PathBuf = PathBuf::from("./vmstore");
+    let mut name: Option<String> = None;
+    let mut force = false;
+    let mut restore_name: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -445,20 +473,33 @@ fn main() {
                 assert!((1..=MAX_VCPUS).contains(&n), "--smp must be 1..={MAX_VCPUS}");
                 smp = n;
             }
+            "--mem" => {
+                let n = it
+                    .next()
+                    .expect("--mem needs a value")
+                    .parse::<u64>()
+                    .expect("--mem value must be a number (MiB)");
+                assert!((1..=65536).contains(&n), "--mem must be 1..=65536 MiB");
+                mem_mib = n;
+            }
             "--net" => {
                 net = true;
             }
-            "--snap-dir" => {
-                let v = it.next().expect("--snap-dir needs a path");
-                snap_dir = PathBuf::from(v);
+            "--store" => {
+                store = PathBuf::from(it.next().expect("--store needs a path"));
+            }
+            "--name" => {
+                name = Some(it.next().expect("--name needs a value").to_string());
+            }
+            "--force" => {
+                force = true;
             }
             "--vsock-uds" => {
                 let v = it.next().expect("--vsock-uds needs a path");
                 vsock_uds = Some(PathBuf::from(v));
             }
             "--restore" => {
-                let v = it.next().expect("--restore needs a directory path");
-                restore_dir = Some(PathBuf::from(v));
+                restore_name = Some(it.next().expect("--restore needs a snapshot name").to_string());
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown flag: {other}");
@@ -468,9 +509,11 @@ fn main() {
         }
     }
 
+    let ram_size: u64 = mem_mib << 20; // MiB -> bytes
+
     // Restore path: skip normal boot entirely.
-    if let Some(dir) = restore_dir {
-        match run_restore(&dir, vsock_uds) {
+    if let Some(rname) = restore_name {
+        match run_restore(&store, &rname, name.clone(), force, vsock_uds) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -481,7 +524,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--net] [--vsock-uds <path>] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -494,7 +537,7 @@ fn main() {
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            RAM_SIZE as usize,
+            ram_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_ANON | libc::MAP_PRIVATE,
             -1,
@@ -503,13 +546,13 @@ fn main() {
     };
     assert!(host != libc::MAP_FAILED, "mmap failed");
     let host_addr = host as u64;
-    let ram: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, RAM_SIZE as usize) };
+    let ram: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, ram_size as usize) };
 
     // Load the kernel; entry is where the vCPU's PC starts.
     let entry = kernel::load_kernel(ram, layout::RAM_BASE, &kernel_image).expect("load_kernel failed");
 
     // The FDT occupies the top FDT_MAX_SIZE of RAM; the kernel must stay below it.
-    let fdt_addr = layout::fdt_addr(RAM_SIZE);
+    let fdt_addr = layout::fdt_addr(ram_size);
     let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
 
     // VM, then the in-kernel GIC (must be created before any vCPU).
@@ -527,7 +570,7 @@ fn main() {
 
     let mut ctx = DeviceContext {
         host: host as *mut u8,
-        ram_size: RAM_SIZE,
+        ram_size,
         disk: disk_path.as_ref().map(PathBuf::from),
         vsock_uds: vsock_uds.clone(),
         net,
@@ -560,7 +603,7 @@ fn main() {
     // Build and place the device tree.
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
-        mem_size: RAM_SIZE,
+        mem_size: ram_size,
         cpu_mpidrs: (0..smp).map(mpidr_for).collect(),
         cmdline: layout::default_cmdline(),
         devices: mgr.fdt_devices(),
@@ -572,7 +615,7 @@ fn main() {
     ram[fdt_off..fdt_off + dtb.len()].copy_from_slice(&dtb);
 
     // Map the populated RAM into the guest.
-    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+    vm.map_memory(host_addr, layout::RAM_BASE, ram_size)
         .expect("hv_vm_map failed");
 
     // Diagnostics (stderr) so a silent boot is debuggable.
@@ -595,6 +638,8 @@ fn main() {
     // Build the VcpuManager and install the snapshot handler before run.
     let mut manager = VcpuManager::new(smp, bus);
 
+    let write_name = name.clone().unwrap_or_else(names::generate);
+
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
 
@@ -605,13 +650,15 @@ fn main() {
         let gic_snap = gic.clone();
         let snap_devices = frozen.clone();
         let disk_path_snap = disk_path.clone();
-        let snap_dir_snap = snap_dir.clone();
+        let store_snap = store.clone();
+        let write_name_snap = write_name.clone();
         // The guest RAM base pointer captured as usize: raw *const u8 is neither
         // Send nor Sync, but usize is. Sound because the closure only reads the
         // slice at the rendezvous, when every vCPU is parked at the barrier. The
         // vmnet RX feeder is quiesced below before RAM is read. usize avoids the
         // 2021+ partial-capture seeing through a newtype to the *const u8 field.
         let host_usize = host as usize;
+        let ram_size_snap = ram_size;
 
         manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
@@ -621,8 +668,6 @@ fn main() {
             };
 
             let devices = snap_devices.save();
-            let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: checkpoints.len() as u64 };
-            let snap = VmSnapshot::new(config, checkpoints, devices);
 
             // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
             if let Some(stop) = &rx_stop_snap {
@@ -634,20 +679,24 @@ fn main() {
 
             // The RAM slice — host_usize round-trip avoids capturing *const u8.
             let ram_slice: &[u8] = unsafe {
-                std::slice::from_raw_parts(host_usize as *const u8, RAM_SIZE as usize)
+                std::slice::from_raw_parts(host_usize as *const u8, ram_size_snap as usize)
             };
 
             let disk_src = match &disk_path_snap {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    let placeholder = snap_dir_snap.join("disk.img");
+                    let placeholder = std::env::temp_dir()
+                        .join(format!("ignition-empty-disk-{}", process::id()));
                     let _ = std::fs::write(&placeholder, b"");
                     placeholder
                 }
             };
 
-            match snapshot::write_snapshot(&snap_dir_snap, &snap, ram_slice, &gic_blob, &disk_src) {
-                Ok(()) => eprintln!("[snapshot] written to {}", snap_dir_snap.display()),
+            match write_named_snapshot(
+                &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
+                checkpoints, devices, ram_size_snap,
+            ) {
+                Ok(()) => {}
                 Err(e) => eprintln!("[snapshot] write failed: {e}"),
             }
 
@@ -663,6 +712,7 @@ fn main() {
     let termios = TermiosGuard::new();
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b), {smp} vCPU(s) ---");
+    eprintln!("--- snapshots will be saved as '{write_name}' under {} ---", store.display());
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
     match manager.run(entry, fdt_addr) {
@@ -671,45 +721,62 @@ fn main() {
     }
 }
 
-/// Restore a snapshot from `dir` and resume the guest.
+/// Restore a named base snapshot from `<store>/snapshots/<restore_name>/` and resume the guest.
 /// Does NOT load a kernel, generate an FDT, or call set_initial_state.
 /// The running kernel + DTB are already in memory.bin.
-fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
+fn run_restore(
+    store: &Path,
+    restore_name: &str,
+    name: Option<String>,
+    force: bool,
+    vsock_uds: Option<PathBuf>,
+) -> io::Result<()> {
+    let dir = snapshot::base_dir(store, restore_name);
+    let dir = dir.as_path();
     // Host-side restore clock: mmap + memory.bin load + GIC/device/vCPU state
     // restore, up to handing the guest to the run loop. The boot-timer device
     // can't measure restore (the guest's init does not re-run), so this is the
     // restore analog of `Guest-boot-time`.
     let restore_start = std::time::Instant::now();
-    // 1. Read the snapshot metadata.
+    // 1. Read the snapshot metadata. RAM size comes from the snapshot, not a const.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
-    assert_eq!(
-        snap.config.mem_size, RAM_SIZE,
-        "snapshot mem_size does not match this binary's RAM_SIZE"
-    );
+    let mem_size = snap.config.mem_size;
 
-    // 2. Allocate guest RAM and load memory.bin into it.
+    // The base memory image must match the recorded size before we map it.
+    let base_len = fs::metadata(&paths.memory)?.len();
+    if base_len != mem_size {
+        return Err(io::Error::other(format!(
+            "memory.bin length {base_len} != snapshot mem_size {mem_size}"
+        )));
+    }
+
+    // Per-restore instance dir: CoW clones of the immutable base live here, so the
+    // running guest never writes back into the base. (A later task moves this under the store.)
+    let inst_dir = snapshot::instance_dir(store, restore_name, process::id());
+    let _ = fs::remove_dir_all(&inst_dir);
+    fs::create_dir_all(&inst_dir)?;
+    let inst_mem = inst_dir.join("memory.bin");
+    snapshot::clonefile_or_copy(&paths.memory, &inst_mem)?;
+
+    // 2. Map the instance memory.bin as guest RAM. MAP_SHARED: pages fault in lazily
+    //    from the clone, and guest writes land in the clone (APFS copy-on-writes the
+    //    block off the base on first write) — the base is never touched.
+    let memf = fs::OpenOptions::new().read(true).write(true).open(&inst_mem)?;
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            RAM_SIZE as usize,
+            mem_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            -1,
+            libc::MAP_SHARED,
+            memf.as_raw_fd(),
             0,
         )
     };
-    assert!(host != libc::MAP_FAILED, "mmap failed");
+    if host == libc::MAP_FAILED {
+        return Err(io::Error::other("mmap of instance memory.bin failed"));
+    }
+    drop(memf); // the mapping keeps the underlying file alive after the fd closes
     let host_addr = host as u64;
-    let ram: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(host as *mut u8, RAM_SIZE as usize) };
-    let mem_bytes = fs::read(&paths.memory)?;
-    assert_eq!(
-        mem_bytes.len(),
-        snap.config.mem_size as usize,
-        "memory.bin length != snap.config.mem_size"
-    );
-    ram.copy_from_slice(&mem_bytes);
-    drop(mem_bytes);
 
     // 3. Create the HVF VM (must precede GIC and vCPU creation).
     let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
@@ -723,7 +790,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     );
 
     // 5. Map the populated RAM into the guest.
-    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+    vm.map_memory(host_addr, layout::RAM_BASE, mem_size)
         .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
 
     // 6. Restore devices at their saved addresses via DeviceManager.
@@ -734,11 +801,11 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
         layout::SPI_BASE,
         layout::SPI_COUNT,
     );
-    // Private disk instance so clones are independent (only if the snapshot has a disk).
+    // Private CoW disk instance so clones are independent and the base disk.img is
+    // never mutated (only if the snapshot has a disk).
     let disk = if snap.devices.iter().any(|r| r.id == "virtio-blk") {
-        let instance_disk = std::env::temp_dir()
-            .join(format!("ignition-instance-{}.img", process::id()));
-        fs::copy(&paths.disk, &instance_disk)?;
+        let instance_disk = inst_dir.join("disk.img");
+        snapshot::clonefile_or_copy(&paths.disk, &instance_disk)?;
         Some(instance_disk)
     } else {
         None
@@ -746,8 +813,8 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
 
     let mut ctx = DeviceContext {
         host: host as *mut u8,
-        ram_size: RAM_SIZE,
-        disk,
+        ram_size: mem_size,
+        disk: disk.clone(),
         vsock_uds: vsock_uds.clone(),
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
@@ -764,12 +831,63 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
         spawn_vsock_reactor(vsock_mmio);
     }
     let net_mmio_restore = ctx.net_mmio.clone();
-    let frozen = mgr.freeze();
+    let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
-    let manager = VcpuManager::new(snap.config.vcpu_count, bus);
+    let mut manager = VcpuManager::new(snap.config.vcpu_count, bus);
+
+    // Re-snapshot: a restored guest can be snapshotted into a NEW base. An omitted
+    // --name generates a fresh one (never collides with the source). An explicit
+    // --name equal to the restored-from name is refused unless --force. This must
+    // be installed before `manager` is cloned (spawn_stdin_reader / run_restored),
+    // because set_snapshot_handler requires sole ownership of the Arc.
+    let write_name = name.unwrap_or_else(names::generate);
+    {
+        let store_snap = store.to_path_buf();
+        let write_name_snap = write_name.clone();
+        let restored_from = restore_name.to_string();
+        let gic_snap = gic.clone();
+        let snap_devices = frozen.clone();
+        let disk_snap = disk.clone();
+        let host_usize = host as usize;
+        let mem_size_snap = mem_size;
+        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
+            if write_name_snap == restored_from && !force {
+                eprintln!(
+                    "[snapshot] refusing to overwrite the base '{write_name_snap}' you are \
+                     restored from; pass --force or --name <other>"
+                );
+                return;
+            }
+            let gic_blob = match gic_snap.save_state() {
+                Ok(b) => b,
+                Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
+            };
+            let devices = snap_devices.save();
+            let ram_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(host_usize as *const u8, mem_size_snap as usize)
+            };
+            let disk_src = match &disk_snap {
+                Some(p) => p.clone(),
+                None => {
+                    let placeholder = std::env::temp_dir()
+                        .join(format!("ignition-empty-disk-{}", process::id()));
+                    let _ = std::fs::write(&placeholder, b"");
+                    placeholder
+                }
+            };
+            match write_named_snapshot(
+                &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
+                checkpoints, devices, mem_size_snap,
+            ) {
+                Ok(()) => {}
+                Err(e) => eprintln!("[snapshot] write failed: {e}"),
+            }
+        }));
+    }
+
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
@@ -789,10 +907,14 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     io::stderr().flush().ok();
 
     // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
-    match manager.run_restored(snap.vcpus, Some(gic_blob)) {
-        Ok(()) => {}
-        Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
-    }
+    let run_result = manager.run_restored(snap.vcpus, Some(gic_blob));
+
+    // Best-effort cleanup of the CoW instance dir (memory.bin + disk.img clones).
+    // A Ctrl-A x exit calls process::exit and intentionally skips this — a leftover
+    // instance dir is harmless because the base is never mutated.
+    let _ = fs::remove_dir_all(&inst_dir);
+
+    run_result.map_err(|e| io::Error::other(format!("run_restored: {e}")))?;
     Ok(())
 }
 
