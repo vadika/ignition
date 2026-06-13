@@ -733,7 +733,6 @@ fn run_restore(
 ) -> io::Result<()> {
     let dir = snapshot::base_dir(store, restore_name);
     let dir = dir.as_path();
-    let _ = (&name, force); // used by the re-snapshot handler in the next task
     // Host-side restore clock: mmap + memory.bin load + GIC/device/vCPU state
     // restore, up to handing the guest to the run loop. The boot-timer device
     // can't measure restore (the guest's init does not re-run), so this is the
@@ -815,7 +814,7 @@ fn run_restore(
     let mut ctx = DeviceContext {
         host: host as *mut u8,
         ram_size: mem_size,
-        disk,
+        disk: disk.clone(),
         vsock_uds: vsock_uds.clone(),
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
@@ -832,12 +831,63 @@ fn run_restore(
         spawn_vsock_reactor(vsock_mmio);
     }
     let net_mmio_restore = ctx.net_mmio.clone();
-    let frozen = mgr.freeze();
+    let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
-    let manager = VcpuManager::new(snap.config.vcpu_count, bus);
+    let mut manager = VcpuManager::new(snap.config.vcpu_count, bus);
+
+    // Re-snapshot: a restored guest can be snapshotted into a NEW base. An omitted
+    // --name generates a fresh one (never collides with the source). An explicit
+    // --name equal to the restored-from name is refused unless --force. This must
+    // be installed before `manager` is cloned (spawn_stdin_reader / run_restored),
+    // because set_snapshot_handler requires sole ownership of the Arc.
+    let write_name = name.unwrap_or_else(names::generate);
+    {
+        let store_snap = store.to_path_buf();
+        let write_name_snap = write_name.clone();
+        let restored_from = restore_name.to_string();
+        let gic_snap = gic.clone();
+        let snap_devices = frozen.clone();
+        let disk_snap = disk.clone();
+        let host_usize = host as usize;
+        let mem_size_snap = mem_size;
+        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
+            if write_name_snap == restored_from && !force {
+                eprintln!(
+                    "[snapshot] refusing to overwrite the base '{write_name_snap}' you are \
+                     restored from; pass --force or --name <other>"
+                );
+                return;
+            }
+            let gic_blob = match gic_snap.save_state() {
+                Ok(b) => b,
+                Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
+            };
+            let devices = snap_devices.save();
+            let ram_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(host_usize as *const u8, mem_size_snap as usize)
+            };
+            let disk_src = match &disk_snap {
+                Some(p) => p.clone(),
+                None => {
+                    let placeholder = std::env::temp_dir()
+                        .join(format!("ignition-empty-disk-{}", process::id()));
+                    let _ = std::fs::write(&placeholder, b"");
+                    placeholder
+                }
+            };
+            match write_named_snapshot(
+                &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
+                checkpoints, devices, mem_size_snap,
+            ) {
+                Ok(()) => {}
+                Err(e) => eprintln!("[snapshot] write failed: {e}"),
+            }
+        }));
+    }
+
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
