@@ -25,8 +25,23 @@ docker run --rm \
     cd "linux-${KVER}"
     wget -qO .config "${CFG_URL}"
 
+    # Extra guest features on top of the Firecracker CI config. Built-in (=y)
+    # so they need no module loading. VSOCKETS/VHOST are deps required for the
+    # *_VSOCK symbols to survive olddefconfig.
+    #   VIRTIO_BALLOON  - guest memory balloon
+    #   VIRTIO_VSOCKETS - guest vsock transport (what Firecracker needs)
+    #   VHOST_VSOCK     - host-side vsock; inert in a guest image, added on request
+    ./scripts/config \
+      --enable VIRTIO_BALLOON \
+      --enable VSOCKETS \
+      --enable VIRTIO_VSOCKETS \
+      --enable VHOST \
+      --enable VHOST_VSOCK
+
     export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
     make olddefconfig
+    echo "=== requested configs after olddefconfig ==="
+    grep -E "CONFIG_(VIRTIO_BALLOON|VSOCKETS|VIRTIO_VSOCKETS|VHOST|VHOST_VSOCK)=" .config || true
     make -j"$(nproc)" Image
 
     # NOTE: never strip the arm64 Image. It is a valid PE/COFF binary, so

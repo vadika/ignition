@@ -102,6 +102,18 @@ Boot proof: `nproc` (or `/proc/cpuinfo`) inside the guest reports N, and
 > FDT generation host-side; see its SMP design/implementation docs. This kernel
 > imposes no extra requirement beyond the two CONFIG flags above.
 
+## Extra kernel features
+
+On top of the Firecracker CI config, `build/build-kernel.sh` force-enables
+(built-in, `=y`) via `scripts/config` before `olddefconfig`:
+
+- `CONFIG_VIRTIO_BALLOON` — guest memory balloon device.
+- `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS` — vsock core + virtio transport;
+  this is what a Firecracker guest needs for vsock (host side is userspace).
+- `CONFIG_VHOST` + `CONFIG_VHOST_VSOCK` — host-side vhost-vsock. Inert in a guest
+  image (Firecracker does not use vhost), included on request. Drop these two if
+  you want a leaner guest.
+
 ## How it was built
 
 Built on host **`artemis2`** (Ubuntu 26.04, x86_64, 32 cores). That host has
