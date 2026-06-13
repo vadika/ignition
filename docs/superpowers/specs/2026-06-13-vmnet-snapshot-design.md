@@ -162,6 +162,14 @@ Findings folded into the plan:
 
 Verdict: proceed with the busybox carrier-watch service (no vsock fallback needed).
 
+## Status: implemented 2026-06-13
+
+Via plan `docs/superpowers/plans/2026-06-13-vmnet-snapshot.md`. Host-side code
+(F_STATUS + link-bounce, rx-feeder quiesce, `smp==1` gate, restore-net wiring) and
+the guest carrier-watch service are in. The spike (above) verified the core
+mechanism end-to-end. Final 2-clone live test runs after the rootfs is rebuilt
+with the carrier-watch service.
+
 ## Scope / YAGNI
 
 - single-vCPU snapshot only (unchanged); multi-vCPU net out.

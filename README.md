@@ -25,6 +25,10 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   snapshot) behind one `MmioDevice` trait. The full Firecracker aarch64 device set:
   - **virtio-blk** — rootfs from a disk image.
   - **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
+    Snapshot/restore supported (single-vCPU, `sudo`): on restore a fresh vmnet
+    interface is started (new MAC) and the VMM bounces the link; a guest
+    carrier-watch service rebinds the driver + re-DHCPs, so clones get distinct
+    MAC+IP. Active connections reset.
   - **virtio-rng** — entropy source (`getentropy`-backed), always-on.
   - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`);
     the inflation target survives snapshot/restore.
@@ -37,7 +41,8 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
 - **Snapshot / restore** — single-vCPU, clone-capable (`--snap-dir` + `Ctrl-A s`,
   `--restore`); restored guest idles at ~0% CPU and stays responsive. Both fresh boot
   and restore drive one device-wiring site; every device restores its full state
-  (transport + queues + per-device: balloon target, vsock connection reset).
+  (transport + queues + per-device: balloon target, vsock connection reset,
+  virtio-net link-bounce re-init). `--net` VMs are snapshottable too (`sudo`).
 
 The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
 load-bearing layer; the `hvf-spike` smoke test still exercises it in isolation
