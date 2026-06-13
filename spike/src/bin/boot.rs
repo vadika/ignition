@@ -11,6 +11,7 @@
 // earlycon lines are cleanly separable.
 
 use std::io::{self, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
@@ -680,36 +681,45 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     // can't measure restore (the guest's init does not re-run), so this is the
     // restore analog of `Guest-boot-time`.
     let restore_start = std::time::Instant::now();
-    // 1. Read the snapshot metadata.
+    // 1. Read the snapshot metadata. RAM size comes from the snapshot, not a const.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
-    assert_eq!(
-        snap.config.mem_size, RAM_SIZE,
-        "snapshot mem_size does not match this binary's RAM_SIZE"
-    );
+    let mem_size = snap.config.mem_size;
 
-    // 2. Allocate guest RAM and load memory.bin into it.
+    // The base memory image must match the recorded size before we map it.
+    let base_len = fs::metadata(&paths.memory)?.len();
+    if base_len != mem_size {
+        return Err(io::Error::other(format!(
+            "memory.bin length {base_len} != snapshot mem_size {mem_size}"
+        )));
+    }
+
+    // Per-restore instance dir: CoW clones of the immutable base live here, so the
+    // running guest never writes back into the base. (A later task moves this under the store.)
+    let inst_dir = std::env::temp_dir().join(format!("ignition-inst-{}", process::id()));
+    let _ = fs::remove_dir_all(&inst_dir);
+    fs::create_dir_all(&inst_dir)?;
+    let inst_mem = inst_dir.join("memory.bin");
+    snapshot::clonefile_or_copy(&paths.memory, &inst_mem)?;
+
+    // 2. Map the instance memory.bin as guest RAM. MAP_SHARED: pages fault in lazily
+    //    from the clone, and guest writes land in the clone (APFS copy-on-writes the
+    //    block off the base on first write) — the base is never touched.
+    let memf = fs::OpenOptions::new().read(true).write(true).open(&inst_mem)?;
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            RAM_SIZE as usize,
+            mem_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            -1,
+            libc::MAP_SHARED,
+            memf.as_raw_fd(),
             0,
         )
     };
-    assert!(host != libc::MAP_FAILED, "mmap failed");
+    if host == libc::MAP_FAILED {
+        return Err(io::Error::other("mmap of instance memory.bin failed"));
+    }
+    drop(memf); // the mapping keeps the underlying file alive after the fd closes
     let host_addr = host as u64;
-    let ram: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(host as *mut u8, RAM_SIZE as usize) };
-    let mem_bytes = fs::read(&paths.memory)?;
-    assert_eq!(
-        mem_bytes.len(),
-        snap.config.mem_size as usize,
-        "memory.bin length != snap.config.mem_size"
-    );
-    ram.copy_from_slice(&mem_bytes);
-    drop(mem_bytes);
 
     // 3. Create the HVF VM (must precede GIC and vCPU creation).
     let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
@@ -723,7 +733,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     );
 
     // 5. Map the populated RAM into the guest.
-    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+    vm.map_memory(host_addr, layout::RAM_BASE, mem_size)
         .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
 
     // 6. Restore devices at their saved addresses via DeviceManager.
@@ -746,7 +756,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
 
     let mut ctx = DeviceContext {
         host: host as *mut u8,
-        ram_size: RAM_SIZE,
+        ram_size: mem_size,
         disk,
         vsock_uds: vsock_uds.clone(),
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
