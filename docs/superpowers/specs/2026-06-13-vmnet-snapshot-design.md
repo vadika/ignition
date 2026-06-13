@@ -167,8 +167,9 @@ Verdict: proceed with the busybox carrier-watch service (no vsock fallback neede
 Via plan `docs/superpowers/plans/2026-06-13-vmnet-snapshot.md`. Host-side code
 (F_STATUS + link-bounce, rx-feeder quiesce, `smp==1` gate, restore-net wiring) and
 the guest carrier-watch service are in. The spike (above) verified the core
-mechanism end-to-end. Final 2-clone live test runs after the rootfs is rebuilt
-with the carrier-watch service.
+mechanism end-to-end. **2-clone live test PASSED** (rootfs rebuilt with the
+carrier-watch service): both clones auto-reconnected on restore with no manual
+step, got distinct IPs, and reached the internet.
 
 ## Scope / YAGNI
 
