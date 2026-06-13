@@ -203,7 +203,9 @@ fn spawn_stdin_reader(
                 Action::Balloon => {
                     const BALLOON_PAGES: u32 = 64 * 256; // 64 MiB in 4 KiB pages
                     let next = if balloon_target.load(Ordering::Relaxed) == 0 { BALLOON_PAGES } else { 0 };
-                    balloon_target.store(next, Ordering::Relaxed);
+                    // Release so the vCPU thread's Acquire load in config_read sees
+                    // the new target before it services the config-change interrupt.
+                    balloon_target.store(next, Ordering::Release);
                     balloon.lock().unwrap().signal_config_change();
                     eprintln!("\n[balloon target -> {} MiB]", next / 256);
                 }
@@ -617,8 +619,9 @@ fn run_restore(dir: &Path) -> io::Result<()> {
             }
         }
     }
-    let serial = serial_handle.expect("snapshot had no serial device");
-    let (balloon_target, balloon) = balloon_restore.expect("snapshot had no balloon device");
+    let serial = serial_handle.ok_or_else(|| io::Error::other("snapshot had no serial device"))?;
+    let (balloon_target, balloon) =
+        balloon_restore.ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
     let frozen = mgr.freeze();
     let bus = frozen.bus();
 

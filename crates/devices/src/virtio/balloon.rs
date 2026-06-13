@@ -35,7 +35,8 @@ impl Balloon {
     /// 8-byte virtio_balloon_config: num_pages (0x00), actual (0x04).
     fn config_bytes(&self) -> [u8; 8] {
         let mut c = [0u8; 8];
-        c[0..4].copy_from_slice(&self.num_pages.load(Ordering::Relaxed).to_le_bytes());
+        // Acquire pairs with the host trigger's Release store of the target.
+        c[0..4].copy_from_slice(&self.num_pages.load(Ordering::Acquire).to_le_bytes());
         c[4..8].copy_from_slice(&self.actual.to_le_bytes());
         c
     }
