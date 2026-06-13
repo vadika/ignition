@@ -433,6 +433,7 @@ pub enum VcpuExit<'a> {
     Breakpoint,
     Canceled,
     CpuOn(u64, u64, u64),
+    DirtyFault(u64),
     HypervisorCall,
     MmioRead(u64, &'a mut [u8]),
     MmioWrite(u64, &'a [u8]),
@@ -460,6 +461,9 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    dirty_tracking: bool,
+    ram_base: u64,
+    ram_size: u64,
 }
 
 /// Write the low `len` little-endian bytes of `val` into `buf` (the MMIO data
@@ -527,7 +531,18 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            dirty_tracking: false,
+            ram_base: 0,
+            ram_size: 0,
         })
+    }
+
+    /// Enable dirty-page tracking and set the guest-RAM window used to
+    /// disambiguate write-protect dirty faults from MMIO data aborts.
+    pub fn set_dirty_window(&mut self, base: u64, size: u64) {
+        self.ram_base = base;
+        self.ram_size = size;
+        self.dirty_tracking = true;
     }
 
     /// Full initial register/system-register setup shared by the primary
@@ -911,6 +926,21 @@ impl HvfVcpu<'_> {
                 );
 
                 let pa = self.vcpu_exit.exception.physical_address;
+
+                // Write-protect dirty fault: a guest store into the tracked RAM
+                // window. HVF reports this as a *translation* fault (DFSC 0x07/0x0f),
+                // NOT a permission fault, so the only reliable discriminator is a
+                // write data abort whose physical address falls inside the RAM
+                // region. Re-grant of write permission happens in the caller; we
+                // must NOT advance PC here so the trapping store re-executes.
+                if self.dirty_tracking
+                    && iswrite
+                    && pa >= self.ram_base
+                    && pa < self.ram_base + self.ram_size
+                {
+                    return Ok(VcpuExit::DirtyFault(pa));
+                }
+
                 self.pending_advance_pc = true;
 
                 if iswrite {
