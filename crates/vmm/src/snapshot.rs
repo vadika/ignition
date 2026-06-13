@@ -1,12 +1,19 @@
 //! Snapshot directory I/O: a JSON state file plus raw memory/gic/disk artifacts.
 
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use ignition_hvf::VcpuState;
+
+// macOS APFS copy-on-write clone. `<sys/clonefile.h>`; flags are clonefile_flags_t (u32).
+unsafe extern "C" {
+    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
+}
 
 pub const SNAP_MAGIC: &str = "ignition-snapshot-v2";
 pub const SNAP_VERSION: u32 = 2;
@@ -75,6 +82,33 @@ pub fn paths(dir: &Path) -> Paths {
         gic: dir.join("gic.bin"),
         disk: dir.join("disk.img"),
         state: dir.join("vmstate.json"),
+    }
+}
+
+/// Copy `src` to `dst` using APFS `clonefile(2)` (O(1), copy-on-write) when
+/// possible, falling back to a byte copy on filesystems that don't support it.
+/// `dst` must not already exist. The result is always an independent file: writing
+/// to it never mutates `src`.
+pub fn clonefile_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    let csrc = CString::new(src.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let cdst = CString::new(dst.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let rc = unsafe { clonefile(csrc.as_ptr(), cdst.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        // Not APFS, or src and dst are on different filesystems: fall back.
+        Some(libc::ENOTSUP) | Some(libc::EXDEV) => {
+            log::warn!(
+                "clonefile unsupported ({err}); falling back to byte copy: {} -> {}",
+                src.display(),
+                dst.display()
+            );
+            fs::copy(src, dst)?;
+            Ok(())
+        }
+        _ => Err(err),
     }
 }
 
@@ -205,6 +239,25 @@ mod tests {
         std::fs::write(&p.state, serde_json::to_vec(&bad).unwrap()).unwrap();
         let err = read_snapshot(dir.path()).unwrap_err();
         assert!(err.to_string().contains("magic"), "error should mention magic: {err}");
+    }
+
+    #[test]
+    fn clonefile_or_copy_duplicates_and_isolates() {
+        let dir = std::env::temp_dir().join(format!("ign-clone-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dst = dir.join("dst.bin");
+        fs::write(&src, b"hello world").unwrap();
+
+        clonefile_or_copy(&src, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"hello world");
+
+        // Editing the clone must NOT change the source (CoW / copy isolation).
+        fs::write(&dst, b"CHANGED!!!!").unwrap();
+        assert_eq!(fs::read(&src).unwrap(), b"hello world");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
