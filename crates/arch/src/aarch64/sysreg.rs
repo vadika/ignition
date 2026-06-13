@@ -116,31 +116,3 @@ pub fn sys_reg_name(addr: u32) -> Option<&'static str> {
         _ => None,
     }
 }
-
-pub fn sysreg_op0(sysreg: u32) -> u32 {
-    (sysreg >> SYSREG_OP0_SHIFT) & SYSREG_OP0_MASK
-}
-
-pub fn sysreg_op1(sysreg: u32) -> u32 {
-    (sysreg >> SYSREG_OP1_SHIFT) & SYSREG_OP1_MASK
-}
-
-pub fn sysreg_op2(sysreg: u32) -> u32 {
-    (sysreg >> SYSREG_OP2_SHIFT) & SYSREG_OP2_MASK
-}
-
-pub fn sysreg_crn(sysreg: u32) -> u32 {
-    (sysreg >> SYSREG_CRN_SHIFT) & SYSREG_CRN_MASK
-}
-
-pub fn sysreg_crm(sysreg: u32) -> u32 {
-    (sysreg >> SYSREG_CRM_SHIFT) & SYSREG_CRM_MASK
-}
-
-pub fn is_id_sysreg(reg: u32) -> bool {
-    sysreg_op0(reg) == 3
-        && sysreg_op1(reg) == 0
-        && sysreg_crn(reg) == 0
-        && sysreg_crm(reg) >= 1
-        && sysreg_crm(reg) < 8
-}

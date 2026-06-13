@@ -592,7 +592,7 @@ fn main() {
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
 
-    // Build the VcpuManager and (for single-vCPU) install the snapshot handler before run.
+    // Build the VcpuManager and install the snapshot handler before run.
     let mut manager = VcpuManager::new(smp, bus);
 
     let rx_stop_snap = ctx.rx_stop.clone();

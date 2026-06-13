@@ -9,14 +9,6 @@ name = "hvf-spike"
 path = "src/main.rs"
 
 [[bin]]
-name = "uart-echo"
-path = "src/bin/uart-echo.rs"
-
-[[bin]]
-name = "gic-smoke"
-path = "src/bin/gic-smoke.rs"
-
-[[bin]]
 name = "boot"
 path = "src/bin/boot.rs"
 

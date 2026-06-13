@@ -204,6 +204,7 @@ dependencies = [
  "ignition-vmnet",
  "libc",
  "log",
+ "serde_json",
 ]
 
 [[package]]

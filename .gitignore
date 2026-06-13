@@ -9,3 +9,10 @@ target/
 /snapshot/
 /snapshot.tmp/
 /snapshot2/
+/snapshot_smp/
+/vmnetsnap/
+# snapshot artifacts (any --snap-dir name) — never source files
+memory.bin
+gic.bin
+disk.img
+vmstate.json
