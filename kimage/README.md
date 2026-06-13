@@ -38,6 +38,13 @@ dd if=out/rootfs.ext4 bs=1 skip=$((0x438)) count=2 2>/dev/null | xxd  # expect: 
   guest's link — true for vmnet shared mode and typical Firecracker TAP setups.
   For a static address instead, replace `/etc/network/interfaces` with an
   `inet static` stanza in `build/build-rootfs.sh`.
+- `devmem`: alpine busybox ships no `devmem` applet, so `build/devmem.c` is
+  compiled static (musl) in the build container and installed at
+  `/usr/bin/devmem` (`devmem ADDR [WIDTH [VALUE]]`, busybox-compatible). The
+  build toolchain is removed afterward (`apk del`). Used by the boot-timer hook
+  `/etc/local.d/boottime.start` → `devmem 0x091FF000 8 123`, which signals
+  boot-complete to the VMM's boot_timer MMIO device. Requires kernel
+  `CONFIG_DEVMEM=y` (above).
 
 ## Booting in Firecracker
 
@@ -113,6 +120,9 @@ On top of the Firecracker CI config, `build/build-kernel.sh` force-enables
 - `CONFIG_VHOST` + `CONFIG_VHOST_VSOCK` — host-side vhost-vsock. Inert in a guest
   image (Firecracker does not use vhost), included on request. Drop these two if
   you want a leaner guest.
+- `CONFIG_DEVMEM=y`, `CONFIG_STRICT_DEVMEM=n` — `/dev/mem` access reaching MMIO,
+  needed by the boot-timer poke (see below). Strict devmem is forced off so a
+  userspace tool can write the device register at `BOOT_TIMER_ADDR`.
 
 ## How it was built
 

@@ -36,12 +36,16 @@ docker run --rm \
       --enable VSOCKETS \
       --enable VIRTIO_VSOCKETS \
       --enable VHOST \
-      --enable VHOST_VSOCK
+      --enable VHOST_VSOCK \
+      --enable DEVMEM \
+      --disable STRICT_DEVMEM \
+      --disable IO_STRICT_DEVMEM
 
     export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
     make olddefconfig
     echo "=== requested configs after olddefconfig ==="
-    grep -E "CONFIG_(VIRTIO_BALLOON|VSOCKETS|VIRTIO_VSOCKETS|VHOST|VHOST_VSOCK)=" .config || true
+    grep -E "CONFIG_(VIRTIO_BALLOON|VSOCKETS|VIRTIO_VSOCKETS|VHOST|VHOST_VSOCK|DEVMEM|STRICT_DEVMEM)=" .config || true
+    grep -E "CONFIG_STRICT_DEVMEM" .config || echo "CONFIG_STRICT_DEVMEM not set (good)"
     make -j"$(nproc)" Image
 
     # NOTE: never strip the arm64 Image. It is a valid PE/COFF binary, so
