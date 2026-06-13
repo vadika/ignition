@@ -9,6 +9,7 @@
 //   libkrun/src/devices/src/legacy/{vcpu.rs,gicv3.rs,hvfgicv3.rs}  (GIC + ICC traps)
 //   libkrun/src/vmm/src/device_manager/hvf/mmio.rs     (MMIO bus without irqfd)
 
+pub mod boot_timer;
 pub mod bus;
 pub mod device;
 pub mod rtc;

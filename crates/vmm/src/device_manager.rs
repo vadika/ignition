@@ -129,6 +129,14 @@ impl DeviceManager {
         Ok(typed)
     }
 
+    /// Register a plain BusDevice at a fixed guest-physical address — for pseudo
+    /// devices (boot_timer) that need a stable address known to the guest out-of-band
+    /// and have no SPI / FDT node / snapshot state. Bypasses the window/SPI allocators
+    /// and the record list.
+    pub fn add_fixed(&mut self, base: u64, len: u64, dev: Arc<Mutex<dyn BusDevice>>) -> Result<(), DeviceMgrError> {
+        self.bus.register(base, len, dev).map_err(DeviceMgrError::BusOverlap)
+    }
+
     /// FDT device descriptors for `fdt::generate` (call before `freeze`).
     pub fn fdt_devices(&self) -> Vec<FdtDevice> {
         self.records

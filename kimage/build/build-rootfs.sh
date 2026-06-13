@@ -10,10 +10,18 @@ TAR="$STAGE/rootfs.tar"
 
 # 1. Provision rootfs inside an arm64 alpine container (init, console, dirs).
 docker rm -f fcroot_build >/dev/null 2>&1 || true
-docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
+docker run --platform linux/arm64 --name fcroot_build \
+  -v "$(cd "$(dirname "$0")" && pwd)/devmem.c:/devmem.c:ro" \
+  alpine:3.19 sh -euxc '
   # socat provides a userspace AF_VSOCK client (VSOCK-CONNECT) for testing the
   # virtio-vsock device end to end (alpine 3.19 ships socat 1.8 with VSOCK support).
   apk add --no-cache openrc util-linux ifupdown-ng socat
+
+  # devmem: alpine busybox has no devmem applet, so compile a tiny static one
+  # (musl) for the boot-timer MMIO poke. Toolchain is removed afterwards.
+  apk add --no-cache --virtual .build gcc musl-dev
+  gcc -O2 -static /devmem.c -o /usr/bin/devmem
+  apk del .build
 
   # serial console on ttyS0 (Firecracker default)
   ln -sf agetty /etc/init.d/agetty.ttyS0
@@ -41,6 +49,11 @@ docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
   # local service (runs at boot, after device nodes exist).
   printf "#!/bin/sh\nifup -a\n" > /etc/local.d/network.start
   chmod +x /etc/local.d/network.start
+  # boot-timer: signal boot-complete to the VMM by writing the magic byte 123 to
+  # the boot-timer MMIO address (out-of-band fixed address; see layout::BOOT_TIMER_ADDR).
+  # Uses /usr/bin/devmem (compiled above) + kernel CONFIG_DEVMEM=y, STRICT_DEVMEM=n.
+  printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
+  chmod +x /etc/local.d/boottime.start
   rc-update add local boot
 '
 
