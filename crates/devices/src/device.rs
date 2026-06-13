@@ -5,11 +5,12 @@
 use crate::bus::{BusDevice, BusError};
 use serde::{Deserialize, Serialize};
 
-/// Which FDT node shape a device emits. (RTC `Pl031` arrives with sub-project C.)
+/// Which FDT node shape a device emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FdtKind {
     Ns16550a,
     VirtioMmio,
+    Pl031,
 }
 
 /// Failures from device placement / restore.

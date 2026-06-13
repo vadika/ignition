@@ -39,6 +39,8 @@ pub enum FdtDevice {
     /// Any virtio-mmio device -> `virtio,mmio` node (kernel reads the device id
     /// from the mmio registers, so blk/net/rng/... share one node shape).
     VirtioMmio(MmioDev),
+    /// ARM PL031 RTC -> `arm,pl031`/`arm,primecell` node (time-only, no interrupt).
+    Rtc(MmioDev),
 }
 
 /// GICv3 placement, supplied by the GIC milestone. Parameterized so FDT
@@ -91,6 +93,7 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
         match dev {
             FdtDevice::Serial(m) => create_serial_node(&mut fdt, m)?,
             FdtDevice::VirtioMmio(m) => create_virtio_node(&mut fdt, m)?,
+            FdtDevice::Rtc(m) => create_rtc_node(&mut fdt, m)?,
         }
     }
 
@@ -219,6 +222,21 @@ fn create_serial_node(fdt: &mut FdtWriter, serial: &MmioDev) -> Result<(), vm_fd
         &[IRQ_TYPE_SPI, serial.irq, IRQ_TYPE_EDGE_RISING],
     )?;
     fdt.end_node(uart)?;
+    Ok(())
+}
+
+fn create_rtc_node(fdt: &mut FdtWriter, rtc: &MmioDev) -> Result<(), vm_fdt::Error> {
+    let node = fdt.begin_node(&format!("rtc@{:x}", rtc.addr))?;
+    fdt.property_string_list(
+        "compatible",
+        vec!["arm,pl031".to_string(), "arm,primecell".to_string()],
+    )?;
+    fdt.property_array_u64("reg", &[rtc.addr, rtc.size])?;
+    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
+    fdt.property_string("clock-names", "apb_pclk")?;
+    // Time-only: no "interrupts" property (alarm not wired). The device still
+    // occupies a DeviceManager-allocated SPI, which simply goes unreferenced.
+    fdt.end_node(node)?;
     Ok(())
 }
 
@@ -424,5 +442,16 @@ mod tests {
         let dt = Fdt::new(&blob).unwrap();
         assert!(dt.find_node("/virtio_mmio@a000000").is_some());
         assert!(dt.find_node("/virtio_mmio@a000200").is_some());
+    }
+
+    #[test]
+    fn rtc_node_is_pl031_without_interrupts() {
+        let mut cfg = sample();
+        cfg.devices.push(FdtDevice::Rtc(MmioDev { addr: 0x0901_0000, size: 0x1000, irq: 3 }));
+        let blob = generate(&cfg).unwrap();
+        let fdt = Fdt::new(&blob).unwrap();
+        let node = fdt.find_node("/rtc@9010000").expect("rtc node present");
+        assert_eq!(dt_str(node.property("compatible").unwrap().value), "arm,pl031");
+        assert!(node.property("interrupts").is_none(), "rtc must not advertise an interrupt");
     }
 }
