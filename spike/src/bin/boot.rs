@@ -25,6 +25,7 @@ use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
+use devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicU32, Ordering};
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
@@ -214,6 +215,27 @@ fn spawn_stdin_reader(
     });
 }
 
+/// Poll the vsock device's host connection fds and drive RX. A 200 ms timeout also
+/// re-checks for newly-connected fds (TX adds connections between ticks).
+fn spawn_vsock_reactor(vsock: Arc<Mutex<devices::virtio::mmio::VirtioMmio>>) {
+    use std::os::unix::io::RawFd;
+    std::thread::spawn(move || loop {
+        let fds: Vec<RawFd> = { vsock.lock().unwrap().vsock_poll_set() };
+        if fds.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        } else {
+            // POLLIN only: idle sockets are ~always writable, so POLLOUT would
+            // busy-loop. Buffered guest->host tx flushes each tick in service().
+            let mut pfds: Vec<libc::pollfd> = fds
+                .iter()
+                .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .collect();
+            unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+        }
+        vsock.lock().unwrap().poll_vsock_rx();
+    });
+}
+
 /// Unbuffered stdout sink for the guest console: writes each byte straight
 /// through and flushes, so a newline-less prompt is visible immediately.
 #[derive(Default)]
@@ -238,6 +260,7 @@ fn main() {
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
     let mut net = false;
+    let mut vsock_uds: Option<PathBuf> = None;
     let mut snap_dir: PathBuf = PathBuf::from("./snapshot");
     let mut restore_dir: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -260,6 +283,10 @@ fn main() {
                 let v = it.next().expect("--snap-dir needs a path");
                 snap_dir = PathBuf::from(v);
             }
+            "--vsock-uds" => {
+                let v = it.next().expect("--vsock-uds needs a path");
+                vsock_uds = Some(PathBuf::from(v));
+            }
             "--restore" => {
                 let v = it.next().expect("--restore needs a directory path");
                 restore_dir = Some(PathBuf::from(v));
@@ -274,7 +301,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(dir) = restore_dir {
-        match run_restore(&dir) {
+        match run_restore(&dir, vsock_uds) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -285,7 +312,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--net] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--net] [--vsock-uds <path>] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     let kernel_image = fs::read(&positionals[0]).expect("failed to read kernel image");
@@ -388,6 +415,18 @@ fn main() {
             }
         });
         eprintln!("virtio-net: enabled (vmnet shared/NAT)");
+    }
+
+    if let Some(ref uds) = vsock_uds {
+        let guest_ram_vsock = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        let vsock_dev = VsockDevice::new(uds.clone());
+        let vsock_mmio = mgr
+            .add(layout::MMIO_WINDOW, move |irq| {
+                VirtioMmio::new("vsock", Box::new(vsock_dev), guest_ram_vsock, irq)
+            })
+            .expect("add vsock");
+        spawn_vsock_reactor(vsock_mmio);
+        eprintln!("virtio-vsock: enabled (host uds base {})", uds.display());
     }
 
     // Build and place the device tree.
@@ -502,7 +541,7 @@ fn main() {
 /// Restore a snapshot from `dir` and resume the guest.
 /// Does NOT load a kernel, generate an FDT, or call set_initial_state.
 /// The running kernel + DTB are already in memory.bin.
-fn run_restore(dir: &Path) -> io::Result<()> {
+fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     // 1. Read the snapshot metadata.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
     assert_eq!(
@@ -612,6 +651,16 @@ fn run_restore(dir: &Path) -> io::Result<()> {
             // no-net path (the handler is installed only when `smp == 1 && !net`),
             // so a net record never reaches here. If that gate is relaxed, this
             // arm fails loudly rather than silently dropping the device.
+            "vsock" => {
+                // Connections are not snapshotted (E1 TODO); restore an empty device.
+                let guest_ram_vsock = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+                let uds = vsock_uds.clone().unwrap_or_else(|| std::env::temp_dir().join("ignition-vsock"));
+                let vsock_dev = VsockDevice::new(uds);
+                let handle = mgr.add_restored(rec, move |irq| {
+                    VirtioMmio::new("vsock", Box::new(vsock_dev), guest_ram_vsock, irq)
+                }).map_err(io::Error::other)?;
+                spawn_vsock_reactor(handle);
+            }
             other => {
                 return Err(io::Error::other(format!(
                     "unknown device id in snapshot: {other}"
