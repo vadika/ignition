@@ -31,7 +31,8 @@ use ignition_devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ignition_hvf::gic::HvfGicV3;
 use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
-use ignition_vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
+use ignition_vmm::names;
+use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
 
@@ -420,6 +421,30 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
     Ok(())
 }
 
+/// Write a named base snapshot into `<store>/snapshots/<write_name>/`, plus its
+/// manifest, and print the resolved name. Shared by the boot and restore handlers.
+#[allow(clippy::too_many_arguments)]
+fn write_named_snapshot(
+    store: &Path,
+    write_name: &str,
+    ram: &[u8],
+    gic_blob: &[u8],
+    disk_src: &Path,
+    checkpoints: Vec<VcpuCheckpoint>,
+    devices: Vec<DeviceRecord>,
+    mem_size: u64,
+) -> io::Result<()> {
+    let base = snapshot::base_dir(store, write_name);
+    let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
+    let vcpu_count = config.vcpu_count;
+    let snap = VmSnapshot::new(config, checkpoints, devices);
+    snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
+    let manifest = SnapshotManifest::new(write_name.to_string(), mem_size, vcpu_count);
+    snapshot::write_manifest(&base, &manifest)?;
+    eprintln!("[snapshot] '{write_name}' written to {}", base.display());
+    Ok(())
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -431,8 +456,10 @@ fn main() {
     let mut mem_mib: u64 = 512; // default 512 MiB (the historical RAM_SIZE)
     let mut net = false;
     let mut vsock_uds: Option<PathBuf> = None;
-    let mut snap_dir: PathBuf = PathBuf::from("./snapshot");
-    let mut restore_dir: Option<PathBuf> = None;
+    let mut store: PathBuf = PathBuf::from("./vmstore");
+    let mut name: Option<String> = None;
+    let mut force = false;
+    let mut restore_name: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -458,17 +485,21 @@ fn main() {
             "--net" => {
                 net = true;
             }
-            "--snap-dir" => {
-                let v = it.next().expect("--snap-dir needs a path");
-                snap_dir = PathBuf::from(v);
+            "--store" => {
+                store = PathBuf::from(it.next().expect("--store needs a path"));
+            }
+            "--name" => {
+                name = Some(it.next().expect("--name needs a value").to_string());
+            }
+            "--force" => {
+                force = true;
             }
             "--vsock-uds" => {
                 let v = it.next().expect("--vsock-uds needs a path");
                 vsock_uds = Some(PathBuf::from(v));
             }
             "--restore" => {
-                let v = it.next().expect("--restore needs a directory path");
-                restore_dir = Some(PathBuf::from(v));
+                restore_name = Some(it.next().expect("--restore needs a snapshot name").to_string());
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown flag: {other}");
@@ -481,8 +512,8 @@ fn main() {
     let ram_size: u64 = mem_mib << 20; // MiB -> bytes
 
     // Restore path: skip normal boot entirely.
-    if let Some(dir) = restore_dir {
-        match run_restore(&dir, vsock_uds) {
+    if let Some(rname) = restore_name {
+        match run_restore(&store, &rname, name.clone(), force, vsock_uds) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -493,7 +524,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--net] [--vsock-uds <path>] [--snap-dir <dir>] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -607,6 +638,8 @@ fn main() {
     // Build the VcpuManager and install the snapshot handler before run.
     let mut manager = VcpuManager::new(smp, bus);
 
+    let write_name = name.clone().unwrap_or_else(names::generate);
+
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
 
@@ -617,7 +650,8 @@ fn main() {
         let gic_snap = gic.clone();
         let snap_devices = frozen.clone();
         let disk_path_snap = disk_path.clone();
-        let snap_dir_snap = snap_dir.clone();
+        let store_snap = store.clone();
+        let write_name_snap = write_name.clone();
         // The guest RAM base pointer captured as usize: raw *const u8 is neither
         // Send nor Sync, but usize is. Sound because the closure only reads the
         // slice at the rendezvous, when every vCPU is parked at the barrier. The
@@ -634,8 +668,6 @@ fn main() {
             };
 
             let devices = snap_devices.save();
-            let config = VmConfig { mem_size: ram_size_snap, vcpu_count: checkpoints.len() as u64 };
-            let snap = VmSnapshot::new(config, checkpoints, devices);
 
             // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
             if let Some(stop) = &rx_stop_snap {
@@ -653,14 +685,18 @@ fn main() {
             let disk_src = match &disk_path_snap {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    let placeholder = snap_dir_snap.join("disk.img");
+                    let placeholder = std::env::temp_dir()
+                        .join(format!("ignition-empty-disk-{}", process::id()));
                     let _ = std::fs::write(&placeholder, b"");
                     placeholder
                 }
             };
 
-            match snapshot::write_snapshot(&snap_dir_snap, &snap, ram_slice, &gic_blob, &disk_src) {
-                Ok(()) => eprintln!("[snapshot] written to {}", snap_dir_snap.display()),
+            match write_named_snapshot(
+                &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
+                checkpoints, devices, ram_size_snap,
+            ) {
+                Ok(()) => {}
                 Err(e) => eprintln!("[snapshot] write failed: {e}"),
             }
 
@@ -676,6 +712,7 @@ fn main() {
     let termios = TermiosGuard::new();
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b), {smp} vCPU(s) ---");
+    eprintln!("--- snapshots will be saved as '{write_name}' under {} ---", store.display());
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
     match manager.run(entry, fdt_addr) {
@@ -684,10 +721,19 @@ fn main() {
     }
 }
 
-/// Restore a snapshot from `dir` and resume the guest.
+/// Restore a named base snapshot from `<store>/snapshots/<restore_name>/` and resume the guest.
 /// Does NOT load a kernel, generate an FDT, or call set_initial_state.
 /// The running kernel + DTB are already in memory.bin.
-fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
+fn run_restore(
+    store: &Path,
+    restore_name: &str,
+    name: Option<String>,
+    force: bool,
+    vsock_uds: Option<PathBuf>,
+) -> io::Result<()> {
+    let dir = snapshot::base_dir(store, restore_name);
+    let dir = dir.as_path();
+    let _ = (&name, force); // used by the re-snapshot handler in the next task
     // Host-side restore clock: mmap + memory.bin load + GIC/device/vCPU state
     // restore, up to handing the guest to the run loop. The boot-timer device
     // can't measure restore (the guest's init does not re-run), so this is the
@@ -707,7 +753,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
 
     // Per-restore instance dir: CoW clones of the immutable base live here, so the
     // running guest never writes back into the base. (A later task moves this under the store.)
-    let inst_dir = std::env::temp_dir().join(format!("ignition-inst-{}", process::id()));
+    let inst_dir = snapshot::instance_dir(store, restore_name, process::id());
     let _ = fs::remove_dir_all(&inst_dir);
     fs::create_dir_all(&inst_dir)?;
     let inst_mem = inst_dir.join("memory.bin");
