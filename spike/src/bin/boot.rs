@@ -1105,6 +1105,12 @@ fn run_restore(
     {
         let store_snap = store.to_path_buf();
         let write_name_snap = write_name.clone();
+        // The restored-from leaf, captured INDEPENDENTLY of dirty tracking. Guards
+        // the immutable source layer below: a restored guest must never silently
+        // clobber the snapshot it was restored from, whether or not --track-dirty
+        // seeded current_parent. (Without tracking the seed is None, so the
+        // same-name-as-parent guard alone would not catch it.)
+        let restored_from = restore_name.to_string();
         let gic_snap = gic.clone();
         let snap_devices = frozen.clone();
         let disk_snap = disk.clone();
@@ -1119,6 +1125,20 @@ fn run_restore(
             //   None    -> Full root (only when tracking is off).
             //   Some(p) -> Diff against p; requires the tracker to be armed.
             let parent = parent_snap.lock().unwrap().clone();
+
+            // Restored-from guard (independent of dirty tracking): refuse to overwrite
+            // the snapshot this guest was restored from. Applies to BOTH Full and Diff
+            // branches — without --track-dirty current_parent is None, so the
+            // same-name-as-parent guard below would let a `--name <source>` Full clobber
+            // the immutable source layer. Runs BEFORE drain so a refused write keeps any
+            // accumulated dirty set for the next attempt.
+            if write_name_snap == restored_from && !force_snap {
+                eprintln!(
+                    "[snapshot] refusing to overwrite the base '{write_name_snap}' you are \
+                     restored from; pass --force or --name <other>"
+                );
+                return;
+            }
 
             if parent.is_some() && dirty_snap.is_none() {
                 eprintln!("dirty tracking not enabled; restart with --track-dirty for diffs");
