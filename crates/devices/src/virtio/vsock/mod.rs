@@ -116,11 +116,28 @@ impl VirtioDevice for VsockDevice {
     fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
         self.muxer.poll_set()
     }
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({ "conns": self.muxer.save_conns() })
+    }
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        let conns = v.get("conns").and_then(|c| c.as_array())
+            .ok_or("vsock: missing conns array")?;
+        let keys = conns.iter().map(|pair| {
+            let a = pair.as_array().ok_or("vsock: conn not a pair")?;
+            if a.len() != 2 { return Err("vsock: conn not a pair".to_string()); }
+            let g = a.first().and_then(|x| x.as_u64()).ok_or("vsock: bad guest_port")? as u32;
+            let h = a.get(1).and_then(|x| x.as_u64()).ok_or("vsock: bad host_port")? as u32;
+            Ok::<(u32, u32), String>((g, h))
+        }).collect::<Result<Vec<_>, _>>()?;
+        self.muxer.seed_rst(keys);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtio::mmio::VirtioDevice as _;
 
     #[test]
     fn identity_and_config() {
@@ -130,5 +147,21 @@ mod tests {
         let mut c = [0u8; 8];
         dev.config_read(0, &mut c);
         assert_eq!(u64::from_le_bytes(c), 3);
+    }
+
+    #[test]
+    fn vsock_save_restore_seeds_rst() {
+        // A device with no live conns saves an empty list and restores cleanly.
+        let dev = VsockDevice::new(PathBuf::from("/tmp/ign-x/vsock"));
+        let saved = dev.save();
+        assert_eq!(saved, serde_json::json!({ "conns": [] }));
+
+        // Restoring a saved conn list seeds the muxer's pending RSTs.
+        let mut dev2 = VsockDevice::new(PathBuf::from("/tmp/ign-x/vsock"));
+        dev2.restore(&serde_json::json!({ "conns": [[1024, 5000]] })).expect("restore ok");
+        // The seeded RST surfaces on the next service()/RST drain.
+        dev2.muxer.service();
+        let pkt = dev2.muxer.pop_rx().expect("RST queued for restored conn");
+        assert_eq!((pkt.hdr.dst_port, pkt.hdr.src_port), (1024, 5000));
     }
 }
