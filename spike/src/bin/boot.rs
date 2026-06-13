@@ -735,6 +735,9 @@ fn main() {
         // handler `drain()`s it for the dirty page set and re-protects RAM after.
         let dirty_snap = dirty_tracker.clone();
         let parent_snap = current_parent.clone();
+        // --force gates the same-name-as-parent guard below, mirroring the
+        // restore-path guard. Captured by value (bool is Copy) so the closure owns it.
+        let force_snap = force;
 
         manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
@@ -748,6 +751,22 @@ fn main() {
             // writing a Full under a name the user expects to chain off a parent.
             if parent.is_some() && dirty_snap.is_none() {
                 eprintln!("dirty tracking not enabled; restart with --track-dirty for diffs");
+                return;
+            }
+
+            // Same-name-as-parent guard (spec §4): a Diff whose name equals its
+            // parent would atomically rename into base_dir(store, name) — the very
+            // dir holding the Full root the chain depends on — clobbering it (and
+            // forming a self-cycle). Refuse unless --force. Runs BEFORE drain so a
+            // refused diff keeps its accumulated dirty set for the next attempt.
+            if let Some(p) = &parent
+                && *p == write_name_snap
+                && !force_snap
+            {
+                eprintln!(
+                    "[snapshot] refusing to overwrite parent snapshot '{p}'; \
+                     pass --force or use a different --name"
+                );
                 return;
             }
 
