@@ -441,17 +441,6 @@ impl HvfVm {
             Ok(())
         }
     }
-
-    /// Re-protect an already-mapped guest range. `flags` is a bitwise-or of
-    /// `HV_MEMORY_READ`/`HV_MEMORY_WRITE`/`HV_MEMORY_EXEC`. Dropping `HV_MEMORY_WRITE`
-    /// makes subsequent guest writes to the range trap as Data-Abort permission
-    /// faults — the mechanism the dirty-page tracker is built on. `guest_addr` must
-    /// be page-aligned and `size` a multiple of the page size. Returns the raw
-    /// `hv_return_t` so callers (e.g. the feasibility spike) can distinguish the
-    /// exact failure code instead of collapsing it to a generic error.
-    pub fn protect_memory(&self, guest_addr: u64, size: u64, flags: u64) -> hv_return_t {
-        unsafe { hv_vm_protect(guest_addr, size.try_into().unwrap(), flags as hv_memory_flags_t) }
-    }
 }
 
 #[derive(Debug)]
