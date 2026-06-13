@@ -380,7 +380,10 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
     }
 
     // virtio-vsock — present iff a uds base was provided (boot) or a record exists (restore).
-    let want_vsock = matches!(mode, Mode::Restore(_)) || ctx.vsock_uds.is_some();
+    let want_vsock = match &mode {
+        Mode::Boot => ctx.vsock_uds.is_some(),
+        Mode::Restore(recs) => recs.iter().any(|r| r.id == "vsock"),
+    };
     if want_vsock {
         let uds = ctx.vsock_uds.clone()
             .unwrap_or_else(|| std::env::temp_dir().join("ignition-vsock"));

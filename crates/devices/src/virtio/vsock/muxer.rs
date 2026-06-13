@@ -29,9 +29,12 @@ impl Muxer {
         Muxer { uds_base, conns: HashMap::new(), rxq: VecDeque::new(), pending_rst: Vec::new() }
     }
 
-    /// Open connection keys for the snapshot (guest_port, host_port).
+    /// Open connection keys for the snapshot (guest_port, host_port). Sorted so
+    /// snapshots are reproducible (HashMap iteration order is nondeterministic).
     pub fn save_conns(&self) -> Vec<(u32, u32)> {
-        self.conns.keys().copied().collect()
+        let mut keys: Vec<(u32, u32)> = self.conns.keys().copied().collect();
+        keys.sort_unstable();
+        keys
     }
 
     /// Seed connections that existed at snapshot time; service() will RST each.
