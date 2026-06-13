@@ -18,6 +18,7 @@ const QUEUE_SIZE_MAX: u32 = 256;
 /// DeviceFeatures high word (sel 1): bit 0 == VIRTIO_F_VERSION_1 (feature bit 32).
 const FEATURES_HI_VERSION_1: u32 = 1;
 const INT_STATUS_USED: u32 = 1;
+const INT_STATUS_CONFIG: u32 = 2;
 
 /// A virtio device plugged into the mmio transport. The transport owns the
 /// virtqueues and the interrupt line; the device supplies identity, features,
@@ -32,6 +33,9 @@ pub trait VirtioDevice: Send {
     /// little-endian. The guest reads config at arbitrary widths (Linux reads the
     /// 6-byte virtio-net MAC byte-by-byte), so this must serve any `data.len()`.
     fn config_read(&self, offset: u64, data: &mut [u8]);
+    /// Apply a guest write to device config space at `offset` (relative to 0x100).
+    /// Default: ignore (most devices have read-only config).
+    fn config_write(&mut self, _offset: u64, _data: &[u8]) {}
     fn queue_count(&self) -> usize;
     /// Service a QueueNotify on `queue_idx`. Returns true if any buffer was used.
     fn handle_notify(&mut self, queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool;
@@ -243,6 +247,13 @@ impl VirtioMmio {
 }
 
 impl VirtioMmio {
+    /// Raise a config-change interrupt: the guest will re-read config space. Used
+    /// by the host to push a new balloon target (or any future config change).
+    pub fn signal_config_change(&mut self) {
+        self.interrupt_status |= INT_STATUS_CONFIG;
+        self.irq.set_spi(true);
+    }
+
     /// Capture the transport register + queue state for snapshot.
     pub fn save_state(&self) -> VirtioMmioState {
         let queues = self
@@ -316,7 +327,9 @@ impl BusDevice for VirtioMmio {
     }
 
     fn write(&mut self, _base: u64, offset: u64, data: &[u8]) {
-        if data.len() == 4 {
+        if offset >= 0x100 {
+            self.dev.config_write(offset - 0x100, data);
+        } else if data.len() == 4 {
             self.write_reg(offset, u32::from_le_bytes(data.try_into().unwrap()));
         } else {
             log::warn!("virtio-mmio: non-32-bit write at {offset:#x} len {}", data.len());
@@ -475,6 +488,66 @@ mod tests {
         let saved = MmioDevice::save(&t);
         MmioDevice::restore(&mut t, &saved).unwrap();
         assert_eq!(MmioDevice::save(&t), saved);
+    }
+
+    #[test]
+    fn config_write_routes_to_device() {
+        use std::sync::{Arc, Mutex};
+        use crate::virtio::NoopIrq;
+
+        #[derive(Clone, Default)]
+        struct RecDev { writes: Arc<Mutex<Vec<(u64, Vec<u8>)>>> }
+        impl VirtioDevice for RecDev {
+            fn device_id(&self) -> u32 { 99 }
+            fn device_features(&self, _: u32) -> u32 { 0 }
+            fn config_read(&self, _: u64, _: &mut [u8]) {}
+            fn queue_count(&self) -> usize { 1 }
+            fn handle_notify(&mut self, _: usize, _: &mut Virtqueue, _: &GuestRam) -> bool { false }
+            fn config_write(&mut self, offset: u64, data: &[u8]) {
+                self.writes.lock().unwrap().push((offset, data.to_vec()));
+            }
+        }
+
+        let backing = Box::leak(vec![0u8; 0x1000].into_boxed_slice());
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0x4000_0000);
+        let dev = RecDev::default();
+        let writes = dev.writes.clone();
+        let mut t = VirtioMmio::new("rec", Box::new(dev), mem, Arc::new(NoopIrq));
+
+        t.write(0, 0x104, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(writes.lock().unwrap().as_slice(), &[(0x04, vec![0xde, 0xad, 0xbe, 0xef])]);
+    }
+
+    #[test]
+    fn signal_config_change_sets_bit_and_asserts_irq() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecIrq { level: Mutex<Option<bool>> }
+        impl crate::virtio::IrqLine for RecIrq {
+            fn set_spi(&self, level: bool) { *self.level.lock().unwrap() = Some(level); }
+        }
+
+        #[derive(Default)]
+        struct Z;
+        impl VirtioDevice for Z {
+            fn device_id(&self) -> u32 { 0 }
+            fn device_features(&self, _: u32) -> u32 { 0 }
+            fn config_read(&self, _: u64, _: &mut [u8]) {}
+            fn queue_count(&self) -> usize { 0 }
+            fn handle_notify(&mut self, _: usize, _: &mut Virtqueue, _: &GuestRam) -> bool { false }
+        }
+
+        let backing = Box::leak(vec![0u8; 0x1000].into_boxed_slice());
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0x4000_0000);
+        let irq = Arc::new(RecIrq::default());
+        let mut t = VirtioMmio::new("z", Box::new(Z), mem, irq.clone());
+
+        t.signal_config_change();
+        let mut b = [0u8; 4];
+        t.read(0, 0x060, &mut b);
+        assert_eq!(u32::from_le_bytes(b) & 0b10, 0b10, "config-change bit set");
+        assert_eq!(*irq.level.lock().unwrap(), Some(true), "irq asserted");
     }
 
     #[test]
