@@ -15,18 +15,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, process};
 
-use arch::aarch64::fdt::{self, FdtConfig, MmioDev};
+use arch::aarch64::fdt::{self, FdtConfig};
 use arch::aarch64::{kernel, layout};
-use devices::bus::{Bus, BusDevice};
 use devices::serial::Serial;
-use devices::virtio::IrqLine;
 use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
-use vmm::snapshot::{self, MmioWindow, VmConfig, VmSnapshot};
+use vmm::device_manager::DeviceManager;
+use vmm::snapshot::{self, VmConfig, VmSnapshot};
 use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
 
@@ -197,21 +196,9 @@ fn spawn_stdin_reader(
     });
 }
 
-/// Adapts the in-kernel GIC to the device `IrqLine`. The virtio SPI index is the
-/// bare FDT index; hv_gic_set_spi wants the absolute INTID (32 + index).
-struct GicIrq {
-    gic: Arc<HvfGicV3>,
-    /// Absolute GIC INTID (SPI index + 32).
-    intid: u32,
-}
-impl IrqLine for GicIrq {
-    fn set_spi(&self, level: bool) {
-        let _ = self.gic.set_spi(self.intid, level);
-    }
-}
-
 /// Unbuffered stdout sink for the guest console: writes each byte straight
 /// through and flushes, so a newline-less prompt is visible immediately.
+#[derive(Default)]
 struct FlushWriter;
 impl Write for FlushWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -312,32 +299,63 @@ fn main() {
     let mut vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
     let gic = Arc::new(HvfGicV3::new(smp, layout::RAM_BASE).expect("hv_gic_create failed"));
 
-    // Build and place the device tree.
-    let mut fdt_devices = vec![fdt::FdtDevice::Serial(MmioDev {
-        addr: layout::SERIAL_BASE,
-        size: layout::SERIAL_SIZE,
-        irq: layout::SERIAL_SPI,
-    })];
-    if disk_path.is_some() {
-        fdt_devices.push(fdt::FdtDevice::VirtioBlk(MmioDev {
-            addr: layout::VIRTIO_BASE,
-            size: layout::VIRTIO_SIZE,
-            irq: layout::VIRTIO_SPI,
-        }));
+    // Device manager: bump-allocates MMIO windows + SPIs, mints GIC IRQs.
+    let mut mgr = DeviceManager::new(
+        gic.clone(),
+        layout::MMIO_BASE,
+        layout::MMIO_LEN,
+        layout::SPI_BASE,
+        layout::SPI_COUNT,
+    );
+
+    // Serial is always the first device (its base matches the earlycon address
+    // in the kernel command line).
+    let serial = mgr
+        .add(layout::MMIO_WINDOW, |irq| Serial::with_irq(FlushWriter, irq))
+        .expect("add serial");
+
+    if let Some(path) = &disk_path {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("failed to open rootfs disk");
+        let blk = VirtioBlk::new(file).expect("virtio-blk init failed");
+        // SAFETY: the host mapping outlives the run; the device touches it only
+        // during MMIO exits, when the guest is paused.
+        let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        mgr.add(layout::MMIO_WINDOW, move |irq| {
+            VirtioMmio::new("virtio-blk", Box::new(blk), guest_ram, irq)
+        })
+        .expect("add virtio-blk");
+        eprintln!("virtio : /dev/vda backed by {path}");
     }
+
     if net {
-        fdt_devices.push(fdt::FdtDevice::VirtioNet(MmioDev {
-            addr: layout::NET_BASE,
-            size: layout::NET_SIZE,
-            irq: layout::NET_SPI,
-        }));
+        let (backend, rx) = ignition_vmnet::VmnetBackend::start()
+            .expect("vmnet start failed (run boot under sudo for --net)");
+        let guest_ram_net = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        let net_dev = VirtioNet::new(backend);
+        let net_mmio = mgr
+            .add(layout::MMIO_WINDOW, move |irq| {
+                VirtioMmio::new("virtio-net", Box::new(net_dev), guest_ram_net, irq)
+            })
+            .expect("add virtio-net");
+        std::thread::spawn(move || {
+            for frame in rx {
+                net_mmio.lock().unwrap().inject_rx(&frame);
+            }
+        });
+        eprintln!("virtio-net: enabled (vmnet shared/NAT)");
     }
+
+    // Build and place the device tree.
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
         mem_size: RAM_SIZE,
         cpu_mpidrs: (0..smp).map(mpidr_for).collect(),
         cmdline: layout::default_cmdline(),
-        devices: fdt_devices,
+        devices: mgr.fdt_devices(),
         gic: gic.fdt_info(),
         initrd: None,
     };
@@ -362,68 +380,11 @@ fn main() {
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
-    // Device bus: 16550 serial to stdout, plus an optional virtio-blk disk.
-    // Flush each byte: a prompt like "login: " has no trailing newline and would
-    // otherwise sit forever in stdout's line buffer, looking like a hang.
-    let mut bus = Bus::new();
-    let serial_irq = Arc::new(GicIrq { gic: gic.clone(), intid: layout::SERIAL_SPI + 32 });
-    let serial: Arc<Mutex<Serial<FlushWriter>>> =
-        Arc::new(Mutex::new(Serial::with_irq(FlushWriter, serial_irq)));
-    let serial_bus: Arc<Mutex<dyn BusDevice>> = serial.clone();
-    bus.register(layout::SERIAL_BASE, layout::SERIAL_SIZE, serial_bus)
-        .expect("serial range overlap");
+    // Freeze the device set: transfers bus ownership to the run loop.
+    let frozen = Arc::new(mgr.freeze());
+    let bus = frozen.bus();
 
-    // Keep a typed Arc for the snapshot handler (None when no disk).
-    let virtio_blk_mmio: Option<Arc<Mutex<VirtioMmio>>>;
-
-    if let Some(path) = &disk_path {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("failed to open rootfs disk");
-        let blk = VirtioBlk::new(file).expect("virtio-blk init failed");
-        // SAFETY: the host mapping outlives the run; the device touches it only
-        // during MMIO exits, when the guest is paused.
-        let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        let virtio: Arc<Mutex<VirtioMmio>> =
-            Arc::new(Mutex::new(VirtioMmio::new(
-                Box::new(blk),
-                guest_ram,
-                Arc::new(GicIrq { gic: gic.clone(), intid: layout::VIRTIO_SPI + 32 }),
-            )));
-        let virtio_bus: Arc<Mutex<dyn BusDevice>> = virtio.clone();
-        bus.register(layout::VIRTIO_BASE, layout::VIRTIO_SIZE, virtio_bus)
-            .expect("virtio range overlap");
-        virtio_blk_mmio = Some(virtio);
-        eprintln!("virtio : /dev/vda backed by {path}");
-    } else {
-        virtio_blk_mmio = None;
-    }
-
-    if net {
-        let (backend, rx) = ignition_vmnet::VmnetBackend::start()
-            .expect("vmnet start failed (run boot under sudo for --net)");
-        let net_irq = Arc::new(GicIrq { gic: gic.clone(), intid: layout::NET_SPI + 32 });
-        let guest_ram_net = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        let net_dev = VirtioNet::new(backend);
-        let net_mmio: Arc<Mutex<VirtioMmio>> =
-            Arc::new(Mutex::new(VirtioMmio::new(Box::new(net_dev), guest_ram_net, net_irq)));
-        let net_bus: Arc<Mutex<dyn BusDevice>> = net_mmio.clone();
-        bus.register(layout::NET_BASE, layout::NET_SIZE, net_bus)
-            .expect("net range overlap");
-        let net_rx = net_mmio.clone();
-        std::thread::spawn(move || {
-            for frame in rx {
-                net_rx.lock().unwrap().inject_rx(&frame);
-            }
-        });
-        eprintln!("virtio-net: enabled (vmnet shared/NAT)");
-    }
-
-    let bus = Arc::new(bus);
-
-    // Build the VcpuManager and (for single-vCPU + disk + no-net) install the
+    // Build the VcpuManager and (for single-vCPU + no-net) install the
     // snapshot handler before run.
     let mut manager = VcpuManager::new(smp, bus);
 
@@ -431,8 +392,7 @@ fn main() {
         // Build a closure capturing all state needed to write the snapshot.
         // Clone Arcs and scalars; raw pointer is captured as usize for Send+Sync.
         let gic_snap = gic.clone();
-        let serial_snap = serial.clone();
-        let blk_snap = virtio_blk_mmio.clone();
+        let snap_devices = frozen.clone();
         let disk_path_snap = disk_path.clone();
         let snap_dir_snap = snap_dir.clone();
         // The guest RAM base pointer captured as usize: raw *const u8 is neither
@@ -453,39 +413,10 @@ fn main() {
                 Ok(b) => b,
                 Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
             };
-            let blk_state = blk_snap.as_ref().map(|v| v.lock().unwrap().save());
-            let serial_state = serial_snap.lock().unwrap().save();
 
-            // Build VmSnapshot.
-            let blk_mmio_state = match blk_state {
-                Some(s) => s,
-                None => {
-                    // No disk — snapshot of a diskless guest is degenerate but allowed.
-                    devices::virtio::mmio::VirtioMmioState {
-                        status: 0, queue_sel: 0, device_features_sel: 0,
-                        interrupt_status: 0, queues: vec![],
-                    }
-                }
-            };
-            let config = VmConfig {
-                mem_size: RAM_SIZE,
-                vcpu_count: 1,
-                serial: MmioWindow {
-                    base: layout::SERIAL_BASE,
-                    size: layout::SERIAL_SIZE,
-                    spi: layout::SERIAL_SPI,
-                },
-                blk: MmioWindow {
-                    base: layout::VIRTIO_BASE,
-                    size: layout::VIRTIO_SIZE,
-                    spi: layout::VIRTIO_SPI,
-                },
-            };
-            let devices_state = vmm::snapshot::DeviceState {
-                blk: blk_mmio_state,
-                serial: serial_state,
-            };
-            let snap = VmSnapshot::new(config, vcpu_state, devices_state);
+            let devices = snap_devices.save();
+            let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: 1 };
+            let snap = VmSnapshot::new(config, vcpu_state, devices);
 
             // The RAM slice — host_usize round-trip avoids capturing *const u8.
             let ram_slice: &[u8] = unsafe {
@@ -531,8 +462,6 @@ fn main() {
 /// Does NOT load a kernel, generate an FDT, or call set_initial_state.
 /// The running kernel + DTB are already in memory.bin.
 fn run_restore(dir: &Path) -> io::Result<()> {
-    use devices::bus::BusDevice;
-
     // 1. Read the snapshot metadata.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
     assert_eq!(
@@ -583,44 +512,53 @@ fn run_restore(dir: &Path) -> io::Result<()> {
     vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
         .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
 
-    // 6. Copy disk.img to a private instance so clones are independent.
-    let instance_disk = std::env::temp_dir().join(format!("ignition-instance-{}.img", process::id()));
-    fs::copy(&paths.disk, &instance_disk)?;
-    let disk_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&instance_disk)
-        .map_err(|e| io::Error::other(format!("open instance disk: {e}")))?;
+    // 6. Restore devices at their saved addresses via DeviceManager.
+    let mut mgr = DeviceManager::new(
+        gic.clone(),
+        layout::MMIO_BASE,
+        layout::MMIO_LEN,
+        layout::SPI_BASE,
+        layout::SPI_COUNT,
+    );
+    let mut serial_handle = None;
+    for rec in &snap.devices {
+        match rec.id.as_str() {
+            "serial" => {
+                let s = mgr
+                    .add_restored(rec, |irq| Serial::with_irq(FlushWriter, irq))
+                    .map_err(io::Error::other)?;
+                serial_handle = Some(s);
+            }
+            "virtio-blk" => {
+                // Copy disk.img to a private instance so clones are independent.
+                let instance_disk = std::env::temp_dir()
+                    .join(format!("ignition-instance-{}.img", process::id()));
+                fs::copy(&paths.disk, &instance_disk)?;
+                let disk_file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&instance_disk)
+                    .map_err(|e| io::Error::other(format!("open instance disk: {e}")))?;
+                let blk = VirtioBlk::new(disk_file)
+                    .map_err(|e| io::Error::other(format!("VirtioBlk::new: {e}")))?;
+                let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+                mgr.add_restored(rec, move |irq| {
+                    VirtioMmio::new("virtio-blk", Box::new(blk), guest_ram, irq)
+                })
+                .map_err(io::Error::other)?;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown device id in snapshot: {other}"
+                )))
+            }
+        }
+    }
+    let serial = serial_handle.expect("snapshot had no serial device");
+    let frozen = mgr.freeze();
+    let bus = frozen.bus();
 
-    // 7. Build the bus from the restored device state.
-    let mut bus = Bus::new();
-
-    // Serial.
-    let serial_irq: Arc<dyn IrqLine> =
-        Arc::new(GicIrq { gic: gic.clone(), intid: snap.config.serial.spi + 32 });
-    let serial: Arc<Mutex<Serial<FlushWriter>>> = Arc::new(Mutex::new(
-        Serial::from_snapshot(FlushWriter, serial_irq, &snap.devices.serial),
-    ));
-    let serial_bus: Arc<Mutex<dyn BusDevice>> = serial.clone();
-    bus.register(snap.config.serial.base, snap.config.serial.size, serial_bus)
-        .map_err(|e| io::Error::other(format!("serial bus register: {e:?}")))?;
-
-    // Virtio-blk.
-    let blk = VirtioBlk::new(disk_file)
-        .map_err(|e| io::Error::other(format!("VirtioBlk::new: {e}")))?;
-    let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-    let blk_irq: Arc<dyn IrqLine> =
-        Arc::new(GicIrq { gic: gic.clone(), intid: snap.config.blk.spi + 32 });
-    let mut blk_mmio = VirtioMmio::new(Box::new(blk), guest_ram, blk_irq);
-    blk_mmio.restore(&snap.devices.blk);
-    let blk_arc: Arc<Mutex<VirtioMmio>> = Arc::new(Mutex::new(blk_mmio));
-    let blk_bus: Arc<Mutex<dyn BusDevice>> = blk_arc.clone();
-    bus.register(snap.config.blk.base, snap.config.blk.size, blk_bus)
-        .map_err(|e| io::Error::other(format!("blk bus register: {e:?}")))?;
-
-    let bus = Arc::new(bus);
-
-    // 8. Set up the interactive console (raw terminal + stdin reader).
+    // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
     let manager = VcpuManager::new(1, bus);
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone());
@@ -630,7 +568,7 @@ fn run_restore(dir: &Path) -> io::Result<()> {
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
-    // 9. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
+    // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
     match manager.run_restored(snap.vcpu, Some(gic_blob)) {
         Ok(()) => {}
         Err(e) => return Err(io::Error::other(format!("run_restored: {e}"))),
