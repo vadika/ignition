@@ -170,7 +170,6 @@ impl VirtioDevice for VirtioBlk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     use crate::virtio::guest_ram::GuestRam;
     use crate::virtio::queue::{Desc, DescChain};

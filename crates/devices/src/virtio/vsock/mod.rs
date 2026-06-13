@@ -137,7 +137,6 @@ impl VirtioDevice for VsockDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::mmio::VirtioDevice as _;
 
     #[test]
     fn identity_and_config() {

@@ -519,12 +519,12 @@ mod tests {
         assert!(out.iter().all(|&b| b == 0xBB));
         assert_eq!(m.read_u16(used + 2), Some(1)); // used.idx
         assert_eq!(rd(&mut d, 0x060), 1); // InterruptStatus = used
-        assert_eq!(*irq.0.lock().unwrap().last().unwrap(), true);
+        assert!(*irq.0.lock().unwrap().last().unwrap());
 
         // ACK clears the interrupt and deasserts.
         wr(&mut d, 0x064, 1);
         assert_eq!(rd(&mut d, 0x060), 0);
-        assert_eq!(*irq.0.lock().unwrap().last().unwrap(), false);
+        assert!(!(*irq.0.lock().unwrap().last().unwrap()));
     }
 
     fn test_transport(id: &'static str) -> VirtioMmio {
@@ -550,8 +550,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use crate::virtio::NoopIrq;
 
+        type WriteLog = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+
         #[derive(Clone, Default)]
-        struct RecDev { writes: Arc<Mutex<Vec<(u64, Vec<u8>)>>> }
+        struct RecDev { writes: WriteLog }
         impl VirtioDevice for RecDev {
             fn device_id(&self) -> u32 { 99 }
             fn device_features(&self, _: u32) -> u32 { 0 }
@@ -682,7 +684,7 @@ mod tests {
     fn virtio_mmio_roundtrips_inner_device_state() {
         let mem = GuestRam::new(std::ptr::null_mut(), 0, 0);
         let irq: Arc<dyn IrqLine> = Arc::new(crate::virtio::NoopIrq);
-        let mut a = VirtioMmio::new("mock", Box::new(StatefulMock { counter: 7 }), mem, irq.clone());
+        let a = VirtioMmio::new("mock", Box::new(StatefulMock { counter: 7 }), mem, irq.clone());
         let saved = a.save();
 
         let mem2 = GuestRam::new(std::ptr::null_mut(), 0, 0);

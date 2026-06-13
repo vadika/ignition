@@ -517,8 +517,8 @@ fn main() {
         eprintln!("virtio-vsock: enabled (host uds base {})",
             ctx.vsock_uds.as_ref().unwrap().display());
     }
-    if disk_path.is_some() {
-        eprintln!("virtio : /dev/vda backed by {}", disk_path.as_ref().unwrap());
+    if let Some(dp) = &disk_path {
+        eprintln!("virtio : /dev/vda backed by {dp}");
     }
     if net { eprintln!("virtio-net: enabled (vmnet shared/NAT)"); }
 
@@ -707,77 +707,34 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
         layout::SPI_BASE,
         layout::SPI_COUNT,
     );
-    let mut serial_handle = None;
-    let mut balloon_restore: Option<(Arc<AtomicU32>, Arc<Mutex<devices::virtio::mmio::VirtioMmio>>)> = None;
-    for rec in &snap.devices {
-        match rec.id.as_str() {
-            "serial" => {
-                let s = mgr
-                    .add_restored(rec, |irq| Serial::with_irq(FlushWriter, irq))
-                    .map_err(io::Error::other)?;
-                serial_handle = Some(s);
-            }
-            "virtio-blk" => {
-                // Copy disk.img to a private instance so clones are independent.
-                let instance_disk = std::env::temp_dir()
-                    .join(format!("ignition-instance-{}.img", process::id()));
-                fs::copy(&paths.disk, &instance_disk)?;
-                let disk_file = fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&instance_disk)
-                    .map_err(|e| io::Error::other(format!("open instance disk: {e}")))?;
-                let blk = VirtioBlk::new(disk_file)
-                    .map_err(|e| io::Error::other(format!("VirtioBlk::new: {e}")))?;
-                let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-                mgr.add_restored(rec, move |irq| {
-                    VirtioMmio::new("virtio-blk", Box::new(blk), guest_ram, irq)
-                })
-                .map_err(io::Error::other)?;
-            }
-            "virtio-rng" => {
-                let guest_ram_rng = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-                mgr.add_restored(rec, move |irq| {
-                    VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), guest_ram_rng, irq)
-                })
-                .map_err(io::Error::other)?;
-            }
-            "rtc" => {
-                mgr.add_restored(rec, |_irq| Pl031::new()).map_err(io::Error::other)?;
-            }
-            "virtio-balloon" => {
-                let guest_ram_balloon = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-                let (balloon_dev, target) = Balloon::new();
-                let handle = mgr.add_restored(rec, move |irq| {
-                    VirtioMmio::new("virtio-balloon", Box::new(balloon_dev), guest_ram_balloon, irq)
-                })
-                .map_err(io::Error::other)?;
-                balloon_restore = Some((target, handle));
-            }
-            // No "virtio-net" arm: snapshots are only taken on the single-vCPU,
-            // no-net path (the handler is installed only when `smp == 1 && !net`),
-            // so a net record never reaches here. If that gate is relaxed, this
-            // arm fails loudly rather than silently dropping the device.
-            "vsock" => {
-                // Connections are not snapshotted (E1 TODO); restore an empty device.
-                let guest_ram_vsock = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-                let uds = vsock_uds.clone().unwrap_or_else(|| std::env::temp_dir().join("ignition-vsock"));
-                let vsock_dev = VsockDevice::new(uds);
-                let handle = mgr.add_restored(rec, move |irq| {
-                    VirtioMmio::new("vsock", Box::new(vsock_dev), guest_ram_vsock, irq)
-                }).map_err(io::Error::other)?;
-                spawn_vsock_reactor(handle);
-            }
-            other => {
-                return Err(io::Error::other(format!(
-                    "unknown device id in snapshot: {other}"
-                )))
-            }
-        }
+    // Private disk instance so clones are independent (only if the snapshot has a disk).
+    let disk = if snap.devices.iter().any(|r| r.id == "virtio-blk") {
+        let instance_disk = std::env::temp_dir()
+            .join(format!("ignition-instance-{}.img", process::id()));
+        fs::copy(&paths.disk, &instance_disk)?;
+        Some(instance_disk)
+    } else {
+        None
+    };
+
+    let mut ctx = DeviceContext {
+        host: host as *mut u8,
+        ram_size: RAM_SIZE,
+        disk,
+        vsock_uds: vsock_uds.clone(),
+        net: false, // snapshots never contain net
+        serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
+    };
+    setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
+
+    let serial = ctx.serial.clone().ok_or_else(|| io::Error::other("snapshot had no serial device"))?;
+    let balloon_target = ctx.balloon_target.clone()
+        .ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
+    let balloon = ctx.balloon.clone()
+        .ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
+    if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
+        spawn_vsock_reactor(vsock_mmio);
     }
-    let serial = serial_handle.ok_or_else(|| io::Error::other("snapshot had no serial device"))?;
-    let (balloon_target, balloon) =
-        balloon_restore.ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
     let frozen = mgr.freeze();
     let bus = frozen.bus();
 
