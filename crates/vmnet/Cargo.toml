@@ -14,7 +14,7 @@ name = "vmnet-smoke"
 path = "src/bin/vmnet-smoke.rs"
 
 [dependencies]
-devices = { package = "ignition-devices", path = "../devices" }
+ignition_devices = { package = "ignition-devices", path = "../devices" }
 
 [build-dependencies]
 cc = "1"

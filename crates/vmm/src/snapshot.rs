@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use hvf::VcpuState;
+use ignition_hvf::VcpuState;
 
 pub const SNAP_MAGIC: &str = "ignition-snapshot-v2";
 pub const SNAP_VERSION: u32 = 2;
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn snapshot_roundtrips_with_device_records() {
         use crate::device_manager::DeviceRecord;
-        use devices::device::FdtKind;
+        use ignition_devices::device::FdtKind;
         let snap = VmSnapshot::new(
             VmConfig { mem_size: 0x2000_0000, vcpu_count: 1 },
             vec![VcpuCheckpoint { mpidr: 0, state: sample_vcpu() }],

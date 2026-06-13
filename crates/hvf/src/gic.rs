@@ -77,8 +77,8 @@ impl HvfGicV3 {
     }
 
     /// The FDT interrupt-controller description implied by this GIC's placement.
-    pub fn fdt_info(&self) -> arch::aarch64::fdt::GicInfo {
-        arch::aarch64::fdt::GicInfo {
+    pub fn fdt_info(&self) -> ignition_arch::aarch64::fdt::GicInfo {
+        ignition_arch::aarch64::fdt::GicInfo {
             dist_base: self.dist_base,
             dist_size: self.dist_size,
             redist_base: self.redist_base,

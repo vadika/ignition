@@ -5,15 +5,14 @@ edition = "2024"
 description = "Apple Hypervisor.framework backend, lifted from libkrun (krun-hvf)"
 license = "Apache-2.0"
 
-# lib name `hvf` so lifted libkrun modules (`use hvf::...`) compile verbatim.
 [lib]
-name = "hvf"
+name = "ignition_hvf"
 path = "src/lib.rs"
 
 [dependencies]
 libloading = "0.8"
 log = "0.4"
-arch = { package = "ignition-arch", path = "../arch" }
+ignition_arch = { package = "ignition-arch", path = "../arch" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

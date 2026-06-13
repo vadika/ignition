@@ -4,7 +4,7 @@ use std::os::raw::c_void;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Mutex;
 
-use devices::virtio::net::NetBackend;
+use ignition_devices::virtio::net::NetBackend;
 
 #[repr(C)]
 struct IgVmnet {
