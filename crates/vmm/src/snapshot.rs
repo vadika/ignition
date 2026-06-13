@@ -175,7 +175,7 @@ pub fn write_snapshot(
     let p = paths(&tmp);
     fs::File::create(&p.memory)?.write_all(ram)?;
     fs::File::create(&p.gic)?.write_all(gic_blob)?;
-    fs::copy(disk_src, &p.disk)?;
+    clonefile_or_copy(disk_src, &p.disk)?;
     let json = serde_json::to_vec_pretty(snap).map_err(io::Error::other)?;
     fs::write(&p.state, json)?;
     let _ = fs::remove_dir_all(dir); // replace any existing snapshot
