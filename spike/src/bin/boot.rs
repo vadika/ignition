@@ -555,6 +555,11 @@ fn main() {
 /// Does NOT load a kernel, generate an FDT, or call set_initial_state.
 /// The running kernel + DTB are already in memory.bin.
 fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
+    // Host-side restore clock: mmap + memory.bin load + GIC/device/vCPU state
+    // restore, up to handing the guest to the run loop. The boot-timer device
+    // can't measure restore (the guest's init does not re-run), so this is the
+    // restore analog of `Guest-boot-time`.
+    let restore_start = std::time::Instant::now();
     // 1. Read the snapshot metadata.
     let (snap, gic_blob, paths) = snapshot::read_snapshot(dir)?;
     assert_eq!(
@@ -694,6 +699,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
     eprintln!("== ignition restore == (no kernel boot; resuming from saved PC)");
+    log::info!("Restore-time = {} ms", restore_start.elapsed().as_millis());
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
