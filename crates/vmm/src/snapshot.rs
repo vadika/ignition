@@ -164,6 +164,29 @@ pub fn read_manifest(dir: &Path) -> io::Result<SnapshotManifest> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
+/// Walk a diff chain from `leaf` to its Full root, returning the manifests
+/// ordered root..leaf. Rejects a missing parent layer and a cycle.
+pub fn resolve_chain(store: &Path, leaf: &str) -> io::Result<Vec<SnapshotManifest>> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = leaf.to_string();
+    loop {
+        if !seen.insert(cur.clone()) {
+            return Err(io::Error::other(format!("snapshot chain cycle at {cur}")));
+        }
+        let m = read_manifest(&base_dir(store, &cur))
+            .map_err(|e| io::Error::other(format!("missing layer {cur}: {e}")))?;
+        let parent = m.parent.clone();
+        chain.push(m);
+        match parent {
+            Some(p) => cur = p,
+            None => break, // reached Full root
+        }
+    }
+    chain.reverse(); // root..leaf
+    Ok(chain)
+}
+
 /// Copy `src` to `dst` using APFS `clonefile(2)` (O(1), copy-on-write) when
 /// possible, falling back to a byte copy on filesystems that don't support it.
 /// `dst` must not already exist. The result is always an independent file: writing
@@ -482,5 +505,55 @@ mod tests {
         assert_eq!(back.vcpus.len(), 4);
         let mpidrs: Vec<u64> = back.vcpus.iter().map(|c| c.mpidr).collect();
         assert_eq!(mpidrs, vec![0, 1, 2, 3]);
+    }
+
+    fn put_manifest(store: &Path, manifest: &SnapshotManifest) {
+        let d = base_dir(store, &manifest.name);
+        fs::create_dir_all(&d).unwrap();
+        write_manifest(&d, manifest).unwrap();
+    }
+
+    #[test]
+    fn resolve_chain_root_to_leaf() {
+        let store = tempfile::tempdir().unwrap();
+        put_manifest(store.path(), &SnapshotManifest::new_full("root".into(), 4096, 1));
+        put_manifest(
+            store.path(),
+            &SnapshotManifest::new_diff("mid".into(), "root".into(), 4096, 1),
+        );
+        put_manifest(
+            store.path(),
+            &SnapshotManifest::new_diff("leaf".into(), "mid".into(), 4096, 1),
+        );
+        let names: Vec<_> = resolve_chain(store.path(), "leaf")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, vec!["root", "mid", "leaf"]);
+    }
+
+    #[test]
+    fn resolve_chain_missing_parent_errors() {
+        let store = tempfile::tempdir().unwrap();
+        put_manifest(
+            store.path(),
+            &SnapshotManifest::new_diff("orphan".into(), "ghost".into(), 4096, 1),
+        );
+        assert!(resolve_chain(store.path(), "orphan").is_err());
+    }
+
+    #[test]
+    fn resolve_chain_cycle_errors() {
+        let store = tempfile::tempdir().unwrap();
+        put_manifest(
+            store.path(),
+            &SnapshotManifest::new_diff("a".into(), "b".into(), 4096, 1),
+        );
+        put_manifest(
+            store.path(),
+            &SnapshotManifest::new_diff("b".into(), "a".into(), 4096, 1),
+        );
+        assert!(resolve_chain(store.path(), "a").is_err());
     }
 }
