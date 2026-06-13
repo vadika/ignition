@@ -27,8 +27,6 @@ pub struct Pl031 {
     load: u32,
     /// Last value written to RTCMR (returned on RTCMR reads; alarm not wired).
     match_reg: u32,
-    /// Last value written to RTCCR (reads always report enabled).
-    control: u32,
     /// RTCIMSC (interrupt mask); stored for read-back, never acted on.
     imsc: u32,
 }
@@ -41,7 +39,7 @@ struct Pl031Snapshot {
 
 impl Pl031 {
     pub fn new() -> Self {
-        Pl031 { offset: 0, load: 0, match_reg: 0, control: 0, imsc: 0 }
+        Pl031 { offset: 0, load: 0, match_reg: 0, imsc: 0 }
     }
 
     fn rtcdr(&self) -> u32 {
@@ -94,7 +92,7 @@ impl BusDevice for Pl031 {
                 self.load = v;
                 self.offset = v as i64 - now_unix();
             }
-            0x0C => self.control = v,
+            0x0C => {} // RTCCR writes ignored; the RTC is always enabled
             0x10 => self.imsc = v,
             _ => {} // DR/RIS/MIS read-only; ICR has no IRQ to clear; IDs read-only
         }
