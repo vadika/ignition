@@ -17,13 +17,21 @@ unsafe extern "C" {
     fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 }
 
-pub const SNAP_MAGIC: &str = "ignition-snapshot-v2";
-pub const SNAP_VERSION: u32 = 2;
+pub const SNAP_MAGIC: &str = "ignition-snapshot-v3";
+pub const SNAP_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {
     pub mem_size: u64,
     pub vcpu_count: u64,
+}
+
+/// Whether a snapshot is self-contained (`Full`) or stores only the delta from a
+/// parent (`Diff`). Diff layers form an immutable chain via `SnapshotManifest::parent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotType {
+    Full,
+    Diff,
 }
 
 /// Human/management metadata for a base snapshot, written as `manifest.json`
@@ -34,15 +42,40 @@ pub struct SnapshotManifest {
     pub created: u64, // seconds since the Unix epoch
     pub mem_size: u64,
     pub vcpu_count: u64,
+    pub snapshot_type: SnapshotType,
+    pub parent: Option<String>,
 }
 
 impl SnapshotManifest {
-    pub fn new(name: String, mem_size: u64, vcpu_count: u64) -> Self {
-        let created = SystemTime::now()
+    fn now_secs() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Self { name, created, mem_size, vcpu_count }
+            .unwrap_or(0)
+    }
+
+    /// A self-contained base snapshot with no parent.
+    pub fn new_full(name: String, mem_size: u64, vcpu_count: u64) -> Self {
+        Self {
+            name,
+            created: Self::now_secs(),
+            mem_size,
+            vcpu_count,
+            snapshot_type: SnapshotType::Full,
+            parent: None,
+        }
+    }
+
+    /// A diff layer recording only the delta from `parent`.
+    pub fn new_diff(name: String, parent: String, mem_size: u64, vcpu_count: u64) -> Self {
+        Self {
+            name,
+            created: Self::now_secs(),
+            mem_size,
+            vcpu_count,
+            snapshot_type: SnapshotType::Diff,
+            parent: Some(parent),
+        }
     }
 }
 
@@ -83,7 +116,7 @@ impl VmSnapshot {
 pub fn check_version(s: &VmSnapshot) -> io::Result<()> {
     if s.magic != SNAP_MAGIC || s.version != SNAP_VERSION {
         return Err(io::Error::other(format!(
-            "incompatible snapshot: magic={:?} version={} (want {:?} v{})",
+            "unsupported snapshot {} v{} (need {} v{})",
             s.magic, s.version, SNAP_MAGIC, SNAP_VERSION
         )));
     }
@@ -288,9 +321,32 @@ mod tests {
     }
 
     #[test]
+    fn manifest_roundtrip_with_type_and_parent() {
+        let m = SnapshotManifest::new_diff("child".into(), "root".into(), 1 << 20, 1);
+        let j = serde_json::to_vec(&m).unwrap();
+        let back: SnapshotManifest = serde_json::from_slice(&j).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.snapshot_type, SnapshotType::Diff);
+        assert_eq!(back.parent.as_deref(), Some("root"));
+        assert_eq!(SnapshotManifest::new_full("root".into(), 1 << 20, 1).parent, None);
+    }
+
+    #[test]
+    fn v2_snapshot_rejected() {
+        let s = VmSnapshot {
+            magic: "ignition-snapshot-v2".to_string(),
+            version: 2,
+            config: VmConfig { mem_size: 0, vcpu_count: 0 },
+            vcpus: vec![],
+            devices: vec![],
+        };
+        assert!(check_version(&s).is_err());
+    }
+
+    #[test]
     fn manifest_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let m = SnapshotManifest::new("brave-hopper".to_string(), 1 << 30, 4);
+        let m = SnapshotManifest::new_full("brave-hopper".to_string(), 1 << 30, 4);
         write_manifest(dir.path(), &m).unwrap();
         let back = read_manifest(dir.path()).unwrap();
         assert_eq!(back, m);

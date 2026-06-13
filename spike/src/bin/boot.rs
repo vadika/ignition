@@ -439,7 +439,7 @@ fn write_named_snapshot(
     let vcpu_count = config.vcpu_count;
     let snap = VmSnapshot::new(config, checkpoints, devices);
     snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
-    let manifest = SnapshotManifest::new(write_name.to_string(), mem_size, vcpu_count);
+    let manifest = SnapshotManifest::new_full(write_name.to_string(), mem_size, vcpu_count);
     snapshot::write_manifest(&base, &manifest)?;
     eprintln!("[snapshot] '{write_name}' written to {}", base.display());
     Ok(())
