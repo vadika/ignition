@@ -17,6 +17,7 @@ use std::{env, fs, process};
 
 use arch::aarch64::fdt::{self, FdtConfig};
 use arch::aarch64::{kernel, layout};
+use devices::rtc::Pl031;
 use devices::serial::Serial;
 use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
@@ -315,6 +316,10 @@ fn main() {
         .add(layout::MMIO_WINDOW, |irq| Serial::with_irq(FlushWriter, irq))
         .expect("add serial");
 
+    // PL031 RTC: always-on wall clock. The build closure ignores `irq` (time-only,
+    // no alarm interrupt); the framework still allocates an unused SPI.
+    mgr.add(layout::MMIO_WINDOW, |_irq| Pl031::new()).expect("add rtc");
+
     // virtio-rng: always-on entropy source. Stateless; the framework handles its
     // MMIO window, SPI, FDT node, and snapshot record.
     {
@@ -564,6 +569,9 @@ fn run_restore(dir: &Path) -> io::Result<()> {
                     VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), guest_ram_rng, irq)
                 })
                 .map_err(io::Error::other)?;
+            }
+            "rtc" => {
+                mgr.add_restored(rec, |_irq| Pl031::new()).map_err(io::Error::other)?;
             }
             // No "virtio-net" arm: snapshots are only taken on the single-vCPU,
             // no-net path (the handler is installed only when `smp == 1 && !net`),

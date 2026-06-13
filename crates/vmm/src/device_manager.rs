@@ -138,6 +138,7 @@ impl DeviceManager {
                 match r.fdt_kind {
                     FdtKind::Ns16550a => FdtDevice::Serial(m),
                     FdtKind::VirtioMmio => FdtDevice::VirtioMmio(m),
+                    FdtKind::Pl031 => FdtDevice::Rtc(m),
                 }
             })
             .collect()
