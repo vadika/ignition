@@ -227,9 +227,94 @@ pub fn read_snapshot(dir: &Path) -> io::Result<(VmSnapshot, Vec<u8>, Paths)> {
     Ok((snap, gic, p))
 }
 
+/// Write a diff layer: the dirty pages packed back-to-back into `memory.bin`
+/// (ascending page-index order) and the sorted page indices into `dirty.idx`
+/// as little-endian u64. `dirty` must be sorted page indices into `ram`.
+pub fn write_diff_pages(dir: &Path, dirty: &[u64], ram: &[u8]) -> io::Result<()> {
+    let page = crate::dirty::PAGE;
+    let mut mem = fs::File::create(dir.join("memory.bin"))?;
+    for &p in dirty {
+        let o = p as usize * page;
+        mem.write_all(&ram[o..o + page])?;
+    }
+    let mut idx = fs::File::create(dir.join("dirty.idx"))?;
+    for &p in dirty {
+        idx.write_all(&p.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Read a diff layer written by [`write_diff_pages`]: returns the page indices
+/// (from `dirty.idx`) and the packed dirty-page bytes (from `memory.bin`).
+pub fn read_diff_pages(dir: &Path) -> io::Result<(Vec<u64>, Vec<u8>)> {
+    let raw = fs::read(dir.join("dirty.idx"))?;
+    let idx: Vec<u64> = raw
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let packed = fs::read(dir.join("memory.bin"))?;
+    Ok((idx, packed))
+}
+
+/// Overlay a diff layer's packed pages onto `target` (the mmap'd guest RAM).
+/// `idx[i]` is the destination page index for `packed[i*PAGE..(i+1)*PAGE]`.
+pub fn apply_diff(target: &mut [u8], idx: &[u64], packed: &[u8]) -> io::Result<()> {
+    let page = crate::dirty::PAGE;
+    if packed.len() != idx.len() * page {
+        return Err(io::Error::other("diff packed size mismatch"));
+    }
+    for (i, &p) in idx.iter().enumerate() {
+        let o = p as usize * page;
+        if o + page > target.len() {
+            return Err(io::Error::other("diff page out of range"));
+        }
+        target[o..o + page].copy_from_slice(&packed[i * page..(i + 1) * page]);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_pack_apply_roundtrip() {
+        let page = crate::dirty::PAGE;
+        let mut ram = vec![0u8; 4 * page];
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let dirty = vec![1u64, 3];
+        let dir = tempfile::tempdir().unwrap();
+        write_diff_pages(dir.path(), &dirty, &ram).unwrap();
+        let (idx, packed) = read_diff_pages(dir.path()).unwrap();
+        assert_eq!(idx, dirty);
+        assert_eq!(packed.len(), 2 * page);
+        let mut target = vec![0u8; 4 * page];
+        apply_diff(&mut target, &idx, &packed).unwrap();
+        for &p in &dirty {
+            let o = p as usize * page;
+            assert_eq!(&target[o..o + page], &ram[o..o + page]);
+        }
+        assert!(target[0..page].iter().all(|&b| b == 0)); // page 0 untouched
+        assert!(target[2 * page..3 * page].iter().all(|&b| b == 0)); // page 2 untouched
+    }
+
+    #[test]
+    fn apply_diff_rejects_out_of_range() {
+        let page = crate::dirty::PAGE;
+        let mut target = vec![0u8; page]; // 1 page
+        let packed = vec![7u8; page];
+        assert!(apply_diff(&mut target, &[5u64], &packed).is_err());
+    }
+
+    #[test]
+    fn apply_diff_rejects_size_mismatch() {
+        let page = crate::dirty::PAGE;
+        let mut target = vec![0u8; 2 * page];
+        let packed = vec![0u8; page - 1]; // not a multiple
+        assert!(apply_diff(&mut target, &[0u64], &packed).is_err());
+    }
 
     fn sample_vcpu() -> VcpuState {
         VcpuState {
