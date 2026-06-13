@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::bus::BusDevice;
+use crate::device::{DeviceMgrError, FdtKind, MmioDevice};
 
 use super::IrqLine;
 use super::guest_ram::GuestRam;
@@ -82,6 +83,7 @@ pub struct VirtioMmioState {
 
 /// A virtio-mmio transport hosting one `VirtioDevice`.
 pub struct VirtioMmio {
+    id: &'static str,
     dev: Box<dyn VirtioDevice>,
     mem: GuestRam,
     irq: Arc<dyn IrqLine>,
@@ -93,9 +95,10 @@ pub struct VirtioMmio {
 }
 
 impl VirtioMmio {
-    pub fn new(dev: Box<dyn VirtioDevice>, mem: GuestRam, irq: Arc<dyn IrqLine>) -> Self {
+    pub fn new(id: &'static str, dev: Box<dyn VirtioDevice>, mem: GuestRam, irq: Arc<dyn IrqLine>) -> Self {
         let queues = (0..dev.queue_count()).map(|_| QueueState::default()).collect();
         Self {
+            id,
             dev,
             mem,
             irq,
@@ -241,7 +244,7 @@ impl VirtioMmio {
 
 impl VirtioMmio {
     /// Capture the transport register + queue state for snapshot.
-    pub fn save(&self) -> VirtioMmioState {
+    pub fn save_state(&self) -> VirtioMmioState {
         let queues = self
             .queues
             .iter()
@@ -271,7 +274,7 @@ impl VirtioMmio {
     }
 
     /// Restore transport register + queue state from a snapshot.
-    pub fn restore(&mut self, s: &VirtioMmioState) {
+    pub fn restore_state(&mut self, s: &VirtioMmioState) {
         self.status = s.status;
         self.queue_sel = s.queue_sel;
         self.device_features_sel = s.device_features_sel;
@@ -321,6 +324,26 @@ impl BusDevice for VirtioMmio {
     }
 }
 
+impl MmioDevice for VirtioMmio {
+    fn fdt_kind(&self) -> FdtKind { FdtKind::VirtioMmio }
+    fn snapshot_id(&self) -> &str { self.id }
+    fn save(&self) -> serde_json::Value {
+        serde_json::to_value(self.save_state()).expect("VirtioMmioState serializes")
+    }
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), DeviceMgrError> {
+        let s: VirtioMmioState = serde_json::from_value(v.clone())
+            .map_err(|e| DeviceMgrError::StateInvalid { id: self.id.into(), reason: e.to_string() })?;
+        if s.queues.len() != self.queues.len() {
+            return Err(DeviceMgrError::StateInvalid {
+                id: self.id.into(),
+                reason: format!("queue count {} != {}", s.queues.len(), self.queues.len()),
+            });
+        }
+        self.restore_state(&s);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -348,7 +371,7 @@ mod tests {
 
     fn dev(backing: &mut Vec<u8>, irq: Arc<dyn IrqLine>) -> VirtioMmio {
         let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
-        VirtioMmio::new(Box::new(VirtioBlk::new(disk()).unwrap()), mem, irq)
+        VirtioMmio::new("virtio-blk", Box::new(VirtioBlk::new(disk()).unwrap()), mem, irq)
     }
 
     fn rd(d: &mut VirtioMmio, off: u64) -> u32 {
@@ -436,6 +459,24 @@ mod tests {
         assert_eq!(*irq.0.lock().unwrap().last().unwrap(), false);
     }
 
+    fn test_transport(id: &'static str) -> VirtioMmio {
+        // Leak the backing so its lifetime exceeds the VirtioMmio (test-only).
+        let backing = Box::leak(vec![0u8; 0x1000].into_boxed_slice());
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        VirtioMmio::new(id, Box::new(VirtioBlk::new(disk()).unwrap()), mem, Arc::new(FakeIrq::default()))
+    }
+
+    #[test]
+    fn mmio_device_trait_roundtrips_transport_state() {
+        use crate::device::{FdtKind, MmioDevice};
+        let mut t = test_transport("virtio-blk");
+        assert_eq!(t.fdt_kind(), FdtKind::VirtioMmio);
+        assert_eq!(t.snapshot_id(), "virtio-blk");
+        let saved = MmioDevice::save(&t);
+        MmioDevice::restore(&mut t, &saved).unwrap();
+        assert_eq!(MmioDevice::save(&t), saved);
+    }
+
     #[test]
     fn virtio_mmio_state_round_trips() {
         let mut backing = vec![0u8; 0x6000];
@@ -445,10 +486,10 @@ mod tests {
         wr(&mut d, 0x080, 0x1000); // QueueDescLow
         wr(&mut d, 0x038, 8); // QueueNum
         wr(&mut d, 0x044, 1); // QueueReady
-        let st = d.save();
+        let st = d.save_state();
         let mut backing2 = vec![0u8; 0x6000];
         let mut d2 = dev(&mut backing2, Arc::new(FakeIrq::default()));
-        d2.restore(&st);
-        assert_eq!(d2.save(), st); // round-trips
+        d2.restore_state(&st);
+        assert_eq!(d2.save_state(), st); // round-trips
     }
 }
