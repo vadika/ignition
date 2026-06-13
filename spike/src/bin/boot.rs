@@ -776,6 +776,7 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
         spawn_vsock_reactor(vsock_mmio);
     }
+    let net_mmio_restore = ctx.net_mmio.clone();
     let frozen = mgr.freeze();
     let bus = frozen.bus();
 
@@ -784,6 +785,16 @@ fn run_restore(dir: &Path, vsock_uds: Option<PathBuf>) -> io::Result<()> {
     let manager = VcpuManager::new(1, bus);
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
+
+    // Net restore: present the link as DOWN, then raise it after resume so the
+    // guest's carrier-watch sees a down->up edge and re-inits (new MAC + DHCP).
+    if let Some(net) = net_mmio_restore {
+        net.lock().unwrap().net_set_link(false);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            net.lock().unwrap().net_set_link(true);
+        });
+    }
 
     eprintln!("== ignition restore == (no kernel boot; resuming from saved PC)");
     log::info!("Restore-time = {} ms", restore_start.elapsed().as_millis());
