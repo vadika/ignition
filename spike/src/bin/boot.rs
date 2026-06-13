@@ -19,11 +19,13 @@ use arch::aarch64::fdt::{self, FdtConfig};
 use arch::aarch64::{kernel, layout};
 use devices::rtc::Pl031;
 use devices::serial::Serial;
+use devices::virtio::balloon::Balloon;
 use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
 use devices::virtio::rng::VirtioRng;
+use std::sync::atomic::{AtomicU32, Ordering};
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
 use vmm::device_manager::DeviceManager;
@@ -54,6 +56,8 @@ enum Action {
     Quit,
     /// Ctrl-A s: request a snapshot.
     Snapshot,
+    /// Ctrl-A b: toggle the memory-balloon target.
+    Balloon,
 }
 
 /// Advance the escape state machine by one input byte. The caller forwards
@@ -75,6 +79,7 @@ fn step(state: &mut EscState, byte: u8) -> Action {
             match byte {
                 b'x' => Action::Quit,
                 b's' => Action::Snapshot,
+                b'b' => Action::Balloon,
                 // Ctrl-A Ctrl-A sends a single literal Ctrl-A to the guest.
                 CTRL_A => Action::Forward([CTRL_A, 0], 1),
                 // Ctrl-A was not an escape: send it literally, then this byte.
@@ -153,6 +158,8 @@ fn spawn_stdin_reader(
     serial: Arc<Mutex<Serial<FlushWriter>>>,
     saved_termios: Option<libc::termios>,
     manager: Arc<vmm::vstate::vcpu_manager::VcpuManager>,
+    balloon_target: Arc<AtomicU32>,
+    balloon: Arc<Mutex<devices::virtio::mmio::VirtioMmio>>,
 ) {
     // Detached: the reader lives for the process lifetime.
     std::thread::spawn(move || {
@@ -192,6 +199,13 @@ fn spawn_stdin_reader(
                 Action::Snapshot => {
                     eprintln!("\n[snapshot requested]");
                     manager.request_snapshot();
+                }
+                Action::Balloon => {
+                    const BALLOON_PAGES: u32 = 64 * 256; // 64 MiB in 4 KiB pages
+                    let next = if balloon_target.load(Ordering::Relaxed) == 0 { BALLOON_PAGES } else { 0 };
+                    balloon_target.store(next, Ordering::Relaxed);
+                    balloon.lock().unwrap().signal_config_change();
+                    eprintln!("\n[balloon target -> {} MiB]", next / 256);
                 }
             }
         }
@@ -330,6 +344,15 @@ fn main() {
         .expect("add rng");
     }
 
+    let (balloon_dev, balloon_target) = Balloon::new();
+    let balloon = {
+        let guest_ram_balloon = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        mgr.add(layout::MMIO_WINDOW, move |irq| {
+            VirtioMmio::new("virtio-balloon", Box::new(balloon_dev), guest_ram_balloon, irq)
+        })
+        .expect("add balloon")
+    };
+
     if let Some(path) = &disk_path {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -464,8 +487,8 @@ fn main() {
     // restores the terminal on drop (guest-initiated exit); the reader restores
     // it before process::exit on Ctrl-A x.
     let termios = TermiosGuard::new();
-    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone());
-    eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s), {smp} vCPU(s) ---");
+    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b), {smp} vCPU(s) ---");
 
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
     match manager.run(entry, fdt_addr) {
@@ -537,6 +560,7 @@ fn run_restore(dir: &Path) -> io::Result<()> {
         layout::SPI_COUNT,
     );
     let mut serial_handle = None;
+    let mut balloon_restore: Option<(Arc<AtomicU32>, Arc<Mutex<devices::virtio::mmio::VirtioMmio>>)> = None;
     for rec in &snap.devices {
         match rec.id.as_str() {
             "serial" => {
@@ -573,6 +597,15 @@ fn run_restore(dir: &Path) -> io::Result<()> {
             "rtc" => {
                 mgr.add_restored(rec, |_irq| Pl031::new()).map_err(io::Error::other)?;
             }
+            "virtio-balloon" => {
+                let guest_ram_balloon = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+                let (balloon_dev, target) = Balloon::new();
+                let handle = mgr.add_restored(rec, move |irq| {
+                    VirtioMmio::new("virtio-balloon", Box::new(balloon_dev), guest_ram_balloon, irq)
+                })
+                .map_err(io::Error::other)?;
+                balloon_restore = Some((target, handle));
+            }
             // No "virtio-net" arm: snapshots are only taken on the single-vCPU,
             // no-net path (the handler is installed only when `smp == 1 && !net`),
             // so a net record never reaches here. If that gate is relaxed, this
@@ -585,14 +618,15 @@ fn run_restore(dir: &Path) -> io::Result<()> {
         }
     }
     let serial = serial_handle.expect("snapshot had no serial device");
+    let (balloon_target, balloon) = balloon_restore.expect("snapshot had no balloon device");
     let frozen = mgr.freeze();
     let bus = frozen.bus();
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
     let manager = VcpuManager::new(1, bus);
-    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone());
-    eprintln!("--- restore console attached (quit: Ctrl-A x) ---");
+    spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
     eprintln!("== ignition restore == (no kernel boot; resuming from saved PC)");
     eprintln!("--- guest console (stdout) ---");

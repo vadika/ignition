@@ -1,5 +1,6 @@
 //! Synchronous, exit-driven virtio-mmio block device.
 
+pub mod balloon;
 pub mod blk;
 pub mod guest_ram;
 pub mod mmio;
