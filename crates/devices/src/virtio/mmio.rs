@@ -43,6 +43,17 @@ pub trait VirtioDevice: Send {
     fn inject_rx(&mut self, _vq: &mut Virtqueue, _mem: &GuestRam, _frame: &[u8]) -> bool {
         false
     }
+
+    /// Reactor entry for async-RX devices (vsock): read host-side data and fill the
+    /// RX virtqueue. Default: no-op.
+    fn fill_rx(&mut self, _rx_vq: &mut Virtqueue, _mem: &GuestRam) -> bool {
+        false
+    }
+
+    /// Host fds an async-RX device wants the reactor to poll. Default: none.
+    fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
+        Vec::new()
+    }
 }
 
 /// Per-queue driver-programmed state.
@@ -230,6 +241,31 @@ impl VirtioMmio {
             self.raise();
         }
         used
+    }
+
+    /// Reactor hook: drive the device's async RX (queue 0) and raise the used IRQ if
+    /// anything was delivered. Builds/saves the RX queue exactly as inject_rx does.
+    pub fn poll_vsock_rx(&mut self) -> bool {
+        let Some(q) = self.queues.get_mut(0) else {
+            return false;
+        };
+        if q.ready == 0 {
+            return false;
+        }
+        let Some(vq) = q.vq.as_mut() else {
+            return false;
+        };
+        let delivered = self.dev.fill_rx(vq, &self.mem);
+        if delivered {
+            self.interrupt_status |= INT_STATUS_USED;
+            self.irq.set_spi(true);
+        }
+        delivered
+    }
+
+    /// vsock reactor support: the host fds the device wants polled (empty for others).
+    pub fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
+        self.dev.vsock_poll_set()
     }
 
     fn raise(&mut self) {
@@ -548,6 +584,45 @@ mod tests {
         t.read(0, 0x060, &mut b);
         assert_eq!(u32::from_le_bytes(b) & 0b10, 0b10, "config-change bit set");
         assert_eq!(*irq.level.lock().unwrap(), Some(true), "irq asserted");
+    }
+
+    #[test]
+    fn poll_vsock_rx_drives_fill_rx_and_irq() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct RecIrq { level: Mutex<Option<bool>> }
+        impl crate::virtio::IrqLine for RecIrq {
+            fn set_spi(&self, level: bool) { *self.level.lock().unwrap() = Some(level); }
+        }
+        struct FillDev;
+        impl VirtioDevice for FillDev {
+            fn device_id(&self) -> u32 { 19 }
+            fn device_features(&self, _: u32) -> u32 { 0 }
+            fn config_read(&self, _: u64, _: &mut [u8]) {}
+            fn queue_count(&self) -> usize { 3 }
+            fn handle_notify(&mut self, _: usize, _: &mut Virtqueue, _: &GuestRam) -> bool { false }
+            fn fill_rx(&mut self, _rx: &mut Virtqueue, _mem: &GuestRam) -> bool { true }
+        }
+        let backing = Box::leak(vec![0u8; 0x6000].into_boxed_slice());
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0x4000_0000);
+        let irq = Arc::new(RecIrq::default());
+        let mut t = VirtioMmio::new("vsock", Box::new(FillDev), mem, irq.clone());
+        // Configure queue 0 ready the same way the notify test does.
+        let base: u64 = 0x4000_0000;
+        let desc = base + 0x1000;
+        let avail = base + 0x2000;
+        let used_ring = base + 0x3000;
+        wr(&mut t, 0x030, 0); // QueueSel = 0
+        wr(&mut t, 0x080, desc as u32);
+        wr(&mut t, 0x084, (desc >> 32) as u32);
+        wr(&mut t, 0x090, avail as u32);
+        wr(&mut t, 0x094, (avail >> 32) as u32);
+        wr(&mut t, 0x0a0, used_ring as u32);
+        wr(&mut t, 0x0a4, (used_ring >> 32) as u32);
+        wr(&mut t, 0x038, 8); // QueueNum
+        wr(&mut t, 0x044, 1); // QueueReady
+        assert!(t.poll_vsock_rx());
+        assert_eq!(*irq.level.lock().unwrap(), Some(true));
     }
 
     #[test]
