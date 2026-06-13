@@ -35,7 +35,6 @@ use ignition_vmm::snapshot::{self, VcpuCheckpoint, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
 
-const RAM_SIZE: u64 = 0x2000_0000; // 512 MiB
 
 /// Host console escape key: Ctrl-A (0x01).
 const CTRL_A: u8 = 0x01;
@@ -429,6 +428,7 @@ fn main() {
     // Cap matches the FDT/GIC sizing we exercise; raise if a guest needs more.
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
+    let mut mem_mib: u64 = 512; // default 512 MiB (the historical RAM_SIZE)
     let mut net = false;
     let mut vsock_uds: Option<PathBuf> = None;
     let mut snap_dir: PathBuf = PathBuf::from("./snapshot");
@@ -445,6 +445,15 @@ fn main() {
                     .expect("--smp value must be a number");
                 assert!((1..=MAX_VCPUS).contains(&n), "--smp must be 1..={MAX_VCPUS}");
                 smp = n;
+            }
+            "--mem" => {
+                let n = it
+                    .next()
+                    .expect("--mem needs a value")
+                    .parse::<u64>()
+                    .expect("--mem value must be a number (MiB)");
+                assert!((1..=65536).contains(&n), "--mem must be 1..=65536 MiB");
+                mem_mib = n;
             }
             "--net" => {
                 net = true;
@@ -468,6 +477,8 @@ fn main() {
             other => positionals.push(other.to_string()),
         }
     }
+
+    let ram_size: u64 = mem_mib << 20; // MiB -> bytes
 
     // Restore path: skip normal boot entirely.
     if let Some(dir) = restore_dir {
@@ -495,7 +506,7 @@ fn main() {
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            RAM_SIZE as usize,
+            ram_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_ANON | libc::MAP_PRIVATE,
             -1,
@@ -504,13 +515,13 @@ fn main() {
     };
     assert!(host != libc::MAP_FAILED, "mmap failed");
     let host_addr = host as u64;
-    let ram: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, RAM_SIZE as usize) };
+    let ram: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, ram_size as usize) };
 
     // Load the kernel; entry is where the vCPU's PC starts.
     let entry = kernel::load_kernel(ram, layout::RAM_BASE, &kernel_image).expect("load_kernel failed");
 
     // The FDT occupies the top FDT_MAX_SIZE of RAM; the kernel must stay below it.
-    let fdt_addr = layout::fdt_addr(RAM_SIZE);
+    let fdt_addr = layout::fdt_addr(ram_size);
     let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
 
     // VM, then the in-kernel GIC (must be created before any vCPU).
@@ -528,7 +539,7 @@ fn main() {
 
     let mut ctx = DeviceContext {
         host: host as *mut u8,
-        ram_size: RAM_SIZE,
+        ram_size,
         disk: disk_path.as_ref().map(PathBuf::from),
         vsock_uds: vsock_uds.clone(),
         net,
@@ -561,7 +572,7 @@ fn main() {
     // Build and place the device tree.
     let cfg = FdtConfig {
         mem_base: layout::RAM_BASE,
-        mem_size: RAM_SIZE,
+        mem_size: ram_size,
         cpu_mpidrs: (0..smp).map(mpidr_for).collect(),
         cmdline: layout::default_cmdline(),
         devices: mgr.fdt_devices(),
@@ -573,7 +584,7 @@ fn main() {
     ram[fdt_off..fdt_off + dtb.len()].copy_from_slice(&dtb);
 
     // Map the populated RAM into the guest.
-    vm.map_memory(host_addr, layout::RAM_BASE, RAM_SIZE)
+    vm.map_memory(host_addr, layout::RAM_BASE, ram_size)
         .expect("hv_vm_map failed");
 
     // Diagnostics (stderr) so a silent boot is debuggable.
@@ -613,6 +624,7 @@ fn main() {
         // vmnet RX feeder is quiesced below before RAM is read. usize avoids the
         // 2021+ partial-capture seeing through a newtype to the *const u8 field.
         let host_usize = host as usize;
+        let ram_size_snap = ram_size;
 
         manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
@@ -622,7 +634,7 @@ fn main() {
             };
 
             let devices = snap_devices.save();
-            let config = VmConfig { mem_size: RAM_SIZE, vcpu_count: checkpoints.len() as u64 };
+            let config = VmConfig { mem_size: ram_size_snap, vcpu_count: checkpoints.len() as u64 };
             let snap = VmSnapshot::new(config, checkpoints, devices);
 
             // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
@@ -635,7 +647,7 @@ fn main() {
 
             // The RAM slice — host_usize round-trip avoids capturing *const u8.
             let ram_slice: &[u8] = unsafe {
-                std::slice::from_raw_parts(host_usize as *const u8, RAM_SIZE as usize)
+                std::slice::from_raw_parts(host_usize as *const u8, ram_size_snap as usize)
             };
 
             let disk_src = match &disk_path_snap {
