@@ -22,6 +22,7 @@ use devices::virtio::blk::VirtioBlk;
 use devices::virtio::guest_ram::GuestRam;
 use devices::virtio::mmio::VirtioMmio;
 use devices::virtio::net::VirtioNet;
+use devices::virtio::rng::VirtioRng;
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
 use vmm::device_manager::DeviceManager;
@@ -314,6 +315,16 @@ fn main() {
         .add(layout::MMIO_WINDOW, |irq| Serial::with_irq(FlushWriter, irq))
         .expect("add serial");
 
+    // virtio-rng: always-on entropy source. Stateless; the framework handles its
+    // MMIO window, SPI, FDT node, and snapshot record.
+    {
+        let guest_ram_rng = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+        mgr.add(layout::MMIO_WINDOW, move |irq| {
+            VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), guest_ram_rng, irq)
+        })
+        .expect("add rng");
+    }
+
     if let Some(path) = &disk_path {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -544,6 +555,13 @@ fn run_restore(dir: &Path) -> io::Result<()> {
                 let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
                 mgr.add_restored(rec, move |irq| {
                     VirtioMmio::new("virtio-blk", Box::new(blk), guest_ram, irq)
+                })
+                .map_err(io::Error::other)?;
+            }
+            "virtio-rng" => {
+                let guest_ram_rng = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
+                mgr.add_restored(rec, move |irq| {
+                    VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), guest_ram_rng, irq)
                 })
                 .map_err(io::Error::other)?;
             }
