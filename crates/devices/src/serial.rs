@@ -60,19 +60,24 @@ pub struct SerialSnapshot {
 /// buffer in tests).
 pub struct Serial<W: Write + Send> {
     inner: vm_superio::Serial<SerialIrq, NoEvents, W>,
+    irq: Arc<dyn IrqLine>,
 }
 
 impl<W: Write + Send> Serial<W> {
     /// A serial with no interrupt line (output only; smoke tests).
     pub fn new(out: W) -> Self {
-        Self { inner: vm_superio::Serial::new(SerialIrq::Noop, out) }
+        let irq: Arc<dyn IrqLine> = Arc::new(crate::virtio::NoopIrq);
+        Self { inner: vm_superio::Serial::new(SerialIrq::Noop, out), irq }
     }
 
     /// A serial whose interrupt pulses the given GIC line — required for the
     /// kernel's interrupt-driven tty (it blocks on the TX-empty interrupt once
     /// the 16-byte FIFO fills).
     pub fn with_irq(out: W, irq: Arc<dyn IrqLine>) -> Self {
-        Self { inner: vm_superio::Serial::new(SerialIrq::Gic(irq), out) }
+        Self {
+            inner: vm_superio::Serial::new(SerialIrq::Gic(irq.clone()), out),
+            irq,
+        }
     }
 
     /// Feed host input into the RX FIFO. Sets the LSR data-ready bit and raises
@@ -90,7 +95,7 @@ impl<W: Write + Send> Serial<W> {
     }
 
     /// Capture the 16550 register state for snapshot.
-    pub fn save(&self) -> SerialSnapshot {
+    pub fn save_state(&self) -> SerialSnapshot {
         let s = self.inner.state();
         SerialSnapshot {
             baud_divisor_low: s.baud_divisor_low,
@@ -121,9 +126,9 @@ impl<W: Write + Send> Serial<W> {
             in_buffer: Vec::new(),
         };
         let inner =
-            vm_superio::Serial::from_state(&vs_state, SerialIrq::Gic(irq), NoEvents, out)
+            vm_superio::Serial::from_state(&vs_state, SerialIrq::Gic(irq.clone()), NoEvents, out)
                 .expect("from_state with empty in_buffer cannot fail");
-        Self { inner }
+        Self { inner, irq }
     }
 }
 
@@ -144,6 +149,24 @@ impl<W: Write + Send> BusDevice for Serial<W> {
         } else {
             log::warn!("serial: ignored write (offset={offset:#x}, len={})", data.len());
         }
+    }
+}
+
+use crate::device::{DeviceMgrError, FdtKind, MmioDevice};
+
+impl<W: Write + Send + Default> MmioDevice for Serial<W> {
+    fn fdt_kind(&self) -> FdtKind { FdtKind::Ns16550a }
+    fn snapshot_id(&self) -> &str { "serial" }
+    fn save(&self) -> serde_json::Value {
+        serde_json::to_value(self.save_state()).expect("SerialSnapshot serializes")
+    }
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), DeviceMgrError> {
+        let snap: SerialSnapshot = serde_json::from_value(v.clone())
+            .map_err(|e| DeviceMgrError::StateInvalid { id: "serial".into(), reason: e.to_string() })?;
+        // vm_superio applies serial state only at construction, so rebuild in place
+        // from the stored irq + a fresh writer (W: Default).
+        *self = Serial::from_snapshot(W::default(), self.irq.clone(), &snap);
+        Ok(())
     }
 }
 
@@ -208,13 +231,36 @@ mod tests {
         fn set_spi(&self, _: bool) {}
     }
 
+    #[derive(Clone, Default)]
+    struct SinkWriter;
+    impl Write for SinkWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { Ok(buf.len()) }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
     #[test]
     fn serial_state_round_trips() {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let mut s = Serial::new(SharedSink(buf.clone()));
         s.write(0, 1, &[0x0f]); // IER = 0x0f (offset 1)
-        let st = s.save();
+        let st = s.save_state();
         let s2 = Serial::from_snapshot(SharedSink(buf), Arc::new(NoIrq), &st);
-        assert_eq!(s2.save(), st);
+        assert_eq!(s2.save_state(), st);
+    }
+
+    #[test]
+    fn serial_mmio_device_roundtrips() {
+        use crate::device::{FdtKind, MmioDevice};
+        use crate::virtio::NoopIrq;
+        use std::sync::Arc;
+        let irq = Arc::new(NoopIrq);
+        let mut s = Serial::with_irq(SinkWriter, irq);
+        s.write(0, 1, &[0xab]); // IER register — dirty some state
+        let saved = MmioDevice::save(&s);
+        assert_eq!(s.fdt_kind(), FdtKind::Ns16550a);
+        assert_eq!(s.snapshot_id(), "serial");
+        let mut s2 = Serial::with_irq(SinkWriter, Arc::new(NoopIrq));
+        MmioDevice::restore(&mut s2, &saved).unwrap();
+        assert_eq!(MmioDevice::save(&s2), saved);
     }
 }
