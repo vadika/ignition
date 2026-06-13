@@ -29,3 +29,6 @@ vmm = { package = "ignition-vmm", path = "../crates/vmm" }
 devices = { package = "ignition-devices", path = "../crates/devices" }
 arch = { package = "ignition-arch", path = "../crates/arch" }
 ignition-vmnet = { path = "../crates/vmnet" }
+
+[dev-dependencies]
+serde_json = "1"

@@ -30,7 +30,7 @@ use devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicU32, Ordering};
 use hvf::gic::HvfGicV3;
 use hvf::HvfVcpu;
-use vmm::device_manager::DeviceManager;
+use vmm::device_manager::{DeviceManager, DeviceRecord};
 use vmm::snapshot::{self, VmConfig, VmSnapshot};
 use vmm::vstate::vcpu_manager::{mpidr_for, VcpuManager};
 use vmm::vstate::hvf_vm::Vm;
@@ -252,6 +252,149 @@ impl Write for FlushWriter {
     }
 }
 
+/// The known set of snapshot-able device ids (boot_timer is add_fixed: no record).
+const KNOWN_DEVICE_IDS: &[&str] = &[
+    "serial", "virtio-blk", "virtio-rng", "rtc", "virtio-balloon", "vsock", "virtio-net",
+];
+
+/// Fail if a snapshot record names a device this binary cannot rebuild.
+fn check_known_ids(records: &[DeviceRecord]) -> io::Result<()> {
+    for rec in records {
+        if !KNOWN_DEVICE_IDS.contains(&rec.id.as_str()) {
+            return Err(io::Error::other(format!("unknown device id in snapshot: {}", rec.id)));
+        }
+    }
+    Ok(())
+}
+
+/// Whether we are wiring a fresh boot or restoring from a record set.
+enum Mode<'a> {
+    Boot,
+    Restore(&'a [DeviceRecord]),
+}
+
+/// Inputs the device builders read, plus the typed handles they stash for the
+/// console reader / Ctrl-A b / vsock reactor.
+struct DeviceContext {
+    host: *mut u8,
+    ram_size: u64,
+    disk: Option<PathBuf>,      // boot: original rootfs; restore: private instance copy
+    vsock_uds: Option<PathBuf>,
+    net: bool,                  // boot-only; never set on restore
+    // outputs
+    serial: Option<Arc<Mutex<Serial<FlushWriter>>>>,
+    balloon_target: Option<Arc<AtomicU32>>,
+    balloon: Option<Arc<Mutex<VirtioMmio>>>,
+    vsock_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+    net_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+}
+
+impl DeviceContext {
+    fn guest_ram(&self) -> GuestRam {
+        GuestRam::new(self.host, self.ram_size as usize, layout::RAM_BASE)
+    }
+}
+
+/// Place a device once for whichever mode we're in: fresh `add` (boot, new
+/// window/SPI) or `add_restored` (restore, saved window/SPI + state applied).
+/// In restore mode a device with no matching record is skipped (returns None).
+fn place<D, F>(
+    mgr: &mut DeviceManager,
+    mode: &Mode,
+    id: &str,
+    window: u64,
+    build: F,
+) -> io::Result<Option<Arc<Mutex<D>>>>
+where
+    D: devices::device::MmioDevice + 'static,
+    F: FnOnce(Arc<dyn devices::virtio::IrqLine>) -> D,
+{
+    match mode {
+        Mode::Boot => Ok(Some(mgr.add(window, build).map_err(io::Error::other)?)),
+        Mode::Restore(recs) => match recs.iter().find(|r| r.id == id) {
+            Some(rec) => Ok(Some(mgr.add_restored(rec, build).map_err(io::Error::other)?)),
+            None => Ok(None),
+        },
+    }
+}
+
+/// The single device-wiring site. Lists every snapshot-able device once; both
+/// fresh boot and restore call it. Fills `ctx`'s output handles. boot_timer is
+/// wired separately by the caller (add_fixed: no record/FDT/state).
+fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -> io::Result<()> {
+    if let Mode::Restore(recs) = &mode {
+        check_known_ids(recs)?;
+    }
+
+    // Serial — always first (its base matches the earlycon address in the cmdline).
+    if let Some(s) = place(mgr, &mode, "serial", layout::MMIO_WINDOW,
+        |irq| Serial::with_irq(FlushWriter, irq))? {
+        ctx.serial = Some(s);
+    }
+
+    // PL031 RTC — always-on; ignores irq (time-only).
+    place::<Pl031, _>(mgr, &mode, "rtc", layout::MMIO_WINDOW, |_irq| Pl031::new())?;
+
+    // virtio-rng — always-on, stateless.
+    {
+        let mem = ctx.guest_ram();
+        place::<VirtioMmio, _>(mgr, &mode, "virtio-rng", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), mem, irq))?;
+    }
+
+    // virtio-balloon — always-on; the shared target survives restore via its state.
+    {
+        let mem = ctx.guest_ram();
+        let (balloon_dev, target) = Balloon::new();
+        if let Some(h) = place(mgr, &mode, "virtio-balloon", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new("virtio-balloon", Box::new(balloon_dev), mem, irq))? {
+            ctx.balloon_target = Some(target);
+            ctx.balloon = Some(h);
+        }
+    }
+
+    // virtio-blk — present iff a disk source was provided (boot) or a record exists (restore).
+    if let Some(disk) = ctx.disk.clone() {
+        let file = fs::OpenOptions::new().read(true).write(true).open(&disk)
+            .map_err(|e| io::Error::other(format!("open disk {}: {e}", disk.display())))?;
+        let blk = VirtioBlk::new(file).map_err(|e| io::Error::other(format!("VirtioBlk::new: {e}")))?;
+        let mem = ctx.guest_ram();
+        place::<VirtioMmio, _>(mgr, &mode, "virtio-blk", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new("virtio-blk", Box::new(blk), mem, irq))?;
+    }
+
+    // virtio-net — boot-only (snapshots are blocked under --net, so no restore arm).
+    if ctx.net {
+        let (backend, rx) = ignition_vmnet::VmnetBackend::start()
+            .expect("vmnet start failed (run boot under sudo for --net)");
+        let mem = ctx.guest_ram();
+        let net_dev = VirtioNet::new(backend);
+        if let Some(h) = place(mgr, &mode, "virtio-net", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new("virtio-net", Box::new(net_dev), mem, irq))? {
+            let h2 = h.clone();
+            std::thread::spawn(move || {
+                for frame in rx { h2.lock().unwrap().inject_rx(&frame); }
+            });
+            ctx.net_mmio = Some(h);
+        }
+    }
+
+    // virtio-vsock — present iff a uds base was provided (boot) or a record exists (restore).
+    let want_vsock = matches!(mode, Mode::Restore(_)) || ctx.vsock_uds.is_some();
+    if want_vsock {
+        let uds = ctx.vsock_uds.clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("ignition-vsock"));
+        let mem = ctx.guest_ram();
+        let vsock_dev = VsockDevice::new(uds);
+        if let Some(h) = place(mgr, &mode, "vsock", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new("vsock", Box::new(vsock_dev), mem, irq))? {
+            ctx.vsock_mmio = Some(h);
+        }
+    }
+
+    Ok(())
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -357,81 +500,27 @@ fn main() {
         layout::SPI_COUNT,
     );
 
-    // Serial is always the first device (its base matches the earlycon address
-    // in the kernel command line).
-    let serial = mgr
-        .add(layout::MMIO_WINDOW, |irq| Serial::with_irq(FlushWriter, irq))
-        .expect("add serial");
-
-    // PL031 RTC: always-on wall clock. The build closure ignores `irq` (time-only,
-    // no alarm interrupt); the framework still allocates an unused SPI.
-    mgr.add(layout::MMIO_WINDOW, |_irq| Pl031::new()).expect("add rtc");
-
-    // virtio-rng: always-on entropy source. Stateless; the framework handles its
-    // MMIO window, SPI, FDT node, and snapshot record.
-    {
-        let guest_ram_rng = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        mgr.add(layout::MMIO_WINDOW, move |irq| {
-            VirtioMmio::new("virtio-rng", Box::new(VirtioRng::new()), guest_ram_rng, irq)
-        })
-        .expect("add rng");
-    }
-
-    let (balloon_dev, balloon_target) = Balloon::new();
-    let balloon = {
-        let guest_ram_balloon = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        mgr.add(layout::MMIO_WINDOW, move |irq| {
-            VirtioMmio::new("virtio-balloon", Box::new(balloon_dev), guest_ram_balloon, irq)
-        })
-        .expect("add balloon")
+    let mut ctx = DeviceContext {
+        host: host as *mut u8,
+        ram_size: RAM_SIZE,
+        disk: disk_path.as_ref().map(PathBuf::from),
+        vsock_uds: vsock_uds.clone(),
+        net,
+        serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
     };
-
-    if let Some(path) = &disk_path {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("failed to open rootfs disk");
-        let blk = VirtioBlk::new(file).expect("virtio-blk init failed");
-        // SAFETY: the host mapping outlives the run; the device touches it only
-        // during MMIO exits, when the guest is paused.
-        let guest_ram = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        mgr.add(layout::MMIO_WINDOW, move |irq| {
-            VirtioMmio::new("virtio-blk", Box::new(blk), guest_ram, irq)
-        })
-        .expect("add virtio-blk");
-        eprintln!("virtio : /dev/vda backed by {path}");
-    }
-
-    if net {
-        let (backend, rx) = ignition_vmnet::VmnetBackend::start()
-            .expect("vmnet start failed (run boot under sudo for --net)");
-        let guest_ram_net = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        let net_dev = VirtioNet::new(backend);
-        let net_mmio = mgr
-            .add(layout::MMIO_WINDOW, move |irq| {
-                VirtioMmio::new("virtio-net", Box::new(net_dev), guest_ram_net, irq)
-            })
-            .expect("add virtio-net");
-        std::thread::spawn(move || {
-            for frame in rx {
-                net_mmio.lock().unwrap().inject_rx(&frame);
-            }
-        });
-        eprintln!("virtio-net: enabled (vmnet shared/NAT)");
-    }
-
-    if let Some(ref uds) = vsock_uds {
-        let guest_ram_vsock = GuestRam::new(host as *mut u8, RAM_SIZE as usize, layout::RAM_BASE);
-        let vsock_dev = VsockDevice::new(uds.clone());
-        let vsock_mmio = mgr
-            .add(layout::MMIO_WINDOW, move |irq| {
-                VirtioMmio::new("vsock", Box::new(vsock_dev), guest_ram_vsock, irq)
-            })
-            .expect("add vsock");
+    setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
+    let serial = ctx.serial.clone().expect("serial device");
+    let balloon_target = ctx.balloon_target.clone().expect("balloon target");
+    let balloon = ctx.balloon.clone().expect("balloon device");
+    if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
         spawn_vsock_reactor(vsock_mmio);
-        eprintln!("virtio-vsock: enabled (host uds base {})", uds.display());
+        eprintln!("virtio-vsock: enabled (host uds base {})",
+            ctx.vsock_uds.as_ref().unwrap().display());
     }
+    if disk_path.is_some() {
+        eprintln!("virtio : /dev/vda backed by {}", disk_path.as_ref().unwrap());
+    }
+    if net { eprintln!("virtio-net: enabled (vmnet shared/NAT)"); }
 
     // Boot-timer: plain BusDevice at a fixed MMIO address (no FDT node, no SPI).
     // The guest writes magic byte 123 to signal userspace-reached; we log elapsed ms.
@@ -756,5 +845,19 @@ mod tests {
         let mut s = EscState::Normal;
         assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
         assert!(matches!(step(&mut s, b's'), Action::Snapshot));
+    }
+
+    #[test]
+    fn check_known_ids_accepts_known_and_rejects_unknown() {
+        use vmm::device_manager::DeviceRecord;
+        use devices::device::FdtKind;
+        let rec = |id: &str| DeviceRecord {
+            id: id.into(), base: 0, size: 0x200, spi: 0,
+            fdt_kind: FdtKind::VirtioMmio, state: serde_json::Value::Null,
+        };
+        let ok = vec![rec("serial"), rec("virtio-blk"), rec("virtio-balloon"), rec("vsock")];
+        assert!(super::check_known_ids(&ok).is_ok());
+        let bad = vec![rec("serial"), rec("mystery-device")];
+        assert!(super::check_known_ids(&bad).is_err());
     }
 }
