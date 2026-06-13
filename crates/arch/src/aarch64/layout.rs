@@ -99,11 +99,11 @@ mod tests {
 
     #[test]
     fn mmio_region_is_below_ram() {
-        assert!(MMIO_BASE + MMIO_LEN <= RAM_BASE);
+        const { assert!(MMIO_BASE + MMIO_LEN <= RAM_BASE) };
     }
 
     #[test]
     fn mmio_window_fits_in_region() {
-        assert!(MMIO_WINDOW <= MMIO_LEN);
+        const { assert!(MMIO_WINDOW <= MMIO_LEN) };
     }
 }

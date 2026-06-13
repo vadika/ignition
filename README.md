@@ -26,14 +26,18 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   - **virtio-blk** — rootfs from a disk image.
   - **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
   - **virtio-rng** — entropy source (`getentropy`-backed), always-on.
-  - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`).
-  - **virtio-vsock** — guest→host streams over a host Unix socket (`--vsock-uds`); host→guest is a TODO (E2).
+  - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`);
+    the inflation target survives snapshot/restore.
+  - **virtio-vsock** — guest→host streams over a host Unix socket (`--vsock-uds`); host→guest is
+    a TODO (E2). On restore, live connections are reset (the guest is RST'd — host peers are gone).
   - **PL031 RTC** — wall clock; the kernel sets system time from it.
   - **boot-timer** — pseudo device; the guest pokes a magic byte at boot's end and
     the VMM logs `Guest-boot-time = N ms` (~200 ms here).
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
 - **Snapshot / restore** — single-vCPU, clone-capable (`--snap-dir` + `Ctrl-A s`,
-  `--restore`); restored guest idles at ~0% CPU and stays responsive.
+  `--restore`); restored guest idles at ~0% CPU and stays responsive. Both fresh boot
+  and restore drive one device-wiring site; every device restores its full state
+  (transport + queues + per-device: balloon target, vsock connection reset).
 
 The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
 load-bearing layer; the `hvf-spike` smoke test still exercises it in isolation

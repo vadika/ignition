@@ -101,6 +101,22 @@ impl VirtioDevice for Balloon {
             _ => false,
         }
     }
+    fn save(&self) -> serde_json::Value {
+        serde_json::json!({
+            "num_pages": self.num_pages.load(Ordering::Acquire),
+            "actual": self.actual,
+        })
+    }
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        let num_pages = v.get("num_pages").and_then(|x| x.as_u64())
+            .ok_or("balloon: missing num_pages")? as u32;
+        let actual = v.get("actual").and_then(|x| x.as_u64())
+            .ok_or("balloon: missing actual")? as u32;
+        // Release pairs with the device's Acquire load in config_bytes().
+        self.num_pages.store(num_pages, Ordering::Release);
+        self.actual = actual;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +195,21 @@ mod tests {
         assert_eq!(b.device_id(), 5);
         assert_eq!(b.queue_count(), 2);
         assert_eq!(b.device_features(0), 0);
+    }
+
+    #[test]
+    fn save_restore_roundtrips_target_and_actual() {
+        let (mut b, t) = Balloon::new();
+        t.store(64 * 256, Ordering::Relaxed); // host target = 64 MiB in pages
+        b.config_write(0x04, &(40 * 256u32).to_le_bytes()); // guest reported actual
+        let saved = b.save();
+
+        let (mut b2, t2) = Balloon::new();
+        b2.restore(&saved).expect("restore ok");
+        assert_eq!(t2.load(Ordering::Relaxed), 64 * 256, "shared target restored");
+        let mut d = [0u8; 8];
+        b2.config_read(0x00, &mut d);
+        assert_eq!(u32::from_le_bytes(d[0..4].try_into().unwrap()), 64 * 256);
+        assert_eq!(u32::from_le_bytes(d[4..8].try_into().unwrap()), 40 * 256);
     }
 }

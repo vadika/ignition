@@ -20,11 +20,26 @@ pub struct Muxer {
     uds_base: PathBuf,
     conns: HashMap<(u32, u32), Connection>, // (guest_port, host_port)
     rxq: VecDeque<RxPacket>,
+    /// Connection keys carried over a snapshot; RST'd to the guest on the first service() after restore (host UDS peers no longer exist).
+    pending_rst: Vec<(u32, u32)>,
 }
 
 impl Muxer {
     pub fn new(uds_base: PathBuf) -> Muxer {
-        Muxer { uds_base, conns: HashMap::new(), rxq: VecDeque::new() }
+        Muxer { uds_base, conns: HashMap::new(), rxq: VecDeque::new(), pending_rst: Vec::new() }
+    }
+
+    /// Open connection keys for the snapshot (guest_port, host_port). Sorted so
+    /// snapshots are reproducible (HashMap iteration order is nondeterministic).
+    pub fn save_conns(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.conns.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Seed connections that existed at snapshot time; service() will RST each.
+    pub fn seed_rst(&mut self, conns: Vec<(u32, u32)>) {
+        self.pending_rst = conns;
     }
 
     fn ctrl_hdr(op: u16, guest_port: u32, host_port: u32, fwd_cnt: u32) -> VsockHeader {
@@ -113,6 +128,13 @@ impl Muxer {
     /// Reactor pass: flush pending guest->host data and read host->guest data into rxq.
     /// Removes connections that reached Closed (queuing a final RST).
     pub fn service(&mut self) {
+        // Post-restore: RST every connection that existed at snapshot time, once.
+        for (guest_port, host_port) in self.pending_rst.drain(..) {
+            self.rxq.push_back(RxPacket {
+                hdr: Self::ctrl_hdr(OP_RST, guest_port, host_port, 0),
+                data: Vec::new(),
+            });
+        }
         let mut new_rx: Vec<RxPacket> = Vec::new();
         let mut closed: Vec<(u32, u32)> = Vec::new();
         for (key, conn) in self.conns.iter_mut() {
@@ -208,6 +230,37 @@ mod tests {
         app.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_rst_emits_one_rst_per_conn_on_service() {
+        let base = std::env::temp_dir().join("ign-vsock-rst/vsock");
+        let mut mux = Muxer::new(base);
+        mux.seed_rst(vec![(1024, 5000), (2048, 6000)]);
+        mux.service();
+        let mut ops = Vec::new();
+        while let Some(pkt) = mux.pop_rx() {
+            ops.push((pkt.hdr.op, pkt.hdr.dst_port, pkt.hdr.src_port));
+        }
+        assert_eq!(ops.len(), 2, "one RST per seeded connection");
+        assert!(ops.iter().all(|&(op, _, _)| op == OP_RST));
+        assert!(ops.contains(&(OP_RST, 1024, 5000)));
+        assert!(ops.contains(&(OP_RST, 2048, 6000)));
+        // Idempotent: a second service() pass emits nothing further.
+        mux.service();
+        assert!(mux.pop_rx().is_none());
+    }
+
+    #[test]
+    fn save_conns_lists_open_connection_keys() {
+        let dir = std::env::temp_dir().join(format!("ign-vsock-save-{}", std::process::id()));
+        let base = dir.join("vsock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _l = UnixListener::bind(base.with_file_name("vsock_5000")).unwrap();
+        let mut mux = Muxer::new(base);
+        mux.handle_tx(&req(1024, 5000), &[]);
+        assert_eq!(mux.save_conns(), vec![(1024, 5000)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
