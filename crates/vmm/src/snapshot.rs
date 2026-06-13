@@ -279,11 +279,25 @@ pub fn read_snapshot(dir: &Path) -> io::Result<(VmSnapshot, Vec<u8>, Paths)> {
 /// Write a diff layer: the dirty pages packed back-to-back into `memory.bin`
 /// (ascending page-index order) and the sorted page indices into `dirty.idx`
 /// as little-endian u64. `dirty` must be sorted page indices into `ram`.
+///
+/// Invariant: guest RAM (`mem_size`) is always a multiple of [`crate::dirty::PAGE`]
+/// because it derives from `--mem` in MiB (1 MiB = 64 × 16 KiB), so every dirty
+/// page index maps to a full in-bounds page of `ram`. The bounds guard below
+/// exists purely as defense against a future non-aligned size: it turns the only
+/// slice-out-of-bounds panic path into a clean `Err` and never fires for
+/// MiB-sized RAM.
 pub fn write_diff_pages(dir: &Path, dirty: &[u64], ram: &[u8]) -> io::Result<()> {
     let page = crate::dirty::PAGE;
     let mut mem = fs::File::create(dir.join("memory.bin"))?;
     for &p in dirty {
         let o = p as usize * page;
+        if o + page > ram.len() {
+            return Err(io::Error::other(format!(
+                "dirty page {p} out of RAM bounds ({} pages of {page}B, ram {}B)",
+                dirty.len(),
+                ram.len()
+            )));
+        }
         mem.write_all(&ram[o..o + page])?;
     }
     let mut idx = fs::File::create(dir.join("dirty.idx"))?;
@@ -347,6 +361,15 @@ mod tests {
         }
         assert!(target[0..page].iter().all(|&b| b == 0)); // page 0 untouched
         assert!(target[2 * page..3 * page].iter().all(|&b| b == 0)); // page 2 untouched
+    }
+
+    #[test]
+    fn write_diff_pages_rejects_out_of_bounds_index() {
+        let page = crate::dirty::PAGE;
+        let ram = vec![0u8; 2 * page]; // 2 pages
+        let dir = tempfile::tempdir().unwrap();
+        // index 2 is out of bounds for a 2-page ram
+        assert!(write_diff_pages(dir.path(), &[2u64], &ram).is_err());
     }
 
     #[test]
