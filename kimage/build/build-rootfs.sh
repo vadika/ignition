@@ -11,7 +11,9 @@ TAR="$STAGE/rootfs.tar"
 # 1. Provision rootfs inside an arm64 alpine container (init, console, dirs).
 docker rm -f fcroot_build >/dev/null 2>&1 || true
 docker run --platform linux/arm64 --name fcroot_build alpine:3.19 sh -euxc '
-  apk add --no-cache openrc util-linux ifupdown-ng
+  # socat provides a userspace AF_VSOCK client (VSOCK-CONNECT) for testing the
+  # virtio-vsock device end to end (alpine 3.19 ships socat 1.8 with VSOCK support).
+  apk add --no-cache openrc util-linux ifupdown-ng socat
 
   # serial console on ttyS0 (Firecracker default)
   ln -sf agetty /etc/init.d/agetty.ttyS0
