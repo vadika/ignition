@@ -99,7 +99,7 @@ pub fn clonefile_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     let err = io::Error::last_os_error();
     match err.raw_os_error() {
         // Not APFS, or src and dst are on different filesystems: fall back.
-        Some(libc::ENOTSUP) | Some(libc::EXDEV) => {
+        Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::ENOSYS) => {
             log::warn!(
                 "clonefile unsupported ({err}); falling back to byte copy: {} -> {}",
                 src.display(),
@@ -243,11 +243,9 @@ mod tests {
 
     #[test]
     fn clonefile_or_copy_duplicates_and_isolates() {
-        let dir = std::env::temp_dir().join(format!("ign-clone-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.bin");
-        let dst = dir.join("dst.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
         fs::write(&src, b"hello world").unwrap();
 
         clonefile_or_copy(&src, &dst).unwrap();
@@ -256,8 +254,6 @@ mod tests {
         // Editing the clone must NOT change the source (CoW / copy isolation).
         fs::write(&dst, b"CHANGED!!!!").unwrap();
         assert_eq!(fs::read(&src).unwrap(), b"hello world");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
