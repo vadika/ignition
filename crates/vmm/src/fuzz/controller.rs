@@ -62,6 +62,14 @@ pub fn restore_ram(base: &[u8], live: &mut [u8]) {
     live.copy_from_slice(base);
 }
 
+/// Copy a fixed input verbatim into the window (replay/determinism mode). No
+/// mutation — used to confirm a saved crash input reproduces deterministically.
+pub fn replay_into(input: &[u8], window: &mut [u8]) -> u32 {
+    let n = input.len().min(window.len());
+    window[..n].copy_from_slice(&input[..n]);
+    n as u32
+}
+
 /// Write a crash-triggering input and its metadata to the solutions directory.
 /// Returns the path of the written input file.
 pub fn write_solution(dir: &Path, index: u64, input: &[u8], crash_code: u32) -> std::io::Result<PathBuf> {
@@ -93,6 +101,7 @@ pub struct FuzzController {
     rng: Rng,
     seeds: Vec<Vec<u8>>,
     seed_idx: usize,
+    replay: Option<Vec<u8>>,
     solutions_dir: PathBuf,
     crash_count: u64,
     iterations: u64,
@@ -104,12 +113,15 @@ unsafe impl Send for FuzzController {}
 
 impl FuzzController {
     /// `ram`/`window` are (ptr, len) of the host mappings for guest RAM and the
-    /// shared window. `seeds` is the starting corpus (may be empty). `seed_rng`
+    /// shared window. `seeds` is the starting corpus (may be empty). `replay`, if
+    /// `Some`, is a fixed input fed verbatim every iteration (no mutation) for the
+    /// determinism gate; it takes precedence over the seed corpus. `seed_rng`
     /// fixes the mutation stream for reproducibility.
     pub fn new(
         ram: (*mut u8, usize),
         window: (*mut u8, usize),
         seeds: Vec<Vec<u8>>,
+        replay: Option<Vec<u8>>,
         seed_rng: u64,
         solutions_dir: PathBuf,
     ) -> FuzzController {
@@ -123,6 +135,7 @@ impl FuzzController {
             rng: Rng::new(seed_rng),
             seeds: if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds },
             seed_idx: 0,
+            replay,
             solutions_dir,
             crash_count: 0,
             iterations: 0,
@@ -156,6 +169,9 @@ impl FuzzController {
 
     /// Pick the next seed, mutate it into the shared window, return its length.
     fn prepare_next_input(&mut self) -> u32 {
+        if let Some(fixed) = self.replay.clone() {
+            return replay_into(&fixed, self.window());
+        }
         let seed = self.seeds[self.seed_idx % self.seeds.len()].clone();
         self.seed_idx = self.seed_idx.wrapping_add(1);
         let max = self.window_len;
@@ -242,6 +258,18 @@ mod tests {
         live[4000] = 0x11;
         restore_ram(&base, &mut live);
         assert_eq!(live, base);
+    }
+
+    #[test]
+    fn replay_into_copies_verbatim_clamped() {
+        let mut win = vec![0u8; 4];
+        let n = replay_into(&[0xAB, 0xCD, 0xEF], &mut win);
+        assert_eq!(n, 3);
+        assert_eq!(&win[..3], &[0xAB, 0xCD, 0xEF]);
+        // clamps to window length
+        let mut small = vec![0u8; 2];
+        assert_eq!(replay_into(&[1, 2, 3, 4], &mut small), 2);
+        assert_eq!(&small[..], &[1, 2]);
     }
 
     #[test]
