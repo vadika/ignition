@@ -204,7 +204,7 @@ plumbing.
 - [ ] **M1 — correctness gate.** Target = **libpng, known-CVE build** (e.g. CVE-2015-8126).
   Gate: fuzzer rediscovers the planted crash from an empty/seed corpus, deterministically
   reproducible from the saved input.
-- [ ] **M2 — coverage + dirty-page reset (v1).** Add SanCov window + libAFL feedback; swap
+- [x] **M2 — coverage + dirty-page reset (v1).** Add SanCov window + libAFL feedback; swap
   reset to `hv_vm_protect` dirty set. Gate: coverage curve stabilizes; execs/sec jumps.
 - [ ] **M3 — benchmark.** Target = **libpng current**. Capture execs/sec, reset-latency
   p50/p99, dirty-set-size distribution; compare vs a Linux/KVM snapshot fuzzer on the same

@@ -17,6 +17,7 @@ void target_parse(const uint8_t *data, unsigned long len);
 
 static volatile uint8_t *g_ctrl;   /* control registers (16 KiB) */
 static volatile uint8_t *g_win;    /* shared window (input bytes) */
+static volatile uint8_t *g_cov;    /* 8-bit SanCov edge counters (host reads) */
 
 static inline void reg_write(unsigned off, uint32_t v) {
     *(volatile uint32_t *)(g_ctrl + off) = v;
@@ -25,6 +26,18 @@ static inline uint32_t reg_read(unsigned off) {
     return *(volatile uint32_t *)(g_ctrl + off);
 }
 static inline void doorbell(uint32_t cmd) { reg_write(REG_DOORBELL, cmd); }
+
+/* SanCov edge callback. target.c is built with -fsanitize-coverage=trace-pc, so
+ * this fires once per edge with the return address identifying the edge. We hash
+ * it into the shared coverage map (8-bit counters) the host reads after DONE.
+ * harness.c is NOT coverage-instrumented, or this would recurse into itself.
+ * The null-guard matters: the callback can fire during libc/global init, before
+ * main() maps g_cov. */
+void __sanitizer_cov_trace_pc(void) {
+    if (!g_cov) return;
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    g_cov[(pc >> 4) & (IGNITION_FUZZ_COV_SIZE - 1)]++;
+}
 
 /* On any fatal signal: report a CRASH and spin. The VMM resets PC/regs/RAM on
  * the CRASH doorbell, so this frame is discarded — we never actually return. */
@@ -60,6 +73,8 @@ int main(void) {
     g_ctrl = mmap(0, IGNITION_FUZZ_CTRL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IGNITION_FUZZ_CTRL_GPA);
     g_win  = mmap(0, IGNITION_FUZZ_WIN_SIZE,  PROT_READ | PROT_WRITE, MAP_SHARED, fd, IGNITION_FUZZ_WIN_GPA);
     if (g_ctrl == MAP_FAILED || g_win == MAP_FAILED) return 2;
+    g_cov = mmap(0, IGNITION_FUZZ_COV_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IGNITION_FUZZ_COV_GPA);
+    if (g_cov == MAP_FAILED) return 3;
 
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);

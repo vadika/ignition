@@ -4,8 +4,11 @@
 //! mutator, and solution writer are pure and tested here.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ignition_hvf::{HvfVcpu, VcpuState};
+
+use crate::dirty::{DirtyTracker, PAGE};
 
 /// Deterministic xorshift64* PRNG. A fixed seed makes a fuzz run reproducible,
 /// which the determinism requirements (spec §7) depend on.
@@ -28,6 +31,28 @@ impl Rng {
     }
     pub fn below(&mut self, n: usize) -> usize {
         if n == 0 { 0 } else { (self.next_u64() % n as u64) as usize }
+    }
+}
+
+/// Which per-iteration RAM reset to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    /// v0: memcpy the whole guest RAM from base every iteration. Correct, slow,
+    /// no dirty-tracking dependency. Kept for the M2 throughput comparison.
+    Full,
+    /// v1: restore only guest-dirtied pages (drained from the DirtyTracker) and
+    /// re-protect. This is the throughput story.
+    Dirty,
+}
+
+impl std::str::FromStr for ResetMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<ResetMode, String> {
+        match s {
+            "full" => Ok(ResetMode::Full),
+            "dirty" => Ok(ResetMode::Dirty),
+            other => Err(format!("unknown reset mode {other:?} (want full|dirty)")),
+        }
     }
 }
 
@@ -62,6 +87,22 @@ pub fn restore_ram(base: &[u8], live: &mut [u8]) {
     live.copy_from_slice(base);
 }
 
+/// Restore only the pages in `pages` (page indices into a region based at offset
+/// 0) from `base` to `live`, clamping the last page to the region length. v1 of
+/// the spec §6 reset: the dirty set replaces the full-RAM copy. `base`/`live`
+/// must be the same length.
+pub fn restore_pages(base: &[u8], live: &mut [u8], pages: &[u64], page: usize) {
+    debug_assert_eq!(base.len(), live.len(), "base and live RAM must match in size");
+    for &p in pages {
+        let start = (p as usize) * page;
+        if start >= live.len() {
+            continue;
+        }
+        let end = (start + page).min(live.len());
+        live[start..end].copy_from_slice(&base[start..end]);
+    }
+}
+
 /// Copy a fixed input verbatim into the window (replay/determinism mode). No
 /// mutation — used to confirm a saved crash input reproduces deterministically.
 pub fn replay_into(input: &[u8], window: &mut [u8]) -> u32 {
@@ -83,6 +124,44 @@ pub fn write_solution(dir: &Path, index: u64, input: &[u8], crash_code: u32) -> 
     Ok(input_path)
 }
 
+/// Accumulated edge-coverage map (the host-side "virgin bits"). Each `record`
+/// folds one iteration's freshly-read 8-bit counter buffer in: an index that is
+/// nonzero now but was never seen before is new coverage. Counts, not just bits,
+/// are read from the guest, but only first-touch is tracked — enough for the M2
+/// coverage curve and the coverage-guided corpus. (libAFL's bucketed
+/// `MaxMapFeedback` is the later, richer replacement.)
+pub struct CoverageMap {
+    seen: Vec<bool>,
+    covered: usize,
+}
+
+impl CoverageMap {
+    pub fn new(len: usize) -> CoverageMap {
+        CoverageMap { seen: vec![false; len], covered: 0 }
+    }
+
+    /// Fold `cov` (this iteration's counters) into the accumulated map. Returns
+    /// true if any previously-unseen edge was hit. `cov` may be shorter or longer
+    /// than the map; only the overlapping prefix is considered.
+    pub fn record(&mut self, cov: &[u8]) -> bool {
+        let mut new = false;
+        let n = cov.len().min(self.seen.len());
+        for i in 0..n {
+            if cov[i] != 0 && !self.seen[i] {
+                self.seen[i] = true;
+                self.covered += 1;
+                new = true;
+            }
+        }
+        new
+    }
+
+    /// Total distinct edges hit across all recorded iterations.
+    pub fn covered(&self) -> usize {
+        self.covered
+    }
+}
+
 /// The live fuzzer state for one M0 run. Holds the host-side base copy of guest
 /// RAM, the saved base register file, a raw view of live guest RAM and the
 /// shared window (host VAs from the boot harness's mmaps), the mutator, the seed
@@ -98,9 +177,17 @@ pub struct FuzzController {
     ram_len: usize,
     window_ptr: *mut u8,
     window_len: usize,
+    cov_ptr: *mut u8,
+    cov_len: usize,
+    coverage: CoverageMap,
+    corpus: Vec<Vec<u8>>,
+    last_input: Vec<u8>,
+    reset_mode: ResetMode,
+    dirty: Option<DirtyTracker>,
+    ram_base_gpa: u64,
+    started: Option<Instant>,
+    last_dirty_pages: u64,
     rng: Rng,
-    seeds: Vec<Vec<u8>>,
-    seed_idx: usize,
     replay: Option<Vec<u8>>,
     solutions_dir: PathBuf,
     crash_count: u64,
@@ -117,14 +204,20 @@ impl FuzzController {
     /// `Some`, is a fixed input fed verbatim every iteration (no mutation) for the
     /// determinism gate; it takes precedence over the seed corpus. `seed_rng`
     /// fixes the mutation stream for reproducibility.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ram: (*mut u8, usize),
         window: (*mut u8, usize),
+        cov: (*mut u8, usize),
+        ram_base_gpa: u64,
+        reset_mode: ResetMode,
+        dirty: Option<DirtyTracker>,
         seeds: Vec<Vec<u8>>,
         replay: Option<Vec<u8>>,
         seed_rng: u64,
         solutions_dir: PathBuf,
     ) -> FuzzController {
+        let corpus = if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds };
         FuzzController {
             base_ram: Vec::new(),
             base_state: None,
@@ -132,14 +225,22 @@ impl FuzzController {
             ram_len: ram.1,
             window_ptr: window.0,
             window_len: window.1,
+            cov_ptr: cov.0,
+            cov_len: cov.1,
+            coverage: CoverageMap::new(cov.1),
+            corpus,
+            last_input: Vec::new(),
+            reset_mode,
+            dirty,
+            ram_base_gpa,
             rng: Rng::new(seed_rng),
-            seeds: if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds },
-            seed_idx: 0,
             replay,
             solutions_dir,
             crash_count: 0,
             iterations: 0,
             captured: false,
+            started: None,
+            last_dirty_pages: 0,
         }
     }
 
@@ -155,6 +256,10 @@ impl FuzzController {
         // SAFETY: see struct doc; single-threaded, mapping outlives the run.
         unsafe { std::slice::from_raw_parts_mut(self.window_ptr, self.window_len) }
     }
+    fn cov(&mut self) -> &mut [u8] {
+        // SAFETY: see struct doc; single-threaded, mapping outlives the run.
+        unsafe { std::slice::from_raw_parts_mut(self.cov_ptr, self.cov_len) }
+    }
 
     /// One-time SNAPSHOT_ME handling: PC is advanced past the doorbell store by
     /// the caller; copy guest RAM into the base buffer and save the register
@@ -164,26 +269,78 @@ impl FuzzController {
         self.base_ram = live;
         self.base_state = Some(vcpu.save_state()?);
         self.captured = true;
+        self.started = Some(Instant::now());
+        if self.reset_mode == ResetMode::Dirty {
+            // Note: `set_dirty_window` (armed earlier in fuzz_loop) only configures
+            // fault CLASSIFICATION; actual write-protection of guest RAM begins HERE
+            // at the snapshot point, which is why boot-time guest writes never faulted.
+            // Drop WRITE on all guest RAM; first write per page faults (DirtyFault),
+            // gets logged + re-granted by the fuzz loop. The window/cov regions are
+            // mapped below RAM_BASE, outside this range, so they stay writable.
+            ignition_hvf::vm_protect_memory(
+                self.ram_base_gpa,
+                self.ram_len as u64,
+                (ignition_hvf::bindings::HV_MEMORY_READ | ignition_hvf::bindings::HV_MEMORY_EXEC) as u64,
+            )?;
+        }
         Ok(self.prepare_next_input())
     }
 
-    /// Pick the next seed, mutate it into the shared window, return its length.
+    /// Pick a corpus entry, mutate it into the shared window, zero the coverage
+    /// map (so the next run's counters are fresh), remember the bytes for a
+    /// possible corpus add, and return the input length.
     fn prepare_next_input(&mut self) -> u32 {
+        // Zero coverage before the guest accumulates this iteration's edges.
+        for b in self.cov().iter_mut() {
+            *b = 0;
+        }
         if let Some(fixed) = self.replay.clone() {
+            self.last_input = fixed.clone();
             return replay_into(&fixed, self.window());
         }
-        let seed = self.seeds[self.seed_idx % self.seeds.len()].clone();
-        self.seed_idx = self.seed_idx.wrapping_add(1);
+        let pick = self.rng.below(self.corpus.len());
+        let seed = self.corpus[pick].clone();
         let max = self.window_len;
         let input = mutate(&seed, &mut self.rng, max);
         let n = input.len().min(self.window_len);
         self.window()[..n].copy_from_slice(&input[..n]);
+        self.last_input = input[..n].to_vec();
         n as u32
     }
 
-    /// DONE handling: count the iteration, prepare the next input, reset.
+    /// Read this iteration's coverage, fold it into the accumulated map, and keep
+    /// the input in the corpus if it reached a new edge (coverage-guided growth;
+    /// the homegrown analogue of libAFL's MaxMapFeedback). Emits a periodic stats
+    /// line (parsed by the M2 gate). Must run before `reset` rolls back RAM — but
+    /// the coverage region is reset-exempt, so the ordering is for clarity only.
+    fn observe_and_stats(&mut self) {
+        let cov_snapshot = self.cov().to_vec();
+        let new_cov = self.coverage.record(&cov_snapshot);
+        if new_cov && self.replay.is_none() && self.corpus.len() < 4096 {
+            self.corpus.push(self.last_input.clone());
+        }
+        // Periodic stats: every 2000 iterations and on the first.
+        if self.iterations == 1 || self.iterations % 2000 == 0 {
+            let elapsed = self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let eps = if elapsed > 0.0 { self.iterations as f64 / elapsed } else { 0.0 };
+            log::info!(
+                "fuzz: iters={} execs/sec={:.0} cov={} corpus={} dirty_pages={} reset={:?}",
+                self.iterations, eps, self.coverage.covered(), self.corpus.len(),
+                self.last_dirty_pages, self.reset_mode
+            );
+            // Also to stderr so the gate can parse without RUST_LOG configured.
+            eprintln!(
+                "fuzz: iters={} execs/sec={:.0} cov={} corpus={} dirty_pages={} reset={:?}",
+                self.iterations, eps, self.coverage.covered(), self.corpus.len(),
+                self.last_dirty_pages, self.reset_mode
+            );
+        }
+    }
+
+    /// DONE handling: count the iteration, fold coverage, prepare the next input, reset.
     pub fn on_done(&mut self, vcpu: &mut HvfVcpu) -> Result<u32, ignition_hvf::Error> {
         self.iterations += 1;
+        self.observe_and_stats();
         let len = self.prepare_next_input();
         self.reset(vcpu)?;
         Ok(len)
@@ -200,17 +357,40 @@ impl FuzzController {
         self.crash_count += 1;
         log::info!("fuzz: CRASH captured (code={crash_code}, len={n}), solutions={}", self.crash_count);
         self.iterations += 1;
+        self.observe_and_stats();
         let len = self.prepare_next_input();
         self.reset(vcpu)?;
         Ok(len)
     }
 
-    /// Roll the guest back to the snapshot: memcpy base->live RAM, restore the
-    /// register file, and cancel the pending lazy PC advance from the doorbell
-    /// trap (restore_state already set PC to the post-SNAPSHOT_ME value).
+    /// Roll the guest back to the snapshot: restore RAM (full memcpy or only the
+    /// drained dirty pages), restore the register file, and cancel the pending
+    /// lazy PC advance from the doorbell trap (restore_state already set PC to the
+    /// post-SNAPSHOT_ME value).
     fn reset(&mut self, vcpu: &mut HvfVcpu) -> Result<(), ignition_hvf::Error> {
         let base = std::mem::take(&mut self.base_ram);
-        restore_ram(&base, self.live_ram());
+        match self.reset_mode {
+            ResetMode::Full => {
+                restore_ram(&base, self.live_ram());
+            }
+            ResetMode::Dirty => {
+                // Ordering note: the guest vCPU is paused for the entire duration of
+                // reset() (single vCPU thread; reset runs between vcpu.run() calls), so
+                // no guest instruction executes between the re-protect below and the
+                // register restore — the ordering is immaterial, there is no fault window.
+                let pages = self.dirty.as_ref().expect("dirty mode requires a tracker").drain();
+                self.last_dirty_pages = pages.len() as u64;
+                restore_pages(&base, self.live_ram(), &pages, PAGE);
+                // Re-protect ALL RAM (drop WRITE) so the next iteration starts clean
+                // and re-arms the write-protect faults. drain() already cleared the
+                // bitmap.
+                ignition_hvf::vm_protect_memory(
+                    self.ram_base_gpa,
+                    self.ram_len as u64,
+                    (ignition_hvf::bindings::HV_MEMORY_READ | ignition_hvf::bindings::HV_MEMORY_EXEC) as u64,
+                )?;
+            }
+        }
         self.base_ram = base;
         let state = self.base_state.as_ref().expect("reset before capture");
         vcpu.restore_state(state)?;
@@ -282,5 +462,61 @@ mod tests {
         assert!(meta.contains("crash_code=9"));
         assert!(meta.contains("len=2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_map_reports_new_edges_then_saturates() {
+        let mut cm = CoverageMap::new(8);
+        // First observation: edges 1 and 4 hit -> new coverage.
+        assert!(cm.record(&[0, 5, 0, 0, 2, 0, 0, 0]));
+        assert_eq!(cm.covered(), 2);
+        // Same edges again (different counts) -> no new coverage.
+        assert!(!cm.record(&[0, 1, 0, 0, 9, 0, 0, 0]));
+        assert_eq!(cm.covered(), 2);
+        // A new edge (index 7) -> new coverage.
+        assert!(cm.record(&[0, 0, 0, 0, 0, 0, 0, 3]));
+        assert_eq!(cm.covered(), 3);
+    }
+
+    #[test]
+    #[allow(clippy::erasing_op, clippy::identity_op)]
+    fn restore_pages_touches_only_listed_pages() {
+        let pg = 16384usize;
+        let base = vec![0xAAu8; 4 * pg];
+        let mut live = base.clone();
+        // Dirty page 1 and page 3.
+        for b in &mut live[1 * pg..2 * pg] { *b = 0x55; }
+        for b in &mut live[3 * pg..4 * pg] { *b = 0x11; }
+        // Also scribble page 2, but DON'T list it: it must stay scribbled (proves
+        // we restore only the drained set, not the whole region).
+        for b in &mut live[2 * pg..3 * pg] { *b = 0x77; }
+        restore_pages(&base, &mut live, &[1, 3], pg);
+        assert_eq!(&live[1 * pg..2 * pg], &base[1 * pg..2 * pg], "page 1 restored");
+        assert_eq!(&live[3 * pg..4 * pg], &base[3 * pg..4 * pg], "page 3 restored");
+        assert!(live[2 * pg..3 * pg].iter().all(|&b| b == 0x77), "page 2 untouched");
+    }
+
+    #[test]
+    fn restore_pages_clamps_partial_trailing_page() {
+        let pg = 16384usize;
+        let base = vec![0xAAu8; pg + 100]; // last page is partial (100 bytes)
+        let mut live = base.clone();
+        live[pg + 50] = 0x55;
+        restore_pages(&base, &mut live, &[1], pg);
+        assert_eq!(live, base, "partial trailing page restored without overrun");
+    }
+
+    #[test]
+    fn reset_mode_parses() {
+        assert_eq!("full".parse::<ResetMode>().unwrap(), ResetMode::Full);
+        assert_eq!("dirty".parse::<ResetMode>().unwrap(), ResetMode::Dirty);
+        assert!("bogus".parse::<ResetMode>().is_err());
+    }
+
+    #[test]
+    fn coverage_map_all_zero_is_not_new() {
+        let mut cm = CoverageMap::new(4);
+        assert!(!cm.record(&[0, 0, 0, 0]));
+        assert_eq!(cm.covered(), 0);
     }
 }
