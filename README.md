@@ -1,22 +1,15 @@
 # ignition
 
 A research microVM for **macOS on Apple Silicon**, built on Apple's
-**Hypervisor.framework (HVF)**. Architecturally modeled on AWS Firecracker — the
-microVM model, the vstate seam, the device set — but **not a port of it**: it
-shares ~0 lines of Firecracker source (the Firecracker repo isn't even a
-dependency). The lineage is the *design*, plus the rust-vmm building blocks
-Firecracker also uses (`vm-superio`, `vm-fdt`).
+**Hypervisor.framework (HVF)**. Architecturally modeled on AWS Firecracker (the
+microVM model, the vstate seam, the device set), but not a port: it shares ~0 lines
+of Firecracker source. The lineage is the *design*, plus the rust-vmm building blocks
+Firecracker also uses (`vm-superio`, `vm-fdt`). The HVF backend (the `ignition-hvf`
+crate) originates from [libkrun](https://github.com/containers/libkrun) (Apache-2.0)
+and was substantially reworked here; everything else is original.
 
-The one genuinely lifted piece is the HVF backend — the `hvf` crate, taken from
-[libkrun](https://github.com/containers/libkrun) (Red Hat, Apache-2.0; itself
-Firecracker-inspired) and then substantially reworked here (direct `hv_gic_*`,
-SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
-harness — is original. See `docs/src/internals/design-decisions.md` and
-`docs/src/internals/hvf-firecracker-map.md` for the source analysis, and
-`docs/src/internals/validation-spike.md` for the validation spike.
-
-> **📖 Full documentation:** build the book with `mdbook serve docs/` (or see the
-> published site). Source under [`docs/src/`](docs/src/SUMMARY.md).
+> **📖 Documentation:** <https://vadika.github.io/ignition/> — build, concepts, features,
+> fuzzing, benchmarks, internals. Build locally with `mdbook serve docs/`.
 
 ## Quickstart
 
@@ -26,36 +19,36 @@ scripts/sign.sh target/debug/boot
 target/debug/boot kimage/out/Image kimage/out/rootfs.ext4
 ```
 
-See the book for everything else: build, guest assets, snapshot/restore, diff snapshots, fuzzing, benchmarks, internals.
+Requires an Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024). See
+the documentation for everything else: guest assets, snapshot/restore, diff snapshots,
+fuzzing, benchmarks.
 
-## Status: boots Linux to a shell, snapshot/restore, in-VMM snapshot fuzzing
+## Status
 
-Validated end-to-end on macOS 26.5 / Apple Silicon. Working today:
+Validated end-to-end on Apple Silicon. Working today:
 
 - **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive 16550 console.
-- **Device model** — uniform `DeviceManager` + `MmioDevice` trait; full Firecracker aarch64 set.
-- **virtio** — blk, net (vmnet NAT, `--net`), rng, balloon, vsock (guest→host E1).
-- **PL031 RTC + boot-timer** — wall clock and a `Guest-boot-time` probe.
+- **Device model** — uniform `DeviceManager` + `MmioDevice` trait; the full Firecracker aarch64 set.
+- **virtio** — blk, net (vmnet NAT, `--net`), rng, balloon, vsock (guest→host).
+- **PL031 RTC + boot-timer.**
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
-- **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, ~0% CPU idle, multi-vCPU + net.
+- **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, multi-vCPU + net.
 - **Diff snapshots** — `--track-dirty` write-protect tracking; immutable delta chains.
-- **In-VMM snapshot fuzzing** — `--fuzz` dirty-page reset loop; 1309 execs/sec on libpng 1.6.43.
+- **In-VMM snapshot fuzzing** — `--fuzz` per-iteration dirty-page reset loop.
 
-Full feature docs: the book; roadmap: `ROADMAP.md`.
+Full feature docs: the documentation site. Roadmap and progress: `ROADMAP.md`.
 
 ## Layout
 
 ```
 crates/
-  arch/      ignition-arch  (lib `ignition_arch`)  — aarch64 sysreg tables; FDT/boot regs later
-  hvf/       ignition-hvf   (lib `ignition_hvf`)   — Hypervisor.framework backend, lifted from libkrun then reworked
-  devices/   ignition-devices (lib `ignition_devices`) — serial/virtio/GIC (Phase 1)
-  vmm/       ignition-vmm   (lib `ignition_vmm`)   — vstate seam (HVF replacement for FC kvm/vm/vcpu)
-spike/       ignition-spike                         — the `boot` binary (interactive microVM)
-refs/        libkrun + firecracker clones (gitignored, reference only)
-scripts/     sign.sh                                — ad-hoc codesign with hypervisor entitlement
+  arch/      ignition-arch     (lib ignition_arch)     — aarch64 sysreg tables, FDT, boot regs
+  hvf/       ignition-hvf      (lib ignition_hvf)      — Hypervisor.framework backend
+  devices/   ignition-devices  (lib ignition_devices)  — serial, virtio, GIC, fuzz device
+  vmm/       ignition-vmm      (lib ignition_vmm)       — vstate seam (HVF in place of FC kvm/vm/vcpu)
+spike/       ignition-spike                            — the `boot` binary (interactive microVM)
+docs/        mdBook documentation (src/) + agentic specs/plans (superpowers/)
+examples/    runnable walkthroughs (diff-snapshot fan-out, fuzzing demo)
+scripts/     sign.sh and the benchmark/gate drivers
+refs/        reference VMM clones (gitignored, reference only)
 ```
-
-Crate lib names are `ignition_*`; the `hvf` crate was lifted from libkrun and then reworked, so imports were updated accordingly.
-
-Requires: Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024).
