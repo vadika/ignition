@@ -33,8 +33,19 @@ static void crash_handler(int sig) {
 static void target_parse(const uint8_t *data, uint32_t len) {
     char buf[16];
     if (len > 0 && data[0] == 0xFF) {
-        /* deterministic overflow -> SIGSEGV/SIGABRT (ASan in M1) */
-        memset(buf, 0xAA, (size_t)len + 64);
+        /* Deterministic fatal fault -> SIGSEGV -> crash_handler -> CMD_CRASH.
+         * NB: a plain `char buf[N]; memset(buf, .., len+64)` is dead-store-
+         * eliminated at -O2 (buf is never read), so the planted bug vanishes and
+         * the guest never faults. Force a real, un-removable wild write instead:
+         * spray 0xAA past `buf` through a volatile pointer so the compiler must
+         * emit the stores; with a large `len` this walks off the stack into an
+         * unmapped page and faults. The volatile sink also defeats DSE. */
+        volatile char *p = buf;
+        size_t n = (size_t)len + 64;
+        for (size_t i = 0; i < n; i++) p[i] = (char)0xAA;
+        /* Fallback guarantee: a NULL deref always faults even if the loop above
+         * somehow stayed in mapped memory. Unreachable on a real fault. */
+        *(volatile char *)0 = p[n - 1];
     } else {
         /* touch the input so the read is real work */
         volatile uint8_t acc = 0;
