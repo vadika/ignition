@@ -58,9 +58,3 @@ re-measured here as the deterministic anchor alongside the throughput numbers.
 - Reproduce: `M3_DURATION=60 python3 scripts/fuzz_m3_bench.py` (needs a signed
   `boot`, `kimage/out/Image`, and both fuzz initramfs images; see
   `REBUILD-GUEST-ASSETS.md`).
-
-## Deferred
-
-- Linux/KVM cross-check. A side-by-side against AFL++ persistent or Nyx on the
-  same libpng target (design section 11) is deferred; it needs a KVM host and an
-  equivalent harness. Tracked as an M3 follow-up.

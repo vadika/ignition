@@ -10,8 +10,7 @@ at once:
 
 1. **Benchmark.** Throughput is `1 / (reset_time + run_time)`. With `run_time` driven to a
    single parser call (microseconds), execs/sec becomes a near-direct readout of reset
-   latency — the exact number that says "the snapshot path is fast." Comparable against a
-   Linux/KVM snapshot fuzzer on the *same* target.
+   latency — the exact number that says "the snapshot path is fast."
 2. **Correctness stress test.** A fuzz loop performs millions of restores. Any state the
    snapshot fails to capture or reset — a stray register, a virtio queue index, a missed
    dirty page — surfaces within seconds as nondeterministic crashes or coverage that never
@@ -207,8 +206,8 @@ plumbing.
 - [x] **M2 — coverage + dirty-page reset (v1).** Add SanCov window + libAFL feedback; swap
   reset to `hv_vm_protect` dirty set. Gate: coverage curve stabilizes; execs/sec jumps.
 - [x] **M3 — benchmark.** Target = **libpng current**. Capture execs/sec, reset-latency
-  p50/p99, dirty-set-size distribution; compare vs a Linux/KVM snapshot fuzzer on the same
-  target. Output: `docs/fuzzing-demonstrator-result.md` + numbers into `docs/benchmarks.md`.
+  p50/p99, dirty-set-size distribution. Output: `docs/fuzzing-demonstrator-result.md` +
+  numbers into `docs/benchmarks.md`.
 - [ ] **M4 — stateful targets.** `freetype` / `libxml2`: larger dirty sets, more bug surface;
   stresses reset harder.
 - [ ] **M5 — domain payoff.** TPM 2.0 command-handler or OP-TEE TA harness, parked at the
@@ -223,7 +222,6 @@ plumbing.
   feeds the diff-snapshot work.
 - Time-to-rediscover the planted CVE (M1) — a deterministic correctness number.
 - Coverage growth curve.
-- Cross-check vs Linux/KVM snapshot fuzzer (Nyx / AFL++ persistent) on the same target.
 
 ## 12. Risks & open questions
 
