@@ -9,9 +9,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use ignition_devices::bus::Bus;
+use ignition_devices::bus::{Bus, BusDevice};
 use ignition_hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
 use crate::dirty::{DirtyTracker, PAGE};
+use crate::fuzz::controller::FuzzController;
 use crate::snapshot::VcpuCheckpoint;
 
 /// Dirty-page tracking config, armed by the boot harness before `run` when
@@ -268,6 +269,94 @@ impl VcpuManager {
         self.vcpuids.lock().unwrap().push(vcpu.id());
         vcpu.set_initial_state(entry, fdt_addr)?;
         self.run_loop(mpidr, vcpu)
+    }
+
+    /// Run the single-vCPU fuzz loop. Boots the primary normally; once the guest
+    /// rings SNAPSHOT_ME the loop captures the snapshot and drives
+    /// inject->resume->observe->reset inline on this thread (HVF thread-affine).
+    // The fuzz entry points carry the boot params plus the device + controller
+    // handles; splitting them into a struct would not aid clarity here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_fuzz(
+        self: &Arc<Self>,
+        entry: u64,
+        fdt_addr: u64,
+        doorbell_gpa: u64,
+        ctrl_base: u64,
+        fuzz_dev: Arc<Mutex<ignition_devices::fuzz::FuzzDevice>>,
+        controller: FuzzController,
+    ) -> Result<(), ignition_hvf::Error> {
+        let me = Arc::clone(self);
+        let handle = thread::spawn(move || {
+            let mut controller = controller;
+            let mpidr = mpidr_for(0);
+            me.running.lock().unwrap().insert(mpidr);
+            let vcpu = HvfVcpu::new(mpidr, false)?;
+            me.vcpuids.lock().unwrap().push(vcpu.id());
+            vcpu.set_initial_state(entry, fdt_addr)?;
+            me.fuzz_loop(vcpu, doorbell_gpa, ctrl_base, fuzz_dev, &mut controller)
+        });
+        self.threads.lock().unwrap().push(handle);
+        self.join_all()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fuzz_loop(
+        self: &Arc<Self>,
+        mut vcpu: HvfVcpu,
+        doorbell_gpa: u64,
+        ctrl_base: u64,
+        fuzz_dev: Arc<Mutex<ignition_devices::fuzz::FuzzDevice>>,
+        controller: &mut FuzzController,
+    ) -> Result<(), ignition_hvf::Error> {
+        let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match vcpu.run(vcpus.clone())? {
+                VcpuExit::MmioWrite(addr, data) if addr == doorbell_gpa => {
+                    let cmd = if data.len() >= 4 {
+                        u32::from_le_bytes(data[..4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    use ignition_devices::fuzz::protocol::cmd as C;
+                    if cmd == C::SNAPSHOT_ME {
+                        // First snapshot: advance PC past the store, capture RAM +
+                        // regs, expose the first input length.
+                        vcpu.advance_pc()?;
+                        let len = controller.capture(&vcpu)?;
+                        fuzz_dev.lock().unwrap().set_input_len(len);
+                    } else if cmd == C::DONE {
+                        let len = controller.on_done(&mut vcpu)?;
+                        fuzz_dev.lock().unwrap().set_input_len(len);
+                    } else if cmd == C::CRASH {
+                        let (code, in_len) = {
+                            let mut dev = fuzz_dev.lock().unwrap();
+                            let mut b = [0u8; 4];
+                            dev.read(ctrl_base, ignition_devices::fuzz::protocol::reg::INPUT_LEN, &mut b);
+                            (dev.crash_code(), u32::from_le_bytes(b))
+                        };
+                        let len = controller.on_crash(&mut vcpu, code, in_len)?;
+                        fuzz_dev.lock().unwrap().set_input_len(len);
+                    } else {
+                        log::warn!("fuzz: unknown doorbell command {cmd:#x}");
+                    }
+                }
+                VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
+                VcpuExit::MmioRead(addr, data) => self.bus.read(addr, data),
+                VcpuExit::Shutdown => {
+                    self.request_shutdown();
+                    return Ok(());
+                }
+                VcpuExit::Canceled => return Ok(()),
+                VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
+                VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
+                VcpuExit::WaitForEventExpired | VcpuExit::VtimerActivated => {}
+                other => log::debug!("fuzz: unhandled vCPU exit: {other:?}"),
+            }
+        }
     }
 
     fn run_secondary(self: &Arc<Self>, mpidr: u64, entry: u64, ctx: u64) -> Result<(), ignition_hvf::Error> {

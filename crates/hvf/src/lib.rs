@@ -695,6 +695,23 @@ impl HvfVcpu<'_> {
         }
     }
 
+    /// Advance PC past the current instruction (4 bytes; aarch64 fixed width) and
+    /// clear any pending lazy advance. Used by the fuzz loop on the one-time
+    /// SNAPSHOT_ME doorbell so the captured snapshot PC sits *after* the store.
+    pub fn advance_pc(&mut self) -> Result<(), Error> {
+        let pc = self.read_reg(hv_reg_t_HV_REG_PC)?;
+        self.write_reg(hv_reg_t_HV_REG_PC, pc + 4)?;
+        self.pending_advance_pc = false;
+        Ok(())
+    }
+
+    /// Cancel a pending lazy PC advance. Used by the fuzz loop after a reset:
+    /// `restore_state` has just set PC to the snapshot value, so the +4 the next
+    /// `run()` would apply (from the DONE/CRASH doorbell trap) must be dropped.
+    pub fn clear_pending_advance(&mut self) {
+        self.pending_advance_pc = false;
+    }
+
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
         let val: u64 = 0;
         let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
