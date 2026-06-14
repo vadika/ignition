@@ -1094,12 +1094,15 @@ fn run_restore(
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
+    let q_vsock = restore_start.elapsed();
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
+    let q_freeze = restore_start.elapsed();
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
     let mut manager = VcpuManager::new(snap.config.vcpu_count, bus);
+    let q_console = restore_start.elapsed();
 
     // Re-snapshot: a restored guest can be snapshotted into a NEW base. An omitted
     // --name generates a fresh one (never collides with the source). The handler
@@ -1243,6 +1246,7 @@ fn run_restore(
             }
         }));
     }
+    let q_handler = restore_start.elapsed();
 
     // Arm dirty tracking on the manager BEFORE it is cloned (set_dirty_config, like
     // set_snapshot_handler, needs sole Arc ownership). Each restored/secondary vCPU
@@ -1254,8 +1258,10 @@ fn run_restore(
             tracker: tracker.clone(),
         });
     }
+    let q_dirty = restore_start.elapsed();
 
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    let q_stdin = restore_start.elapsed();
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
     // Net restore: present the link as DOWN, then raise it after resume so the
@@ -1287,6 +1293,18 @@ fn run_restore(
         us(total),
     );
     log::info!("Restore-time = {} ms", total.as_millis());
+    log::info!(
+        "Restore-tail = dev:{}us vsock:{}us freeze:{}us console:{}us handler:{}us dirty:{}us stdin:{}us net:{}us total:{}us",
+        us(t_dev),
+        us(q_vsock - t_dev),
+        us(q_freeze - q_vsock),
+        us(q_console - q_freeze),
+        us(q_handler - q_console),
+        us(q_dirty - q_handler),
+        us(q_stdin - q_dirty),
+        us(total - q_stdin),
+        us(total),
+    );
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
