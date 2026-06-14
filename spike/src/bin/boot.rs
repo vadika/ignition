@@ -1286,7 +1286,7 @@ fn run_restore(
         us(t_dev - t_protect),
         us(total),
     );
-    log::info!("Restore-time = {} ms", restore_start.elapsed().as_millis());
+    log::info!("Restore-time = {} ms", total.as_millis());
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
