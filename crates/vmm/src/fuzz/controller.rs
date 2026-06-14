@@ -188,8 +188,6 @@ pub struct FuzzController {
     started: Option<Instant>,
     last_dirty_pages: u64,
     rng: Rng,
-    seeds: Vec<Vec<u8>>,
-    seed_idx: usize,
     replay: Option<Vec<u8>>,
     solutions_dir: PathBuf,
     crash_count: u64,
@@ -219,7 +217,7 @@ impl FuzzController {
         seed_rng: u64,
         solutions_dir: PathBuf,
     ) -> FuzzController {
-        let corpus = if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds.clone() };
+        let corpus = if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds };
         FuzzController {
             base_ram: Vec::new(),
             base_state: None,
@@ -236,8 +234,6 @@ impl FuzzController {
             dirty,
             ram_base_gpa,
             rng: Rng::new(seed_rng),
-            seeds: if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds },
-            seed_idx: 0,
             replay,
             solutions_dir,
             crash_count: 0,
@@ -275,6 +271,9 @@ impl FuzzController {
         self.captured = true;
         self.started = Some(Instant::now());
         if self.reset_mode == ResetMode::Dirty {
+            // Note: `set_dirty_window` (armed earlier in fuzz_loop) only configures
+            // fault CLASSIFICATION; actual write-protection of guest RAM begins HERE
+            // at the snapshot point, which is why boot-time guest writes never faulted.
             // Drop WRITE on all guest RAM; first write per page faults (DirtyFault),
             // gets logged + re-granted by the fuzz loop. The window/cov regions are
             // mapped below RAM_BASE, outside this range, so they stay writable.
@@ -375,6 +374,10 @@ impl FuzzController {
                 restore_ram(&base, self.live_ram());
             }
             ResetMode::Dirty => {
+                // Ordering note: the guest vCPU is paused for the entire duration of
+                // reset() (single vCPU thread; reset runs between vcpu.run() calls), so
+                // no guest instruction executes between the re-protect below and the
+                // register restore — the ordering is immaterial, there is no fault window.
                 let pages = self.dirty.as_ref().expect("dirty mode requires a tracker").drain();
                 self.last_dirty_pages = pages.len() as u64;
                 restore_pages(&base, self.live_ram(), &pages, PAGE);
