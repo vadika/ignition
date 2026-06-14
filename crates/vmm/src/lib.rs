@@ -12,6 +12,7 @@
 
 pub mod device_manager;
 pub mod dirty;
+pub mod fuzz;
 pub mod names;
 pub mod snapshot;
 pub mod vstate;
