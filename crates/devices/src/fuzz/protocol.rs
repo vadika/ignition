@@ -28,8 +28,10 @@ pub mod cmd {
 
 /// Default shared-window size in bytes (2 MiB).
 pub const DEFAULT_WINDOW_SIZE: u64 = 0x20_0000;
-/// Control region size in bytes (4 KiB).
-pub const CONTROL_SIZE: u64 = 0x1000;
+/// Control region size in bytes: one 16 KiB guest page. The four registers
+/// occupy only the first 16 bytes, but the region is page-sized so the guest can
+/// `mmap` it via `/dev/mem` (mmap offsets must be 16 KiB-aligned on this guest).
+pub const CONTROL_SIZE: u64 = 0x4000;
 
 #[cfg(test)]
 mod tests {
