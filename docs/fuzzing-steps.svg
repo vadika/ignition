@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1048" viewBox="0 0 1000 1048" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="11" markerHeight="11" refX="8.5" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#9aa4b2"/></marker>
+    <marker id="ahr" markerWidth="12" markerHeight="12" refX="8.5" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 z" fill="#f87171"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="1048" fill="#1e1e1e"/>
+  <text x="40" y="44" font-size="22" font-weight="700" fill="#e6e6e6">Snapshot-fuzzing, one iteration (target: libpng)</text>
+
+  <!-- step 0: one-time, full width -->
+  <rect x="64" y="72" width="872" height="54" rx="9" fill="#262a30" stroke="#7c8794" stroke-width="1.6"/>
+  <circle cx="92" cy="99" r="15" fill="#7c8794"/><text x="92" y="104" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">0</text>
+  <text x="122" y="95" font-size="14.5" font-weight="700" fill="#cbd5e1">One-time: take the snapshot</text>
+  <text x="122" y="115" font-size="12.5" fill="#9aa4b2">Guest boots, parks just before the decode, pings the host; host saves regs + RAM and write-protects memory.</text>
+
+  <!-- column headers -->
+  <text x="64" y="160" font-size="14" font-weight="700" fill="#7ea6ff">HOST  (VMM + fuzzer brain)</text>
+  <text x="548" y="160" font-size="14" font-weight="700" fill="#6fe0bb">GUEST VM  (single vCPU)</text>
+  <line x1="64" y1="168" x2="452" y2="168" stroke="#33476f" stroke-width="1.2"/>
+  <line x1="548" y1="168" x2="936" y2="168" stroke="#2c5b4f" stroke-width="1.2"/>
+
+  <!-- ===== arrows first (under boxes) ===== -->
+  <!-- 1->2 down (host) -->
+  <line x1="258" y1="260" x2="258" y2="270" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 2->3 cross host->guest -->
+  <line x1="452" y1="300" x2="544" y2="360" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="498" y="318" font-size="12" fill="#cbd5e1" text-anchor="middle">resume vCPU</text>
+  <!-- 3->4 down (guest) -->
+  <line x1="742" y1="444" x2="742" y2="454" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 4->5 down (guest) -->
+  <line x1="742" y1="536" x2="742" y2="546" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 5->6 cross guest->host -->
+  <line x1="548" y1="580" x2="456" y2="640" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="502" y="598" font-size="12" fill="#cbd5e1" text-anchor="middle">trap → host</text>
+  <!-- 6->7 down (host) -->
+  <line x1="258" y1="720" x2="258" y2="730" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 7->8 down (host) -->
+  <line x1="258" y1="812" x2="258" y2="822" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 8->9 down (host) -->
+  <line x1="258" y1="900" x2="258" y2="910" stroke="#9aa4b2" stroke-width="2" marker-end="url(#ah)"/>
+  <!-- 9->1 loop back (red) -->
+  <path d="M64,952 L28,952 L28,216 L64,216" fill="none" stroke="#f87171" stroke-width="2.2" marker-end="url(#ahr)"/>
+  <text x="18" y="584" font-size="13" font-weight="700" fill="#f87171" text-anchor="middle" transform="rotate(-90 18 584)">next image</text>
+
+  <!-- ===== HOST column boxes (left) ===== -->
+  <!-- 1 -->
+  <rect x="64" y="180" width="388" height="80" rx="9" fill="#16213a" stroke="#5b8def" stroke-width="1.6"/>
+  <circle cx="92" cy="208" r="15" fill="#5b8def"/><text x="92" y="213" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">1</text>
+  <text x="122" y="206" font-size="13.5" font-weight="700" fill="#7ea6ff">Forge the next input — the attack</text>
+  <text x="122" y="228" font-size="12" fill="#cbd5e1">Mutate a known PNG into a fresh candidate:</text>
+  <text x="122" y="245" font-size="12" fill="#cbd5e1">the hostile file an attacker feeds libpng.</text>
+
+  <!-- 2 -->
+  <rect x="64" y="272" width="388" height="80" rx="9" fill="#16213a" stroke="#5b8def" stroke-width="1.6"/>
+  <circle cx="92" cy="300" r="15" fill="#5b8def"/><text x="92" y="305" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">2</text>
+  <text x="122" y="298" font-size="13.5" font-weight="700" fill="#7ea6ff">Let the guest run</text>
+  <text x="122" y="320" font-size="12" fill="#cbd5e1">Hand the CPU back; the guest resumes right</text>
+  <text x="122" y="337" font-size="12" fill="#cbd5e1">where it parked, before the decode call.</text>
+
+  <!-- 6 -->
+  <rect x="64" y="640" width="388" height="80" rx="9" fill="#16213a" stroke="#5b8def" stroke-width="1.6"/>
+  <circle cx="92" cy="668" r="15" fill="#5b8def"/><text x="92" y="673" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">6</text>
+  <text x="122" y="666" font-size="13.5" font-weight="700" fill="#7ea6ff">Hand control back to the host</text>
+  <text x="122" y="688" font-size="12" fill="#cbd5e1">The doorbell write traps out of the guest</text>
+  <text x="122" y="705" font-size="12" fill="#cbd5e1">back to the host.</text>
+
+  <!-- 7 -->
+  <rect x="64" y="732" width="388" height="80" rx="9" fill="#16213a" stroke="#5b8def" stroke-width="1.6"/>
+  <circle cx="92" cy="760" r="15" fill="#5b8def"/><text x="92" y="765" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">7</text>
+  <text x="122" y="758" font-size="13.5" font-weight="700" fill="#7ea6ff">Look at what happened</text>
+  <text x="122" y="780" font-size="12" fill="#cbd5e1">Fold coverage vs seen. New path → keep it.</text>
+  <text x="122" y="797" font-size="12" fill="#cbd5e1">Crash → save a reproducible solution.</text>
+
+  <!-- 8 -->
+  <rect x="64" y="824" width="388" height="68" rx="9" fill="#16213a" stroke="#5b8def" stroke-width="1.6"/>
+  <circle cx="92" cy="852" r="15" fill="#5b8def"/><text x="92" y="857" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">8</text>
+  <text x="122" y="850" font-size="13.5" font-weight="700" fill="#7ea6ff">Decide</text>
+  <text x="122" y="872" font-size="12" fill="#cbd5e1">New coverage, a crash, or neither.</text>
+
+  <!-- 9 -->
+  <rect x="64" y="912" width="388" height="80" rx="9" fill="#3a1f1f" stroke="#f87171" stroke-width="1.8"/>
+  <circle cx="92" cy="940" r="15" fill="#f87171"/><text x="92" y="945" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">9</text>
+  <text x="122" y="938" font-size="13.5" font-weight="700" fill="#fca5a5">Rewind to the snapshot</text>
+  <text x="122" y="960" font-size="12" fill="#cbd5e1">Copy back only dirtied pages, restore regs,</text>
+  <text x="122" y="977" font-size="12" fill="#cbd5e1">re-lock memory; park before the decode.</text>
+
+  <!-- ===== GUEST column boxes (right) ===== -->
+  <!-- 3 -->
+  <rect x="548" y="364" width="388" height="80" rx="9" fill="#14302a" stroke="#4fbf9a" stroke-width="1.6"/>
+  <circle cx="576" cy="392" r="15" fill="#4fbf9a"/><text x="576" y="397" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">3</text>
+  <text x="606" y="390" font-size="13.5" font-weight="700" fill="#6fe0bb">Read the input</text>
+  <text x="606" y="412" font-size="12" fill="#cbd5e1">Hand the bytes to libpng:</text>
+  <text x="606" y="429" font-size="12" fill="#cbd5e1">png_image_finish_read(). The code under test.</text>
+
+  <!-- 4 -->
+  <rect x="548" y="456" width="388" height="80" rx="9" fill="#14302a" stroke="#4fbf9a" stroke-width="1.6"/>
+  <circle cx="576" cy="484" r="15" fill="#4fbf9a"/><text x="576" y="489" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">4</text>
+  <text x="606" y="482" font-size="13.5" font-weight="700" fill="#6fe0bb">Decode, leave a coverage trail</text>
+  <text x="606" y="504" font-size="12" fill="#cbd5e1">libpng decodes; branches fill the coverage</text>
+  <text x="606" y="521" font-size="12" fill="#cbd5e1">map; touched pages fault → marked dirty.</text>
+
+  <!-- 5 -->
+  <rect x="548" y="548" width="388" height="80" rx="9" fill="#14302a" stroke="#4fbf9a" stroke-width="1.6"/>
+  <circle cx="576" cy="576" r="15" fill="#4fbf9a"/><text x="576" y="581" font-size="14" fill="#0b1220" text-anchor="middle" font-weight="700">5</text>
+  <text x="606" y="574" font-size="13.5" font-weight="700" fill="#6fe0bb">Signal the outcome</text>
+  <text x="606" y="596" font-size="12" fill="#cbd5e1">Clean finish → ring DONE.</text>
+  <text x="606" y="613" font-size="12" fill="#cbd5e1">Sanitizer/signal fault → ring CRASH (+ code).</text>
+
+  <text x="500" y="1024" font-size="12.5" fill="#7c8794" text-anchor="middle">Fast because the rewind copies only the dirtied pages (~35 µs) and restores registers (~1 µs). No disk, no network, no syscall in the loop.</text>
+</svg>
