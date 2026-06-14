@@ -15,6 +15,13 @@ use crate::dirty::{DirtyTracker, PAGE};
 use crate::fuzz::controller::FuzzController;
 use crate::snapshot::VcpuCheckpoint;
 
+/// Host SIGINT/SIGTERM stop flag for fuzz mode. The fuzz path has no guest
+/// console to take a Ctrl-C, so `boot --fuzz` installs a signal handler that
+/// sets this; the fuzz loop checks it at the top of each iteration and exits
+/// cleanly (flushing benchmark metrics). A plain process-global atomic keeps the
+/// signal handler async-signal-safe (it only does an atomic store).
+pub static FUZZ_STOP: AtomicBool = AtomicBool::new(false);
+
 /// Dirty-page tracking config, armed by the boot harness before `run` when
 /// `--track-dirty` is set. The window (`base`, `size`) is the write-protected
 /// guest-RAM range; `tracker` is the shared atomic bitmap each vCPU thread
@@ -319,7 +326,7 @@ impl VcpuManager {
             vcpu.set_dirty_window(cfg.base, cfg.size);
         }
         loop {
-            if self.shutdown.load(Ordering::Acquire) {
+            if self.shutdown.load(Ordering::Acquire) || FUZZ_STOP.load(Ordering::Acquire) {
                 controller.write_metrics();
                 return Ok(());
             }

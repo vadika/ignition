@@ -1016,6 +1016,20 @@ fn run_fuzz_mode(
     reset_mode: ResetMode,
     metrics_path: Option<PathBuf>,
 ) -> io::Result<()> {
+    // Fuzz mode has no guest console to absorb Ctrl-C, so install a SIGINT/SIGTERM
+    // handler that flips the global stop flag; the fuzz loop polls it and exits
+    // cleanly, flushing --metrics. The handler only does an atomic store (async-
+    // signal-safe).
+    extern "C" fn fuzz_stop_handler(_sig: libc::c_int) {
+        ignition_vmm::vstate::vcpu_manager::FUZZ_STOP
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    // SAFETY: registering a signal handler that performs only an atomic store.
+    unsafe {
+        libc::signal(libc::SIGINT, fuzz_stop_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, fuzz_stop_handler as *const () as libc::sighandler_t);
+    }
+
     let kernel_image = fs::read(kernel_path)
         .map_err(|e| io::Error::other(format!("read kernel {}: {e}", kernel_path.display())))?;
     let initramfs = fs::read(initramfs_path)
