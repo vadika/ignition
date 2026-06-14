@@ -3,7 +3,7 @@
 A research microVM for macOS / Apple Silicon on Hypervisor.framework, architecturally
 modeled on AWS Firecracker. This file tracks what is built, what is next, and the
 research questions that motivate the project. It is the living index; per-feature
-detail lives in `docs/superpowers/specs/` (design) and `docs/*-result.md` (outcomes).
+detail lives in `docs/superpowers/specs/` (design) and the documentation book under `docs/src/` (outcomes).
 
 _Last updated: 2026-06-14._
 
@@ -41,23 +41,23 @@ Two tracks carry the thesis beyond parity:
 ## Shipped
 
 ### Core VMM
-- [x] Boot aarch64 Linux to a shell — kernel + FDT load, boot regs, run loop (ESR decode, MMIO, WFI/WFE idle, PSCI). `docs/2d-boot-result.md`, `docs/SPIKE_RESULTS.md`
+- [x] Boot aarch64 Linux to a shell — kernel + FDT load, boot regs, run loop (ESR decode, MMIO, WFI/WFE idle, PSCI). `docs/src/getting-started/boot-a-guest.md`, `docs/src/internals/validation-spike.md`
 - [x] In-kernel GICv3 (`hv_gic_*`), SPI/PPI delivery. `docs/superpowers/specs/2026-06-12-phase1-gic-design.md`
-- [x] Interactive 16550 console — TX + RX. `docs/serial-rx-result.md`
+- [x] Interactive 16550 console — TX + RX. `docs/src/features/devices.md`
 - [x] Uniform device model — `DeviceManager` + `MmioDevice` trait (MMIO/SPI alloc, bus, FDT, snapshot). `docs/superpowers/specs/2026-06-13-device-model-framework-design.md`
-- [x] SMP via PSCI `CPU_ON` (`--smp N`). `docs/smp-result.md`
+- [x] SMP via PSCI `CPU_ON` (`--smp N`). `docs/src/features/devices.md`
 - [x] Parametrized guest RAM (`--mem <MiB>`).
 
 ### Devices (full Firecracker aarch64 set)
 - [x] virtio-blk — rootfs from a disk image
-- [x] virtio-net — vmnet NAT backend (`--net`; needs `sudo`/entitlement). `docs/virtio-net-result.md`
+- [x] virtio-net — vmnet NAT backend (`--net`; needs `sudo`/entitlement). `docs/src/features/devices.md`
 - [x] virtio-rng — `getentropy`-backed
 - [x] virtio-balloon — on-demand reclaim (`Ctrl-A b`). `docs/superpowers/specs/2026-06-13-virtio-balloon-design.md`
 - [x] virtio-vsock **E1** (guest→host streams over a host UDS). `docs/superpowers/specs/2026-06-13-virtio-vsock-e1-design.md`
 - [x] PL031 RTC + boot-timer. `docs/superpowers/specs/2026-06-13-rtc-pl031-design.md`
 
 ### Snapshot / restore — *the load-bearing feature*
-- [x] Snapshot/restore to a shell — resume from saved PC, idles ~0% CPU, responsive. `docs/snapshot-restore-result.md`
+- [x] Snapshot/restore to a shell — resume from saved PC, idles ~0% CPU, responsive. `docs/src/features/snapshot-restore.md`
 - [x] Self-describing v2 format — `DeviceRecord` list, version guard.
 - [x] **Multi-vCPU** snapshot — stop-the-world rendezvous; every core saves itself + resumes at its PC. `docs/superpowers/specs/2026-06-13-multi-vcpu-snapshot-design.md`
 - [x] **virtio-net** snapshot/restore — `--smp` + `--net` + sudo; link-bounce + carrier-watch re-DHCP; clones get distinct MAC/IP.
@@ -65,14 +65,14 @@ Two tracks carry the thesis beyond parity:
 - [x] **Fast restore** — `clonefile` + `mmap(MAP_SHARED)`: lazy page fault-in, immutable base. `docs/superpowers/specs/2026-06-13-fast-restore-clonefile-mmap-design.md`
 - [x] **Snapshot store** — `--store`/`--name`, `snapshots/<name>/` bases + `instances/<name>-<pid>/` CoW clones, `manifest.json`, auto-generated names, re-snapshot (+ same-name `--force` guard).
 - [x] **Dirty-page tracking on HVF** — `--track-dirty` arms `hv_vm_protect` write-protect; first write to each 16 KiB page traps (Data-Abort translation fault), marks dirty, re-grants. The genuinely novel platform bit — no `KVM_GET_DIRTY_LOG` equivalent. Shared foundation for diff snapshots and the (planned) in-loop reset.
-- [x] **Diff / incremental snapshots** — a restored armed guest writes a Diff layer (only changed pages, `parent` = the restored-from leaf) as an immutable delta chain; restore reassembles root + diffs transparently. `docs/superpowers/specs/2026-06-13-diff-snapshots-design.md`, `docs/diff-snapshot-research.md`
-- [x] **Restore instrumentation + cost attribution** — per-stage `Restore-breakdown` / `Restore-tail` timers; bench parses + records them. The ~245 ms restore cost is **host RAM page-in** (cache-state dependent), not the HVF-object/overlay stages (~3 ms). Lazy stage-2 demand-paging (`--lazy-restore`) was prototyped (correct single-vCPU + SMP) and **shelved**: `clonefile`+`MAP_SHARED` already demand-pages host-side, so the win could not be demonstrated without a clean cold-base A/B (`sudo purge`). `docs/diff-snapshot-benchmarks.md` §3
+- [x] **Diff / incremental snapshots** — a restored armed guest writes a Diff layer (only changed pages, `parent` = the restored-from leaf) as an immutable delta chain; restore reassembles root + diffs transparently. `docs/superpowers/specs/2026-06-13-diff-snapshots-design.md`, `docs/src/features/diff-snapshots.md`
+- [x] **Restore instrumentation + cost attribution** — per-stage `Restore-breakdown` / `Restore-tail` timers; bench parses + records them. The ~245 ms restore cost is **host RAM page-in** (cache-state dependent), not the HVF-object/overlay stages (~3 ms). Lazy stage-2 demand-paging (`--lazy-restore`) was prototyped (correct single-vCPU + SMP) and **shelved**: `clonefile`+`MAP_SHARED` already demand-pages host-side, so the win could not be demonstrated without a clean cold-base A/B (`sudo purge`). `docs/src/benchmarks/diff-snapshots.md` §3
 
 ### Snapshot fuzzer — demonstrator (M0–M3)
 - [x] In-VMM snapshot fuzzer: `ignition-fuzz` trap-MMIO doorbell + `MAP_SHARED` input/coverage window, guest harness as PID 1, blind+coverage-guided mutation, CRASH capture, `--replay`.
 - [x] In-loop `reset()` — per-iteration dirty-page rollback + register restore in the live VMM (reset p50 36 µs).
 - [x] SanCov `trace-pc` coverage feedback into a reset-exempt window + host virgin-bits map.
-- [x] Benchmarked on libpng 1.6.43: **1309 execs/sec** (dirty) vs 271 (full), 4.8×. `docs/fuzzing-demonstrator-result.md`
+- [x] Benchmarked on libpng 1.6.43: **1309 execs/sec** (dirty) vs 271 (full), 4.8×. `docs/src/benchmarks/fuzzing.md`
 
 The clone primitive (immutable base + lazy CoW clones + dirty tracking + diff chains) is
 **shipped**, and the fuzzing demonstrator (M0–M3) proves it does real work. The next tracks
@@ -88,9 +88,9 @@ Ordered so the clone primitive gets proven and hardened before it gets dressed u
   to the base, in a **live, running** VMM, without re-`clonefile`ing, plus vCPU register
   restore. Stays in-memory, no disk/format/versioning. Shipped in the fuzzer (M2): reset p50
   **36 µs** (page-copy ~35 µs + register restore ~1 µs), 44–50 dirty pages/iter on libpng.
-  Built on the dirty-tracking substrate. `docs/fuzzing-demonstrator-result.md`
+  Built on the dirty-tracking substrate. `docs/src/benchmarks/fuzzing.md`
 - [ ] **Resume-latency benchmark vs Linux/KVM** — per-stage restore attribution is **done**
-  (`docs/diff-snapshot-benchmarks.md` §3); remaining is the cross-platform comparison
+  (`docs/src/benchmarks/diff-snapshots.md` §3); remaining is the cross-platform comparison
   (ignition fast-restore vs Linux/KVM Firecracker) and a clean cold-base eager-vs-lazy A/B
   if a cold-start workload shows the page-in is on the critical path.
 - [ ] **virtio-vsock E2** — host→guest connections (E1 is guest→host only). Gates
@@ -127,7 +127,7 @@ narrowest interface (a buffer in memory), so there is no external interface to r
   grows, corpus expands, execs/sec jumps (~3.5× on the synthetic target).
 - [x] **libpng-current + benchmark** (M3) — real libpng 1.6.43 (SanCov, no ASan): **1309
   execs/sec** dirty-reset vs 271 full-copy (**4.8×**), reset p50 36 µs, dirty-set 44–50 pages,
-  144 edges. `docs/fuzzing-demonstrator-result.md`, `docs/benchmarks.md`, `scripts/fuzz_m3_bench.py`.
+  144 edges. `docs/src/benchmarks/fuzzing.md`, `scripts/fuzz_m3_bench.py`.
   (Linux/KVM cross-check dropped from scope; ignition-own numbers only.)
 - [ ] **Stateful targets** *(next)* — `freetype` / `libxml2`: still single-threaded compute, larger
   dirty-page sets, more bug surface; stresses the reset path harder.
@@ -203,7 +203,7 @@ real and strong today; the VMM *process* is not yet jailed.
 - [ ] **Benchmarks** — resume latency, boot time, density, memory overhead vs Linux/KVM
   Firecracker and vs Apple `container` (Virtualization.framework). Note the no-`KVM_IOEVENTFD`
   cost (every virtio kick = full userspace round trip) — quantify it. (Restore-side
-  per-stage attribution already done; see `docs/diff-snapshot-benchmarks.md`.)
+  per-stage attribution already done; see `docs/src/benchmarks/diff-snapshots.md`.)
 - [ ] **Snapshot-fuzzing throughput study** — execs/sec vs reset latency as a function of
   dirty-set size and target; ignition-on-HVF vs Linux/KVM snapshot fuzzers. (Demonstrator
   track, written up as research.)
@@ -242,5 +242,5 @@ OCI) tracks are deliberately *beyond* Firecracker parity — they are the reason
 catch-up items. The clone-from-warm primitive they exploit is the thing the
 Virtualization.framework-based macOS tools cannot cheaply replicate.
 
-See `docs/HANDOFF.md` and `docs/firecracker-hvf-porting-map.md` for the full FC↔HVF
+See `docs/src/internals/design-decisions.md` and `docs/src/internals/hvf-firecracker-map.md` for the full FC↔HVF
 source analysis (note their dated GIC-snapshot premise, since disproven).

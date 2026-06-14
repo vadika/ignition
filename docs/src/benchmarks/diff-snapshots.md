@@ -1,4 +1,4 @@
-# Diff-snapshot timing — measured on real HVF hardware
+# Diff-snapshot benchmarks
 
 Date: 2026-06-13. Host: Apple Silicon, macOS 26.5. Guest: aarch64 Linux, busybox
 rootfs, single vCPU, **512 MiB RAM**, 16 KiB guest pages. Numbers are the **median
@@ -27,8 +27,8 @@ of 3 runs** unless noted, with min/max in parentheses. Harness:
 > they are I/O- and guest-bound, not VMM-CPU-bound. Still treat absolute
 > milliseconds as figures from this host, not portable production latency.
 
-This doc is a focused follow-up to `docs/benchmarks.md` (which measured plain
-boot vs restore and predates the diff-snapshot feature). It quantifies the
+This doc is a focused follow-up to [Boot & restore latency](boot-and-restore.md)
+(which measured plain boot vs restore and predates the diff-snapshot feature). It quantifies the
 **cost and benefit of diff/incremental snapshots** specifically.
 
 ## What each timer brackets
@@ -332,7 +332,7 @@ across chain depth. The power source changed nothing material on this host.
 
 ## Reproduce
 
-```sh
+```console
 cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
 python3 scripts/diff_snapshot_bench.py --mem 512        # full debug suite
 python3 scripts/diff_snapshot_bench.py --release        # release boot/restore point

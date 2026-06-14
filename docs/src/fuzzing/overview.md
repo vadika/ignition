@@ -1,4 +1,6 @@
-# Snapshot-fuzzing demonstrator — result (M3)
+# How snapshot fuzzing works
+
+![Snapshot-fuzzing iteration](fuzzing-steps.png)
 
 In-VMM snapshot fuzzer for `ignition` (Firecracker-modeled microVM on Apple
 Hypervisor.framework). The fuzzer parks the guest at a parse entry, injects
@@ -31,7 +33,7 @@ dominated by the page copy; register restore is about 1 us.
 | 44 | 50 | 50 |
 
 The dirty set is what the reset copies back; it explains the page-copy latency
-above and feeds the diff-snapshot work (`docs/diff-snapshot-benchmarks.md`).
+above and feeds the [diff-snapshot work](../features/diff-snapshots.md).
 
 ## Coverage
 
@@ -58,3 +60,6 @@ re-measured here as the deterministic anchor alongside the throughput numbers.
 - Reproduce: `M3_DURATION=60 python3 scripts/fuzz_m3_bench.py` (needs a signed
   `boot`, `kimage/out/Image`, and both fuzz initramfs images; see
   `REBUILD-GUEST-ASSETS.md`).
+
+See [Running the fuzzer](running.md) for the build, the gate scripts, and every
+`boot --fuzz` flag.

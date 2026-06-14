@@ -1,4 +1,4 @@
-# ignition benchmarks — boot & restore latency
+# Boot & restore latency
 
 > **Status note (2026-06): numbers predate the fast-restore work.** Restore latency here was
 > measured with eager `read(memory.bin)`; restore now uses clonefile + `mmap(MAP_SHARED)`
@@ -86,7 +86,7 @@ For restore there is a third clock:
 
 ## Reproduce
 
-```sh
+```console
 cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
 python3 scripts/benchmark.py 6      # both fresh-boot methods + restore
 # component scripts:
@@ -100,7 +100,7 @@ python3 scripts/restore_test.py             # snapshot -> restore, CPU% + respon
 
 In-VMM snapshot fuzzer (`boot --fuzz`), `hv_vm_protect` dirty-page reset, target
 = libpng 1.6.43 (SanCov, no ASan). Full write-up and methodology:
-`docs/fuzzing-demonstrator-result.md`.
+[How snapshot fuzzing works](../fuzzing/overview.md).
 
 | Metric | Value |
 |--------|------:|

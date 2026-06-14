@@ -1,4 +1,4 @@
-# Project Handoff: Firecracker → macOS/HVF Port (research project)
+# Design decisions
 
 > **Status (2026-06): historical planning document — kept for lineage/rationale.**
 > Phases 1–2 have largely shipped (boot-to-shell, SMP, virtio-blk/net/rng/balloon/vsock,
@@ -6,10 +6,10 @@
 > One premise below is **disproven**: in-kernel `hv_gic` *does* expose lossless state
 > get/set (`hv_gic_state_*`), so the GIC is snapshotted directly (`crates/hvf/src/gic.rs`) —
 > the "userspace-GIC-for-snapshottability" tradeoff never materialized. Still open: the REST
-> API and dirty-tracking/diff snapshots. See `docs/*-result.md` for what was built.
+> API and dirty-tracking/diff snapshots. See the [validation spike](validation-spike.md) for what was built.
 
 This document transfers context from a planning conversation. Read it together with
-`firecracker-hvf-porting-map.md` (detailed file-by-file analysis) before starting work.
+the [HVF and Firecracker map](hvf-firecracker-map.md) (detailed file-by-file analysis) before starting work.
 
 ## Goal
 

@@ -1,0 +1,16 @@
+[book]
+title = "ignition"
+authors = ["Vadim Likholetov"]
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/vadika/ignition"
+edit-url-template = "https://github.com/vadika/ignition/edit/main/docs/{path}"
+default-theme = "navy"
+
+[output.html.fold]
+enable = true
+
+[output.linkcheck2]
+follow-web-links = false

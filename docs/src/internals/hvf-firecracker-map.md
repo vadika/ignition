@@ -1,4 +1,4 @@
-# Firecracker → macOS/HVF Porting Map
+# HVF and Firecracker map
 
 > **Status (2026-06): historical analysis — kept as the FC↔HVF reference.** The KVM→HVF
 > mapping (§3), run-loop/ESR decode (§4), threading inversion (§5), and interrupt-path (§6)
