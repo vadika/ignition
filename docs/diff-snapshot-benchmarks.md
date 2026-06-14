@@ -146,12 +146,35 @@ shell) because it skips the kernel + init sequence entirely.
 | **total** | 244040 | 243310 |
 
 The named stages sum to only ~3.2 ms (Full-only) / ~78 ms (golden+3) of the ~244 ms
-`total` — the rest is unattributed, spent demand-faulting the 512 MiB base RAM image
-into the guest as vCPUs run (not bracketed by any of these timers). Of the explicitly
-measured work, **`HvfGicV3::new` (`hv_gic_create`, ~1.2 ms) dominates the Full-only
-path**, while on a deep chain the **`diff` overlay (`read_diff_pages` + `apply_diff`,
-~75 ms for golden+3)** becomes the single largest measured stage as each layer's dirty
-pages are read and memcpy'd in.
+`total`. A finer bisection of the restore tail (the `Restore-tail` log line) localizes
+the remaining ~240 ms precisely:
+
+```
+golden #0: dev:2757us vsock:1us freeze:2us console:240591us handler:19us dirty:0us stdin:79us net:30us total:243483us
+golden #1: dev:3774us vsock:0us freeze:0us console:237500us handler:22us dirty:0us stdin:84us net:61us total:241444us
+golden #2: dev:3319us vsock:1us freeze:0us console:240354us handler:17us dirty:0us stdin:112us net:33us total:243840us
+```
+
+The `console` probe brackets just two trivial statements — `TermiosGuard::new()` (four
+non-blocking termios syscalls) and `VcpuManager::new()` (a struct alloc) — yet it holds
+~240 ms. Neither touches guest RAM or blocks. The cost is **`hv_vm_map` making the full
+512 MiB `MAP_SHARED` CoW clone resident, eagerly, before any vCPU runs.** `map_memory`
+(`hv_vm_map`) itself returns in ~10 µs, but the region is materialized as a side effect
+that lands on the following syscalls.
+
+Proof it is full-RAM materialization, not the tail code: the total is **depth-invariant
+and trades off against early page touches.** For golden (no diff) the ~240 ms sits in the
+post-map tail; for golden+3 the `apply_diff` overlay pre-touches its pages, so ~75 ms
+shifts into the `diff` stage and the tail drops by the same amount — `total` stays
+~243 ms.
+
+> **This overturns a documented assumption.** The README and earlier notes said restore
+> "touches only used pages" (lazy). It does not: restore materializes **all** guest RAM
+> before the guest runs, so `Restore-time` is dominated by a fixed full-RAM cost
+> (~240 ms for 512 MiB here) that is independent of the guest's working set and of diff
+> chain depth. `HvfGicV3::new` (~1.2 ms) and the `diff` overlay (~75 ms at golden+3) are
+> real but secondary. Lowering restore latency means attacking the eager full-RAM
+> materialization, not the HVF-object or overlay stages.
 
 ## 4. Disk footprint
 
