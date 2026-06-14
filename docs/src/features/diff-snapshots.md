@@ -47,3 +47,9 @@ python3 scripts/diff_snapshot_test.py
 
 Worked example of one warm golden base fanning out into many cheap divergent forks:
 [diff-snapshot-fanout.md](https://github.com/vadika/ignition/blob/main/examples/diff-snapshot-fanout.md).
+
+## Related
+
+- [The clone primitive](../concepts/clone-primitive.md) — dirty tracking and the delta chain.
+- [Snapshot & restore](snapshot-restore.md) — the full snapshot this builds on.
+- [Diff-snapshot benchmarks](../benchmarks/diff-snapshots.md) — tracking overhead and sizes.

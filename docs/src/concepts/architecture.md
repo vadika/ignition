@@ -72,3 +72,8 @@ exception, the EC field `(syndrome >> 26) & 0x3f`, then dispatches:
 
 For the source-level mapping of every KVM construct to its HVF replacement, see
 [HVF and Firecracker map](../internals/hvf-firecracker-map.md).
+
+## Related
+
+- [Device model](device-model.md) — how devices plug into this architecture.
+- [The clone primitive](clone-primitive.md) — the snapshot/restore feature built on it.

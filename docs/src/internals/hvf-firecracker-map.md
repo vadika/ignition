@@ -199,3 +199,8 @@ firecracker/src/vmm/src/vstate/{kvm,vm,vcpu}.rs  # the seam to cut
 firecracker/src/vmm/src/arch/aarch64/{vcpu,regs,fdt}.rs
 firecracker/src/vmm/src/arch/aarch64/gic/        # what snapshotting demands of a GIC
 ```
+
+## Related
+
+- [Architecture](../concepts/architecture.md) — the same seam, described from the ignition side.
+- [Design decisions](design-decisions.md) — why the VMM is shaped this way.

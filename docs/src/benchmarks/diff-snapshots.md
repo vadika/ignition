@@ -337,3 +337,8 @@ cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
 python3 scripts/diff_snapshot_bench.py --mem 512        # full debug suite
 python3 scripts/diff_snapshot_bench.py --release        # release boot/restore point
 ```
+
+## Related
+
+- [Diff / incremental snapshots](../features/diff-snapshots.md) — the feature these numbers measure.
+- [The clone primitive](../concepts/clone-primitive.md) — dirty tracking and the delta chain.

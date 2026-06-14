@@ -44,3 +44,8 @@ ignition implements the full Firecracker aarch64 device set:
 
 For the per-device behavior, the networking model, and the SMP wiring, see
 [Devices, SMP & networking](../features/devices.md).
+
+## Related
+
+- [Architecture](architecture.md) — where the device manager sits in the VMM.
+- [The clone primitive](clone-primitive.md) — how `DeviceRecord` snapshot hooks are used.

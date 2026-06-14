@@ -91,3 +91,9 @@ these were confirmed empirically by the offset/cval/cntvct sampler.
 15 test suites green (serde round-trips for every state struct; device save/restore;
 snapshot dir write/read/magic). Workspace builds, 0 clippy. Live snapshot→restore and
 clone verified by the two driver scripts above.
+
+## Related
+
+- [The clone primitive](../concepts/clone-primitive.md) — the mechanism behind this feature.
+- [Diff / incremental snapshots](diff-snapshots.md) — only-changed-pages snapshots on top.
+- [Boot & restore latency](../benchmarks/boot-and-restore.md) — how fast restore is.

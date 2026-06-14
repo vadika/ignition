@@ -94,22 +94,7 @@ python3 scripts/boot_vs_restore_timing.py   # launch -> running, phased
 python3 scripts/restore_test.py             # snapshot -> restore, CPU% + responsive
 ```
 
----
+## Related
 
-## Snapshot fuzzer (M3) — libpng, single core
-
-In-VMM snapshot fuzzer (`boot --fuzz`), `hv_vm_protect` dirty-page reset, target
-= libpng 1.6.43 (SanCov, no ASan). Full write-up and methodology:
-[How snapshot fuzzing works](../fuzzing/overview.md).
-
-| Metric | Value |
-|--------|------:|
-| Steady-state execs/sec (dirty reset) | 1309 |
-| Steady-state execs/sec (full-copy reset) | 271 |
-| Reset latency p50 / p99 | 36 / 60 us |
-| page-copy p50 / register-restore p50 | 35 / 1 us |
-| Dirty-set size p50 / p99 / max (16 KiB pages) | 44 / 50 / 50 |
-| Distinct edges (coverage) | 144 |
-| Time-to-rediscover planted CVE (synthetic, ASan) | 0.002 s |
-
-Reproduce: `M3_DURATION=60 python3 scripts/fuzz_m3_bench.py`.
+- [Snapshot & restore](../features/snapshot-restore.md) — the feature these numbers measure.
+- [Snapshot-fuzzing benchmark](fuzzing.md) — execs/sec as a direct readout of reset latency.

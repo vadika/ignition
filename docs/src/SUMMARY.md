@@ -9,17 +9,15 @@
 
 # Concepts
 - [Architecture](concepts/architecture.md)
-- [Device model](concepts/device-model.md)
+  - [Device model](concepts/device-model.md)
 - [The clone primitive](concepts/clone-primitive.md)
-
-# Features
-- [Snapshot & restore](features/snapshot-restore.md)
-- [Diff / incremental snapshots](features/diff-snapshots.md)
+  - [Snapshot & restore](features/snapshot-restore.md)
+  - [Diff / incremental snapshots](features/diff-snapshots.md)
 - [Devices, SMP & networking](features/devices.md)
 
 # Snapshot fuzzing
 - [How it works](fuzzing/overview.md)
-- [Running the fuzzer](fuzzing/running.md)
+  - [Running the fuzzer](fuzzing/running.md)
 
 # Benchmarks
 - [Boot & restore latency](benchmarks/boot-and-restore.md)

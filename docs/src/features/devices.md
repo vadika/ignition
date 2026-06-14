@@ -61,3 +61,8 @@ target/debug/boot --smp 4 kimage/out/Image kimage/out/rootfs.ext4
 A PL031 RTC plus the EL1 virtual timer keep guest time. The vtimer PPI (INTID 27) is
 delivered through the in-kernel GIC, and on restore the vtimer offset is set so that
 `CNTVCT` resumes continuously across the snapshot rather than jumping forward.
+
+## Related
+
+- [Device model](../concepts/device-model.md) — the trait these devices implement.
+- [Snapshot & restore](snapshot-restore.md) — how device state survives a snapshot.
