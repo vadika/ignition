@@ -14,7 +14,7 @@ SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
 harness — is original. See `docs/HANDOFF.md` and `docs/firecracker-hvf-porting-map.md`
 for the source analysis, and `docs/SPIKE_RESULTS.md` for the validation spike.
 
-## Status: boots Linux to a shell, with snapshot/restore
+## Status: boots Linux to a shell, snapshot/restore, in-VMM snapshot fuzzing
 
 See `ROADMAP.md` for the full feature roadmap and progress tracking.
 
@@ -49,6 +49,14 @@ spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
   fresh boot and restore drive one device-wiring site; every device restores its
   full state (transport + queues + per-device: balloon target, vsock connection
   reset, virtio-net link-bounce re-init). `--net` and `--smp N` combine (`sudo`).
+
+- **In-VMM snapshot fuzzing** — `boot --fuzz` parks a guest at a parse entry, injects
+  inputs through a `MAP_SHARED` window, runs the target, and rolls the whole machine back to
+  the snapshot every iteration by restoring **only the dirtied pages** (`hv_vm_protect`
+  write-fault tracking) plus the registers — no re-`clonefile`, no I/O in the loop. SanCov
+  `trace-pc` coverage feeds a host virgin-bits map. On libpng 1.6.43: **1309 execs/sec**
+  (dirty reset) vs 271 (full-copy), reset p50 36 µs, planted CVE-2015-8126-shape bug
+  rediscovered in 0.002 s and deterministically replayable. `docs/fuzzing-demonstrator-result.md`.
 
 The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
 load-bearing layer, exercised end-to-end by the `boot` binary and the crate tests.
@@ -164,3 +172,29 @@ python3 scripts/restore_clone_test.py  # login + run a command + two clones
 Restore expects the same RAM size the snapshot was taken with (read from the
 snapshot). The snapshot artifacts (`memory.bin`/`gic.bin`/`disk.img`/`vmstate.json`)
 are gitignored by name wherever they land, so a store dir's bases aren't tracked.
+
+## Snapshot fuzzing (`--fuzz`)
+
+The in-VMM snapshot fuzzer reuses the dirty-tracking + reset machinery as a hot loop. It
+boots a small initramfs whose `/init` is a harness that parks at a parse entry, then the
+VMM injects mutated inputs into a shared window, runs the target, and resets the guest to
+the snapshot each iteration (dirty pages + registers only). See the iteration diagram in
+`docs/fuzzing-steps.png` and the writeup in `docs/fuzzing-demonstrator-result.md`.
+
+```sh
+cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
+
+# rediscover a planted overflow + replay determinism (synthetic ASan target)
+target/debug/boot --fuzz --mem 96 --initramfs kimage/out/fuzz-initramfs.cpio \
+  --solutions ./fuzz-solutions --seed <seed> kimage/out/Image
+python3 scripts/fuzz_m1_test.py     # M1 correctness gate
+python3 scripts/fuzz_m2_test.py     # M2 coverage + dirty-reset speedup gate
+
+# full benchmark (real libpng + synthetic correctness), writes a metrics file
+M3_DURATION=60 python3 scripts/fuzz_m3_bench.py
+```
+
+Reset mode is `--reset dirty` (default) or `full` (the throughput baseline); `--metrics
+<path>` dumps execs/sec, reset-latency p50/p99 (page-copy vs register split), dirty-set-size
+distribution, the coverage curve, and time-to-rediscover. The libpng benchmark initramfs is
+a separate SanCov-only build (no ASan); see `REBUILD-GUEST-ASSETS.md`.

@@ -68,8 +68,15 @@ Two tracks carry the thesis beyond parity:
 - [x] **Diff / incremental snapshots** — a restored armed guest writes a Diff layer (only changed pages, `parent` = the restored-from leaf) as an immutable delta chain; restore reassembles root + diffs transparently. `docs/superpowers/specs/2026-06-13-diff-snapshots-design.md`, `docs/diff-snapshot-research.md`
 - [x] **Restore instrumentation + cost attribution** — per-stage `Restore-breakdown` / `Restore-tail` timers; bench parses + records them. The ~245 ms restore cost is **host RAM page-in** (cache-state dependent), not the HVF-object/overlay stages (~3 ms). Lazy stage-2 demand-paging (`--lazy-restore`) was prototyped (correct single-vCPU + SMP) and **shelved**: `clonefile`+`MAP_SHARED` already demand-pages host-side, so the win could not be demonstrated without a clean cold-base A/B (`sudo purge`). `docs/diff-snapshot-benchmarks.md` §3
 
+### Snapshot fuzzer — demonstrator (M0–M3)
+- [x] In-VMM snapshot fuzzer: `ignition-fuzz` trap-MMIO doorbell + `MAP_SHARED` input/coverage window, guest harness as PID 1, blind+coverage-guided mutation, CRASH capture, `--replay`.
+- [x] In-loop `reset()` — per-iteration dirty-page rollback + register restore in the live VMM (reset p50 36 µs).
+- [x] SanCov `trace-pc` coverage feedback into a reset-exempt window + host virgin-bits map.
+- [x] Benchmarked on libpng 1.6.43: **1309 execs/sec** (dirty) vs 271 (full), 4.8×. `docs/fuzzing-demonstrator-result.md`
+
 The clone primitive (immutable base + lazy CoW clones + dirty tracking + diff chains) is
-**shipped**. The next tracks turn it from "works" into "provably fast, correct, and reachable."
+**shipped**, and the fuzzing demonstrator (M0–M3) proves it does real work. The next tracks
+turn it from "works" into "provably fast, correct, and reachable."
 
 ---
 
@@ -77,12 +84,11 @@ The clone primitive (immutable base + lazy CoW clones + dirty tracking + diff ch
 
 Ordered so the clone primitive gets proven and hardened before it gets dressed up.
 
-- [ ] **In-loop `reset()` primitive** — per-iteration rollback of *only the dirtied pages*
+- [x] **In-loop `reset()` primitive** — per-iteration rollback of *only the dirtied pages*
   to the base, in a **live, running** VMM, without re-`clonefile`ing, plus vCPU register
-  restore (the rendezvous machinery already does the register half). Distinct from diff
-  snapshots: stays in-memory, no disk/format/versioning, microsecond budget because it runs
-  in a hot loop. The one genuinely new piece the fuzzing demonstrator needs; builds on the
-  shipped dirty-tracking substrate.
+  restore. Stays in-memory, no disk/format/versioning. Shipped in the fuzzer (M2): reset p50
+  **36 µs** (page-copy ~35 µs + register restore ~1 µs), 44–50 dirty pages/iter on libpng.
+  Built on the dirty-tracking substrate. `docs/fuzzing-demonstrator-result.md`
 - [ ] **Resume-latency benchmark vs Linux/KVM** — per-stage restore attribution is **done**
   (`docs/diff-snapshot-benchmarks.md` §3); remaining is the cross-platform comparison
   (ignition fast-restore vs Linux/KVM Firecracker) and a clean cold-base eager-vs-lazy A/B
@@ -96,8 +102,9 @@ Ordered so the clone primitive gets proven and hardened before it gets dressed u
 
 The proof that the clone primitive does real work. Dual purpose, both load-bearing:
 1. **Benchmark** — execs/sec is a direct function of reset latency, so a working fuzzer is a
-   single defensible number that says "the snapshot path is fast," ideally measured against
-   the same target under a Linux/KVM snapshot fuzzer.
+   single defensible number that says "the snapshot path is fast." Shipped (M3): 1309
+   execs/sec on libpng, reset p50 36 µs. (Cross-VMM comparison vs a Linux/KVM snapshot fuzzer
+   was dropped from scope; ignition reports its own dirty-vs-full numbers.)
 2. **Correctness stress test** — a fuzz loop does millions of restores; any uncaptured
    register, stale queue index, or missed dirty page surfaces immediately as
    nondeterministic crashes or coverage that won't stabilize. Dogfoods the load-bearing code
@@ -109,14 +116,20 @@ dependency); guest→host control via the **boot-timer magic-MMIO pattern**; cov
 shared bitmap page; reset via the in-loop `reset()` above. Inject below the target's
 narrowest interface (a buffer in memory), so there is no external interface to reset.
 
-- [ ] **Guest harness + injection channel** — parked-at-call-site loop; magic-MMIO
-  `SNAPSHOT_ME` / `DONE`; shared input + coverage pages. (depends on in-loop `reset()`)
-- [ ] **libpng, known-CVE build** — proves *correctness*: fuzzer rediscovers a planted
-  historical bug (e.g. CVE-2015-8126) in seconds. Pure-compute, single-threaded, no I/O —
-  reset collapses to dirty-pages + registers. The "it works" milestone.
-- [ ] **libpng, current + benchmark** — proves it's a *real* fuzzer: execs/sec, reset
-  latency, vs Linux/KVM snapshot fuzzer. The headline number.
-- [ ] **Stateful targets** — `freetype` / `libxml2`: still single-threaded compute, larger
+- [x] **Guest harness + injection channel** (M0/M1) — parked-at-call-site loop; `ignition-fuzz`
+  trap-MMIO doorbell (`SNAPSHOT_ME` / `DONE` / `CRASH`); shared input + coverage window. Blind
+  mutation brain + CRASH capture + verbatim `--replay`. `scripts/fuzz_m1_test.py`
+- [x] **Correctness gate** (M1) — fuzzer rediscovers a planted length-field heap overflow
+  (the CVE-2015-8126 shape) in **0.002 s** from a seed corpus, deterministically replayable.
+  ASan death-callback → CRASH doorbell. Pure-compute, no I/O; reset = dirty-pages + registers.
+- [x] **Coverage + dirty-page reset** (M2) — SanCov `trace-pc` into a reset-exempt window +
+  host virgin-bits map; reset swapped from full-RAM copy to the dirty-set. Coverage curve
+  grows, corpus expands, execs/sec jumps (~3.5× on the synthetic target).
+- [x] **libpng-current + benchmark** (M3) — real libpng 1.6.43 (SanCov, no ASan): **1309
+  execs/sec** dirty-reset vs 271 full-copy (**4.8×**), reset p50 36 µs, dirty-set 44–50 pages,
+  144 edges. `docs/fuzzing-demonstrator-result.md`, `docs/benchmarks.md`, `scripts/fuzz_m3_bench.py`.
+  (Linux/KVM cross-check dropped from scope; ignition-own numbers only.)
+- [ ] **Stateful targets** *(next)* — `freetype` / `libxml2`: still single-threaded compute, larger
   dirty-page sets, more bug surface; stresses the reset path harder.
 - [ ] **Domain payoff — firmware / TEE harnesses** — TPM 2.0 command-handler or OP-TEE TA,
   parked at the command-parse entry, input injected into the command buffer. *The target
