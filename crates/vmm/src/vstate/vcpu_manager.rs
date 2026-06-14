@@ -310,6 +310,14 @@ impl VcpuManager {
         controller: &mut FuzzController,
     ) -> Result<(), ignition_hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
+        // Arm dirty-page tracking (ResetMode::Dirty). The window is set before the
+        // guest runs; RAM is only write-protected later, at the snapshot point
+        // (FuzzController::capture), so boot-time writes don't fault. With no
+        // dirty config (full-copy reset) this is a no-op and DirtyFault never fires.
+        let dirty = self.dirty.clone();
+        if let Some(cfg) = &dirty {
+            vcpu.set_dirty_window(cfg.base, cfg.size);
+        }
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -346,6 +354,22 @@ impl VcpuManager {
                 }
                 VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
                 VcpuExit::MmioRead(addr, data) => self.bus.read(addr, data),
+                VcpuExit::DirtyFault(pa) => {
+                    if let Some(cfg) = &dirty {
+                        cfg.tracker.mark(pa);
+                        let page_base = pa & !((PAGE as u64) - 1);
+                        ignition_hvf::vm_protect_memory(
+                            page_base,
+                            PAGE as u64,
+                            (ignition_hvf::bindings::HV_MEMORY_READ
+                                | ignition_hvf::bindings::HV_MEMORY_WRITE
+                                | ignition_hvf::bindings::HV_MEMORY_EXEC) as u64,
+                        )
+                        .expect("dirty-tracking re-grant of guest page failed");
+                    } else {
+                        log::warn!("fuzz DirtyFault at {pa:#x} but dirty tracking is not armed");
+                    }
+                }
                 VcpuExit::Shutdown => {
                     self.request_shutdown();
                     return Ok(());

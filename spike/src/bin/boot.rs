@@ -36,6 +36,7 @@ use ignition_hvf::gic::HvfGicV3;
 use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
 use ignition_vmm::dirty::DirtyTracker;
 use ignition_vmm::fuzz::controller::FuzzController;
+use ignition_vmm::fuzz::controller::ResetMode;
 use ignition_vmm::names;
 use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, DirtyConfig, VcpuManager};
@@ -513,6 +514,7 @@ fn main() {
     let mut seed_path: Option<PathBuf> = None;
     let mut replay_path: Option<PathBuf> = None;
     let mut window_mib: u64 = 2;
+    let mut reset_mode = ignition_vmm::fuzz::controller::ResetMode::Dirty;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -559,6 +561,10 @@ fn main() {
                 assert!((1..=64).contains(&n), "--window-mib must be 1..=64 MiB");
                 window_mib = n;
             }
+            "--reset" => {
+                let v = it.next().expect("--reset needs full|dirty");
+                reset_mode = v.parse().expect("--reset must be full|dirty");
+            }
             "--net" => {
                 net = true;
             }
@@ -602,7 +608,7 @@ fn main() {
             process::exit(2);
         });
         if positionals.is_empty() {
-            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
+            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] <kernel-Image>", args[0]);
             process::exit(2);
         }
         let kernel_path = PathBuf::from(&positionals[0]);
@@ -619,7 +625,7 @@ fn main() {
             },
             None => None,
         };
-        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size) {
+        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size, reset_mode) {
             Ok(()) => eprintln!("\n[fuzz exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[fuzz error: {e}]");
@@ -643,7 +649,7 @@ fn main() {
 
     if positionals.is_empty() {
         eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
-        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
+        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] <kernel-Image>", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -1003,6 +1009,7 @@ fn run_fuzz_mode(
     replay: Option<Vec<u8>>,
     window_size: u64,
     ram_size: u64,
+    reset_mode: ResetMode,
 ) -> io::Result<()> {
     let kernel_image = fs::read(kernel_path)
         .map_err(|e| io::Error::other(format!("read kernel {}: {e}", kernel_path.display())))?;
@@ -1168,6 +1175,26 @@ fn run_fuzz_mode(
     vm.map_memory(win_addr, FUZZ_WIN_GPA, window_size)
         .map_err(|e| io::Error::other(format!("hv_vm_map window: {e}")))?;
 
+    // The shared COVERAGE region: host anon mmap mapped into the guest at
+    // FUZZ_COV_GPA. The guest's trace-pc callback writes 8-bit edge counters here;
+    // the host zeroes it before each input and reads it after DONE. Like the
+    // window it lives below RAM_BASE, so the dirty reset never rolls it back.
+    let cov_host = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            cov_size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if cov_host == libc::MAP_FAILED {
+        return Err(io::Error::other("mmap of fuzz coverage region failed"));
+    }
+    vm.map_memory(cov_host as u64, FUZZ_COV_GPA, cov_size)
+        .map_err(|e| io::Error::other(format!("hv_vm_map coverage: {e}")))?;
+
     // Diagnostics (stderr) so a silent boot is debuggable.
     let g = gic.fdt_info();
     eprintln!("== ignition fuzz ==");
@@ -1198,9 +1225,20 @@ fn run_fuzz_mode(
             .map_err(|e| io::Error::other(format!("read seed {}: {e}", p.display())))?],
         None => Vec::new(),
     };
+    // Dirty tracker for ResetMode::Dirty: covers all guest RAM, base = RAM_BASE.
+    let dirty_tracker: Option<DirtyTracker> = if reset_mode == ResetMode::Dirty {
+        Some(DirtyTracker::new(layout::RAM_BASE, ram_size))
+    } else {
+        None
+    };
+
     let controller = FuzzController::new(
         (host as *mut u8, ram_size as usize),
         (win_host as *mut u8, window_size as usize),
+        (cov_host as *mut u8, cov_size as usize),
+        layout::RAM_BASE,
+        reset_mode,
+        dirty_tracker.clone(),
         seeds,
         replay,
         0xF1FA_5EED,
@@ -1209,7 +1247,14 @@ fn run_fuzz_mode(
 
     // Run the single-vCPU fuzz loop. The doorbell GPA is the DOORBELL register
     // within the (unmapped, trapping) control region.
-    let manager = VcpuManager::new(1, bus);
+    let mut manager = VcpuManager::new(1, bus);
+    if let Some(tracker) = &dirty_tracker {
+        manager.set_dirty_config(DirtyConfig {
+            base: layout::RAM_BASE,
+            size: ram_size,
+            tracker: tracker.clone(),
+        });
+    }
     manager
         .run_fuzz(
             entry,
