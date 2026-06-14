@@ -1,7 +1,8 @@
-/* M0 guest fuzz harness: PID 1 in an initramfs. Maps the ignition-fuzz device,
+/* Guest fuzz harness: PID 1 in an initramfs. Maps the ignition-fuzz device,
  * parks at the parse site, and drives the reset->inject->run->observe loop via
- * the doorbell. The "target" is a stub parser that overflows on a magic byte so
- * the M0 gate can plant a deterministic crash. */
+ * the doorbell. The target is the chunk parser in target.c (a planted length-
+ * field heap overflow), built with AddressSanitizer; ASan's death callback rings
+ * the CRASH doorbell, with the signal handlers below as a backstop. */
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
