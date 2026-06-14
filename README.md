@@ -14,52 +14,33 @@ SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
 harness — is original. See `docs/HANDOFF.md` and `docs/firecracker-hvf-porting-map.md`
 for the source analysis, and `docs/SPIKE_RESULTS.md` for the validation spike.
 
+> **📖 Full documentation:** build the book with `mdbook serve docs/` (or see the
+> published site). Source under [`docs/src/`](docs/src/SUMMARY.md).
+
+## Quickstart
+
+```console
+cargo build -p ignition-spike --bin boot
+scripts/sign.sh target/debug/boot
+target/debug/boot kimage/out/Image kimage/out/rootfs.ext4
+```
+
+See the book for everything else: build, guest assets, snapshot/restore, diff snapshots, fuzzing, benchmarks, internals.
+
 ## Status: boots Linux to a shell, snapshot/restore, in-VMM snapshot fuzzing
 
-See `ROADMAP.md` for the full feature roadmap and progress tracking.
+Validated end-to-end on macOS 26.5 / Apple Silicon. Working today:
 
-Validated end-to-end on macOS 26.5 / Apple Silicon. Working today (each with a
-spec under `docs/superpowers/specs/` and a result writeup under `docs/`):
-
-- **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive
-  16550 console (TX + RX).
-- **Device model** — a uniform `DeviceManager` (MMIO/SPI allocation, bus, FDT,
-  snapshot) behind one `MmioDevice` trait. The full Firecracker aarch64 device set:
-  - **virtio-blk** — rootfs from a disk image.
-  - **virtio-net** — `--net`, vmnet NAT backend (guest reaches the internet).
-    Snapshot/restore supported (incl. `--smp N`, `sudo`): on restore a fresh vmnet
-    interface is started (new MAC) and the VMM bounces the link; a guest
-    carrier-watch service rebinds the driver + re-DHCPs, so clones get distinct
-    MAC+IP. Active connections reset.
-  - **virtio-rng** — entropy source (`getentropy`-backed), always-on.
-  - **virtio-balloon** — on-demand memory reclaim (`Ctrl-A b`, `madvise(MADV_FREE_REUSABLE)`);
-    the inflation target survives snapshot/restore.
-  - **virtio-vsock** — guest→host streams over a host Unix socket (`--vsock-uds`); host→guest is
-    a TODO (E2). On restore, live connections are reset (the guest is RST'd — host peers are gone).
-  - **PL031 RTC** — wall clock; the kernel sets system time from it.
-  - **boot-timer** — pseudo device; the guest pokes a magic byte at boot's end and
-    the VMM logs `Guest-boot-time = N ms` (~200 ms here).
+- **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive 16550 console.
+- **Device model** — uniform `DeviceManager` + `MmioDevice` trait; full Firecracker aarch64 set.
+- **virtio** — blk, net (vmnet NAT, `--net`), rng, balloon, vsock (guest→host E1).
+- **PL031 RTC + boot-timer** — wall clock and a `Guest-boot-time` probe.
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
-- **Snapshot / restore** — clone-capable (`--store` + `Ctrl-A s`, `--restore <name>`);
-  restore is lazy (clonefile + `mmap(MAP_SHARED)`) so the immutable base is never
-  mutated and resume touches only used pages. The restored guest idles at ~0% CPU
-  and stays responsive. Multi-vCPU (`--smp N`) is
-  supported via a stop-the-world rendezvous: every vCPU saves its own registers
-  and resumes at its saved PC (restored `--smp 4` guest reports `nproc == 4`). Both
-  fresh boot and restore drive one device-wiring site; every device restores its
-  full state (transport + queues + per-device: balloon target, vsock connection
-  reset, virtio-net link-bounce re-init). `--net` and `--smp N` combine (`sudo`).
+- **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, ~0% CPU idle, multi-vCPU + net.
+- **Diff snapshots** — `--track-dirty` write-protect tracking; immutable delta chains.
+- **In-VMM snapshot fuzzing** — `--fuzz` dirty-page reset loop; 1309 execs/sec on libpng 1.6.43.
 
-- **In-VMM snapshot fuzzing** — `boot --fuzz` parks a guest at a parse entry, injects
-  inputs through a `MAP_SHARED` window, runs the target, and rolls the whole machine back to
-  the snapshot every iteration by restoring **only the dirtied pages** (`hv_vm_protect`
-  write-fault tracking) plus the registers — no re-`clonefile`, no I/O in the loop. SanCov
-  `trace-pc` coverage feeds a host virgin-bits map. On libpng 1.6.43: **1309 execs/sec**
-  (dirty reset) vs 271 (full-copy), reset p50 36 µs, planted CVE-2015-8126-shape bug
-  rediscovered in 0.002 s and deterministically replayable. `docs/fuzzing-demonstrator-result.md`.
-
-The `hvf` crate (the Hypervisor.framework backend, lifted from libkrun) is the
-load-bearing layer, exercised end-to-end by the `boot` binary and the crate tests.
+Full feature docs: the book; roadmap: `ROADMAP.md`.
 
 ## Layout
 
@@ -76,125 +57,4 @@ scripts/     sign.sh                                — ad-hoc codesign with hyp
 
 Crate lib names are `ignition_*`; the `hvf` crate was lifted from libkrun and then reworked, so imports were updated accordingly.
 
-## Build & run
-
-```sh
-cargo build
-# the runnable artifact is `boot`; it needs the hypervisor entitlement before it
-# can call hv_vm_create — re-sign after every build (relinking strips it):
-scripts/sign.sh target/debug/boot
-# usage (kernel + rootfs) is in "Boot a Linux guest" below.
-```
-
 Requires: Apple Silicon Mac, macOS 15+ (26 preferred), Rust 1.96+ (edition 2024).
-
-## Boot a Linux guest
-
-The `boot` binary loads an aarch64 kernel + rootfs, runs the vCPU(s), and gives an
-interactive 16550 console. **Re-sign after every build** — relinking strips the
-hypervisor entitlement.
-
-```sh
-cargo build -p ignition-spike --bin boot
-scripts/sign.sh target/debug/boot
-
-# boot to a shell (log in as root); console keys: Ctrl-A s = snapshot, Ctrl-A x = quit, Ctrl-A b = balloon
-target/debug/boot kimage/out/Image kimage/out/rootfs.ext4
-
-target/debug/boot --smp 4 kimage/out/Image kimage/out/rootfs.ext4   # multi-vCPU (SMP)
-target/debug/boot --net  kimage/out/Image kimage/out/rootfs.ext4    # vmnet NAT networking
-```
-
-## Snapshot & restore
-
-Works with `--smp N` (snapshot after boot completes). Snapshots live in a **store**
-(`--store <dir>`, default `./vmstore`), under a name (`--name <name>`; an
-`adjective-surname` name is auto-generated when omitted). The layout is:
-
-- `<store>/snapshots/<name>/` — the **immutable base**, holding `memory.bin` +
-  `gic.bin` + `disk.img` + `vmstate.json` + `manifest.json`.
-- `<store>/instances/<name>-<pid>/` — **ephemeral CoW clones**, one per restored
-  guest, removed on a clean exit.
-
-Restore is lazy: it `clonefile`s the base into an instance dir (copy-on-write) and
-maps memory `MAP_SHARED`, so resume touches only the pages it actually uses and the
-base is never mutated. `--mem <MiB>` sets guest RAM (default 512); restore reads the
-size from the snapshot, so you don't pass `--mem` on the restore side.
-
-```sh
-# 1. boot into a store (name auto-generated, or pass --name), then press Ctrl-A s
-#    in the console to snapshot (guest keeps running afterwards)
-target/debug/boot --store vmstore --name mysnap kimage/out/Image kimage/out/rootfs.ext4
-ls -la vmstore/snapshots/mysnap/
-
-# 2. restore by name — resumes from the saved PC (no kernel re-boot); press Enter for a prompt
-target/debug/boot --store vmstore --restore mysnap
-
-# 3. confirm it idles (~0% CPU, not spinning)
-target/debug/boot --store vmstore --restore mysnap & BP=$!; sleep 3; ps -o pid,%cpu,command -p $BP; kill $BP
-
-# 4. clone — restore the same base into N independent guests (private CoW clone each)
-target/debug/boot --store vmstore --restore mysnap   # run in separate terminals
-```
-
-A restored guest can re-snapshot: its `Ctrl-A s` writes a **new** named base.
-Reusing the source name is refused unless you pass `--force`.
-
-### Diff snapshots
-
-`--track-dirty` arms write-protect dirty tracking: guest RAM is mapped read-only and
-the first write to each 16 KiB page traps, faults the page back to writable, and marks
-it dirty. A restored guest armed this way writes a **Diff** layer on `Ctrl-A s` — only
-the changed pages, with `parent` set to the leaf it restored from — forming an
-immutable delta chain. Restore reassembles the chain transparently: `clonefile` the
-root base, then overlay each diff's pages in order. vmstate/GIC/devices are always
-written full per layer (only RAM is deltified); the first write per page carries a
-small vmexit cost. Snapshotting under the same name as the parent — or the base it was
-restored from — is refused without `--force`.
-
-```sh
-# boot armed for diff tracking, snapshot a root, then restore + diff-snapshot
-target/debug/boot --store vmstore --name base --track-dirty kimage/out/Image kimage/out/rootfs.ext4
-target/debug/boot --store vmstore --restore base --track-dirty --name base-diff
-python3 scripts/diff_snapshot_test.py  # full cycle: diff ~3% of RAM, mutation survives, bases immutable
-```
-
-Worked example — one warm golden base, many cheap divergent forks:
-`docs/examples/diff-snapshot-fanout.md`.
-
-Headless drivers that run the whole cycle:
-
-```sh
-python3 scripts/restore_test.py        # boot -> snapshot -> restore; prints CPU% + latency + immutability
-python3 scripts/restore_clone_test.py  # login + run a command + two clones
-```
-
-Restore expects the same RAM size the snapshot was taken with (read from the
-snapshot). The snapshot artifacts (`memory.bin`/`gic.bin`/`disk.img`/`vmstate.json`)
-are gitignored by name wherever they land, so a store dir's bases aren't tracked.
-
-## Snapshot fuzzing (`--fuzz`)
-
-The in-VMM snapshot fuzzer reuses the dirty-tracking + reset machinery as a hot loop. It
-boots a small initramfs whose `/init` is a harness that parks at a parse entry, then the
-VMM injects mutated inputs into a shared window, runs the target, and resets the guest to
-the snapshot each iteration (dirty pages + registers only). See the iteration diagram in
-`docs/fuzzing-steps.png` and the writeup in `docs/fuzzing-demonstrator-result.md`.
-
-```sh
-cargo build -p ignition-spike --bin boot && scripts/sign.sh target/debug/boot
-
-# rediscover a planted overflow + replay determinism (synthetic ASan target)
-target/debug/boot --fuzz --mem 96 --initramfs kimage/out/fuzz-initramfs.cpio \
-  --solutions ./fuzz-solutions --seed <seed> kimage/out/Image
-python3 scripts/fuzz_m1_test.py     # M1 correctness gate
-python3 scripts/fuzz_m2_test.py     # M2 coverage + dirty-reset speedup gate
-
-# full benchmark (real libpng + synthetic correctness), writes a metrics file
-M3_DURATION=60 python3 scripts/fuzz_m3_bench.py
-```
-
-Reset mode is `--reset dirty` (default) or `full` (the throughput baseline); `--metrics
-<path>` dumps execs/sec, reset-latency p50/p99 (page-copy vs register split), dirty-set-size
-distribution, the coverage curve, and time-to-rediscover. The libpng benchmark initramfs is
-a separate SanCov-only build (no ASan); see `REBUILD-GUEST-ASSETS.md`.
