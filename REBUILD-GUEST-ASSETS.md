@@ -50,6 +50,31 @@ scp artemis2:'~/kbuild/out/Image' out/Image
 xxd -s 56 -l 4 out/Image
 ```
 
+## Rebuild the fuzz initramfs
+
+The snapshot fuzzer (`boot --fuzz`) uses a separate minimal initramfs whose
+`/init` is the static-musl harness in `kimage/build/fuzz-harness/`. Built the
+same way (arm64 alpine container), packed as a newc cpio.
+
+```bash
+cd kimage
+ssh artemis2 'mkdir -p ~/kbuild/fuzz-harness'
+scp build/fuzz-harness/harness.c build/fuzz-harness/ignition_fuzz.h artemis2:~/kbuild/fuzz-harness/
+scp build/build-fuzz-initramfs.sh artemis2:~/kbuild/
+ssh artemis2 'cd ~/kbuild && chmod +x build-fuzz-initramfs.sh && ./build-fuzz-initramfs.sh'
+# the script writes ~/kbuild/out/fuzz-initramfs.cpio, falling back to
+# ~/kbuild/fuzz-initramfs.cpio if out/ is root-owned from a prior kernel build —
+# pull from whichever exists:
+scp artemis2:'~/kbuild/out/fuzz-initramfs.cpio' out/fuzz-initramfs.cpio 2>/dev/null \
+  || scp artemis2:'~/kbuild/fuzz-initramfs.cpio' out/fuzz-initramfs.cpio
+# verify newc cpio magic "070701" at byte 0:
+head -c 6 out/fuzz-initramfs.cpio
+```
+
+After editing `harness.c` (e.g. swapping the M0 stub target for a real one),
+rebuild and re-pull. Keep `ignition_fuzz.h` in sync with
+`crates/devices/src/fuzz/protocol.rs`.
+
 ## Verify (must pass before committing)
 
 | Artifact | Check | Expect |

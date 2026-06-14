@@ -987,6 +987,18 @@ fn run_fuzz_mode(
     let initramfs = fs::read(initramfs_path)
         .map_err(|e| io::Error::other(format!("read initramfs {}: {e}", initramfs_path.display())))?;
 
+    // The M0 guest harness is compiled with a fixed 2 MiB window clamp
+    // (IGNITION_FUZZ_WIN_SIZE in ignition_fuzz.h). A host window of a different
+    // size would diverge from what the guest mmaps/clamps, so warn unless the
+    // harness is rebuilt to match.
+    if window_size != ignition_devices::fuzz::protocol::DEFAULT_WINDOW_SIZE {
+        log::warn!(
+            "fuzz window {} MiB != harness-baked {} MiB; rebuild the harness or pass --window-mib 2",
+            window_size >> 20,
+            ignition_devices::fuzz::protocol::DEFAULT_WINDOW_SIZE >> 20
+        );
+    }
+
     // The window is RAM-backed (guest loads/stores hit it directly), so it must
     // live OUTSIDE guest RAM — otherwise it would shadow real RAM. Assert it.
     assert!(
