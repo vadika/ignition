@@ -83,6 +83,44 @@ pub fn write_solution(dir: &Path, index: u64, input: &[u8], crash_code: u32) -> 
     Ok(input_path)
 }
 
+/// Accumulated edge-coverage map (the host-side "virgin bits"). Each `record`
+/// folds one iteration's freshly-read 8-bit counter buffer in: an index that is
+/// nonzero now but was never seen before is new coverage. Counts, not just bits,
+/// are read from the guest, but only first-touch is tracked — enough for the M2
+/// coverage curve and the coverage-guided corpus. (libAFL's bucketed
+/// `MaxMapFeedback` is the later, richer replacement.)
+pub struct CoverageMap {
+    seen: Vec<bool>,
+    covered: usize,
+}
+
+impl CoverageMap {
+    pub fn new(len: usize) -> CoverageMap {
+        CoverageMap { seen: vec![false; len], covered: 0 }
+    }
+
+    /// Fold `cov` (this iteration's counters) into the accumulated map. Returns
+    /// true if any previously-unseen edge was hit. `cov` may be shorter or longer
+    /// than the map; only the overlapping prefix is considered.
+    pub fn record(&mut self, cov: &[u8]) -> bool {
+        let mut new = false;
+        let n = cov.len().min(self.seen.len());
+        for i in 0..n {
+            if cov[i] != 0 && !self.seen[i] {
+                self.seen[i] = true;
+                self.covered += 1;
+                new = true;
+            }
+        }
+        new
+    }
+
+    /// Total distinct edges hit across all recorded iterations.
+    pub fn covered(&self) -> usize {
+        self.covered
+    }
+}
+
 /// The live fuzzer state for one M0 run. Holds the host-side base copy of guest
 /// RAM, the saved base register file, a raw view of live guest RAM and the
 /// shared window (host VAs from the boot harness's mmaps), the mutator, the seed
@@ -282,5 +320,26 @@ mod tests {
         assert!(meta.contains("crash_code=9"));
         assert!(meta.contains("len=2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_map_reports_new_edges_then_saturates() {
+        let mut cm = CoverageMap::new(8);
+        // First observation: edges 1 and 4 hit -> new coverage.
+        assert!(cm.record(&[0, 5, 0, 0, 2, 0, 0, 0]));
+        assert_eq!(cm.covered(), 2);
+        // Same edges again (different counts) -> no new coverage.
+        assert!(!cm.record(&[0, 1, 0, 0, 9, 0, 0, 0]));
+        assert_eq!(cm.covered(), 2);
+        // A new edge (index 7) -> new coverage.
+        assert!(cm.record(&[0, 0, 0, 0, 0, 0, 0, 3]));
+        assert_eq!(cm.covered(), 3);
+    }
+
+    #[test]
+    fn coverage_map_all_zero_is_not_new() {
+        let mut cm = CoverageMap::new(4);
+        assert!(!cm.record(&[0, 0, 0, 0]));
+        assert_eq!(cm.covered(), 0);
     }
 }
