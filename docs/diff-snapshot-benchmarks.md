@@ -176,6 +176,21 @@ shifts into the `diff` stage and the tail drops by the same amount — `total` s
 > real but secondary. Lowering restore latency means attacking the eager full-RAM
 > materialization, not the HVF-object or overlay stages.
 
+> **Follow-up (lazy demand-paging), explored and shelved.** The obvious lever —
+> map guest RAM with no stage-2 access and demand-fault pages in on first touch
+> (the read+write analog of the existing dirty-tracking write-fault path) — was
+> prototyped and works correctly (single-vCPU and SMP, via a `DemandFault` exit on
+> both data and instruction aborts). It was **not kept**, because the win could not
+> be demonstrated: `clonefile` + `mmap(MAP_SHARED)` already demand-pages the base
+> host-side, so a restore that touches only its working set may already pay only for
+> the pages it uses. The numbers above are cache-state dependent — they reproduce
+> when the base `memory.bin` is **not** resident in the host page cache (e.g. after
+> the dd phase evicts it); a tight-succession restore with a warm base measures
+> ~1–7 ms. A definitive cold-base A/B (eager vs lazy, wall to first output) needs
+> `sudo purge` to evict the cache reliably, which was unavailable in the test
+> environment. The lever remains open if a cold-start workload shows the eager
+> materialization is genuinely on the critical path.
+
 ## 4. Disk footprint
 
 | Artifact | logical (st_size) | physical (st_blocks×512) |
