@@ -90,6 +90,8 @@ os.write(fdB, b"\r")
 time.sleep(0.3)
 os.write(fdB, b"\r")
 resp = b""
+full = b""  # accumulate ALL restore-phase bytes (Restore-time/Restore-breakdown
+            # log lines fall outside the truncated `resp` tail we print below)
 end = time.time() + 6.0
 restore_latency_ms = 6000.0
 while time.time() < end:
@@ -102,15 +104,22 @@ while time.time() < end:
         if not d:
             break
         resp += d
+        full += d
         if resp.strip():
             restore_latency_ms = (time.time() - t_restore) * 1000.0
             break
+# drain a little more so the Restore-breakdown/Restore-time log lines land in `full`
+full += drain(fdB, 0.8)
 responsive = len(resp.strip()) > 0
 print(f"[restore -> first output latency: {restore_latency_ms:.0f} ms]", flush=True)
 print(f"[responsive: {responsive}  bytes={len(resp)}]", flush=True)
 if resp:
     print("---- restore console after Enter ----")
     sys.stdout.buffer.write(resp[-400:]); print("\n----")
+import re as _re
+_bd = _re.search(rb"Restore-breakdown = chain:(\d+)us .* total:(\d+)us", full)
+print(f"[Restore-breakdown present: {_bd is not None}]", flush=True)
+assert _bd is not None, "Restore-breakdown line missing from restore output"
 # sample CPU% (should idle low)
 samples = [cpu_pct(pidB) for _ in range(5) if not time.sleep(0.5)]
 avg_cpu = sum(s for s in samples if s >= 0) / max(1, len([s for s in samples if s >= 0]))

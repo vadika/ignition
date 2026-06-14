@@ -110,6 +110,27 @@ def run_cmd(fd, cmd, wait=1.2, drain_s=3):
 RE_BOOT    = re.compile(rb"Guest-boot-time = (\d+) ms")
 RE_RESTORE = re.compile(rb"Restore-time = (\d+) ms")
 RE_SNAPW   = re.compile(rb"Snapshot-write-time = (\d+) ms")
+RE_RBREAK = re.compile(
+    rb"Restore-breakdown = chain:(\d+)us read:(\d+)us clone:(\d+)us mmap:(\d+)us "
+    rb"diff:(\d+)us vm:(\d+)us gic:(\d+)us map:(\d+)us protect:(\d+)us dev:(\d+)us total:(\d+)us"
+)
+RBREAK_STAGES = ["chain","read","clone","mmap","diff","vm","gic","map","protect","dev","total"]
+
+def parse_rbreak_us(buf):
+    """Return {stage: microseconds} from the last Restore-breakdown line, or None."""
+    m = None
+    for m in RE_RBREAK.finditer(buf):
+        pass
+    if not m:
+        return None
+    return {s: int(m.group(i + 1)) for i, s in enumerate(RBREAK_STAGES)}
+
+def median_breakdown(breakdowns):
+    """Per-stage median µs across runs; {} if none collected."""
+    if not breakdowns:
+        return {}
+    return {s: int(statistics.median(b[s] for b in breakdowns)) for s in RBREAK_STAGES}
+
 RE_SNAPDONE = re.compile(rb"\[snapshot\] (full|diff) '([^']+)'")
 RE_DD_MBS  = re.compile(rb"([\d.]+)\s*(MB|MiB|GB|kB)/s")
 
@@ -273,7 +294,7 @@ def diff_layer_from(parent, new_name, mem, dirty_mb):
 def measure_restore(name, samples):
     """Restore `name` repeatedly; return lists of (wall_ms spawn->first output,
     internal Restore-time ms)."""
-    wall, internal = [], []
+    wall, internal, breakdowns = [], [], []
     for i in range(samples):
         sink = []
         t0 = time.monotonic()
@@ -295,11 +316,14 @@ def measure_restore(name, samples):
         # give Restore-time line a moment (it's logged during setup, usually already there)
         drain(fd, 0.6, sink=sink)
         internal_ms = parse_restore_ms(b"".join(sink))
+        bd = parse_rbreak_us(b"".join(sink))
+        if bd is not None:
+            breakdowns.append(bd)
         kill(pid, fd)
         wall.append(first_ms); internal.append(internal_ms)
         print(f"   [restore {name} #{i}] wall={first_ms}ms internal={internal_ms}ms", flush=True)
         time.sleep(0.4)
-    return wall, internal
+    return wall, internal, breakdowns
 
 # ---------------------------------------------------------------------------
 def main():
@@ -384,8 +408,9 @@ def main():
         # --- 3. restore latency by chain depth ---
         # (a) Full-only: restore golden (1 layer).
         print("\n--- 3a. restore Full-only (golden, 1 layer) ---", flush=True)
-        w0, i0 = measure_restore("golden", args.restore_samples)
+        w0, i0, bd0 = measure_restore("golden", args.restore_samples)
         R["restore_full"] = (med_spread(w0), med_spread(i0))
+        R["restore_full_breakdown"] = median_breakdown(bd0)
 
         # (b) golden + 1 diff. Build d1 off golden (8 MiB dirtied), keep it.
         print("\n--- build chain: golden -> d1 -> d2 -> d3 (8 MiB each, kept) ---", flush=True)
@@ -402,12 +427,19 @@ def main():
         R["diff_footprint"] = diff_footprint
 
         print("\n--- 3b. restore golden+1 diff (d1) ---", flush=True)
-        w1, i1 = measure_restore("d1", args.restore_samples)
+        w1, i1, bd1 = measure_restore("d1", args.restore_samples)
         R["restore_diff1"] = (med_spread(w1), med_spread(i1))
+        R["restore_diff1_breakdown"] = median_breakdown(bd1)
 
         print("\n--- 3c. restore golden+3 diffs (d3) ---", flush=True)
-        w3, i3 = measure_restore("d3", args.restore_samples)
+        w3, i3, bd3 = measure_restore("d3", args.restore_samples)
         R["restore_diff3"] = (med_spread(w3), med_spread(i3))
+        R["restore_diff3_breakdown"] = median_breakdown(bd3)
+
+        for key in [k for k in R if k.endswith("_breakdown")]:
+            bd = R[key]
+            if bd:
+                print(f"   [{key}] " + " ".join(f"{s}={bd[s]}us" for s in RBREAK_STAGES), flush=True)
 
         # total store size for the chain (golden + d1..d3) — du-style
         def dir_size(p):

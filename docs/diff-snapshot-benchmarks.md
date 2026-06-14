@@ -129,6 +129,68 @@ dirty pages are read + copied), but for shallow chains of small deltas it is
 effectively free. Restore also beats fresh boot here (~245 ms vs ~1241 ms boot-to-
 shell) because it skips the kernel + init sequence entirely.
 
+**Where the ~245 ms goes (per-stage median, µs):**
+
+| stage | Full-only | golden+3 |
+|---|---|---|
+| chain resolve+validate | 238 | 356 |
+| read leaf state | 556 | 465 |
+| clonefile root RAM | 489 | 391 |
+| mmap | 79 | 74 |
+| diff overlay | 0 | 75451 |
+| Vm::new (hv_vm_create) | 138 | 64 |
+| HvfGicV3::new (hv_gic_create) | 1200 | 556 |
+| map_memory (hv_vm_map) | 10 | 3 |
+| protect | 0 | 0 |
+| device wiring | 531 | 216 |
+| **total** | 244040 | 243310 |
+
+The named stages sum to only ~3.2 ms (Full-only) / ~78 ms (golden+3) of the ~244 ms
+`total`. A finer bisection of the restore tail (the `Restore-tail` log line) localizes
+the remaining ~240 ms precisely:
+
+```
+golden #0: dev:2757us vsock:1us freeze:2us console:240591us handler:19us dirty:0us stdin:79us net:30us total:243483us
+golden #1: dev:3774us vsock:0us freeze:0us console:237500us handler:22us dirty:0us stdin:84us net:61us total:241444us
+golden #2: dev:3319us vsock:1us freeze:0us console:240354us handler:17us dirty:0us stdin:112us net:33us total:243840us
+```
+
+The `console` probe brackets just two trivial statements — `TermiosGuard::new()` (four
+non-blocking termios syscalls) and `VcpuManager::new()` (a struct alloc) — yet it holds
+~240 ms. Neither touches guest RAM or blocks. The cost is **`hv_vm_map` making the full
+512 MiB `MAP_SHARED` CoW clone resident, eagerly, before any vCPU runs.** `map_memory`
+(`hv_vm_map`) itself returns in ~10 µs, but the region is materialized as a side effect
+that lands on the following syscalls.
+
+Proof it is full-RAM materialization, not the tail code: the total is **depth-invariant
+and trades off against early page touches.** For golden (no diff) the ~240 ms sits in the
+post-map tail; for golden+3 the `apply_diff` overlay pre-touches its pages, so ~75 ms
+shifts into the `diff` stage and the tail drops by the same amount — `total` stays
+~243 ms.
+
+> **This overturns a documented assumption.** The README and earlier notes said restore
+> "touches only used pages" (lazy). It does not: restore materializes **all** guest RAM
+> before the guest runs, so `Restore-time` is dominated by a fixed full-RAM cost
+> (~240 ms for 512 MiB here) that is independent of the guest's working set and of diff
+> chain depth. `HvfGicV3::new` (~1.2 ms) and the `diff` overlay (~75 ms at golden+3) are
+> real but secondary. Lowering restore latency means attacking the eager full-RAM
+> materialization, not the HVF-object or overlay stages.
+
+> **Follow-up (lazy demand-paging), explored and shelved.** The obvious lever —
+> map guest RAM with no stage-2 access and demand-fault pages in on first touch
+> (the read+write analog of the existing dirty-tracking write-fault path) — was
+> prototyped and works correctly (single-vCPU and SMP, via a `DemandFault` exit on
+> both data and instruction aborts). It was **not kept**, because the win could not
+> be demonstrated: `clonefile` + `mmap(MAP_SHARED)` already demand-pages the base
+> host-side, so a restore that touches only its working set may already pay only for
+> the pages it uses. The numbers above are cache-state dependent — they reproduce
+> when the base `memory.bin` is **not** resident in the host page cache (e.g. after
+> the dd phase evicts it); a tight-succession restore with a warm base measures
+> ~1–7 ms. A definitive cold-base A/B (eager vs lazy, wall to first output) needs
+> `sudo purge` to evict the cache reliably, which was unavailable in the test
+> environment. The lever remains open if a cold-start workload shows the eager
+> materialization is genuinely on the critical path.
+
 ## 4. Disk footprint
 
 | Artifact | logical (st_size) | physical (st_blocks×512) |

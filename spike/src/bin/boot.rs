@@ -930,6 +930,7 @@ fn run_restore(
             )));
         }
     }
+    let t_chain = restore_start.elapsed();
 
     // The LEAF carries the vCPU/GIC/device state to resume from. read_snapshot
     // version-guards (check_version) the leaf's vmstate.json, so we validate v3 here;
@@ -953,6 +954,7 @@ fn run_restore(
             "root memory.bin length {base_len} != mem_size {mem_size}"
         )));
     }
+    let t_read = restore_start.elapsed();
 
     // Per-restore instance dir: CoW clones of the immutable base live here, so the
     // running guest never writes back into the base. (A later task moves this under the store.)
@@ -963,6 +965,7 @@ fn run_restore(
     // Clone the ROOT memory.bin (not the leaf — a Diff leaf's memory.bin is only its
     // packed dirty pages). Diff layers are overlaid onto this clone below.
     snapshot::clonefile_or_copy(&root_paths.memory, &inst_mem)?;
+    let t_clone = restore_start.elapsed();
 
     // 2. Map the instance memory.bin as guest RAM. MAP_SHARED: pages fault in lazily
     //    from the clone, and guest writes land in the clone (APFS copy-on-writes the
@@ -983,6 +986,7 @@ fn run_restore(
     }
     drop(memf); // the mapping keeps the underlying file alive after the fd closes
     let host_addr = host as u64;
+    let t_mmap = restore_start.elapsed();
 
     // 2b. Overlay each Diff layer in order onto the MAP_SHARED clone. Writes land in
     //     the private instance file (APFS CoWs the block off the root on first write),
@@ -1003,9 +1007,11 @@ fn run_restore(
             leaf.name
         );
     }
+    let t_diff = restore_start.elapsed();
 
     // 3. Create the HVF VM (must precede GIC and vCPU creation).
     let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
+    let t_vm = restore_start.elapsed();
 
     // 4. Create the in-kernel GIC (same placement as a fresh boot). Its saved
     //    distributor/redistributor state is restored later via `gic_restore`, after
@@ -1014,10 +1020,12 @@ fn run_restore(
         HvfGicV3::new(snap.config.vcpu_count, layout::RAM_BASE)
             .map_err(|e| io::Error::other(format!("GIC create: {e}")))?,
     );
+    let t_gic = restore_start.elapsed();
 
     // 5. Map the populated RAM into the guest.
     vm.map_memory(host_addr, layout::RAM_BASE, mem_size)
         .map_err(|e| io::Error::other(format!("hv_vm_map: {e}")))?;
+    let t_map = restore_start.elapsed();
 
     // 5b. Arm dirty-page tracking on the restored guest if --track-dirty: write-protect
     //     all guest RAM (drop WRITE) so the first guest write to each page traps as a
@@ -1041,6 +1049,7 @@ fn run_restore(
     } else {
         None
     };
+    let t_protect = restore_start.elapsed();
 
     // 6. Restore devices at their saved addresses via DeviceManager.
     let mut mgr = DeviceManager::new(
@@ -1072,6 +1081,7 @@ fn run_restore(
         rx_stop: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
+    let t_dev = restore_start.elapsed();
 
     let serial = ctx.serial.clone().ok_or_else(|| io::Error::other("snapshot had no serial device"))?;
     let balloon_target = ctx.balloon_target.clone()
@@ -1084,12 +1094,15 @@ fn run_restore(
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
+    let q_vsock = restore_start.elapsed();
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
+    let q_freeze = restore_start.elapsed();
 
     // 7. Set up the interactive console (raw terminal + stdin reader).
     let termios = TermiosGuard::new();
     let mut manager = VcpuManager::new(snap.config.vcpu_count, bus);
+    let q_console = restore_start.elapsed();
 
     // Re-snapshot: a restored guest can be snapshotted into a NEW base. An omitted
     // --name generates a fresh one (never collides with the source). The handler
@@ -1233,6 +1246,7 @@ fn run_restore(
             }
         }));
     }
+    let q_handler = restore_start.elapsed();
 
     // Arm dirty tracking on the manager BEFORE it is cloned (set_dirty_config, like
     // set_snapshot_handler, needs sole Arc ownership). Each restored/secondary vCPU
@@ -1244,8 +1258,10 @@ fn run_restore(
             tracker: tracker.clone(),
         });
     }
+    let q_dirty = restore_start.elapsed();
 
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    let q_stdin = restore_start.elapsed();
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
 
     // Net restore: present the link as DOWN, then raise it after resume so the
@@ -1259,7 +1275,36 @@ fn run_restore(
     }
 
     eprintln!("== ignition restore == (no kernel boot; resuming from saved PC)");
-    log::info!("Restore-time = {} ms", restore_start.elapsed().as_millis());
+    let total = restore_start.elapsed();
+    let us = |d: std::time::Duration| d.as_micros();
+    log::info!(
+        "Restore-breakdown = chain:{}us read:{}us clone:{}us mmap:{}us diff:{}us \
+         vm:{}us gic:{}us map:{}us protect:{}us dev:{}us total:{}us",
+        us(t_chain),
+        us(t_read - t_chain),
+        us(t_clone - t_read),
+        us(t_mmap - t_clone),
+        us(t_diff - t_mmap),
+        us(t_vm - t_diff),
+        us(t_gic - t_vm),
+        us(t_map - t_gic),
+        us(t_protect - t_map),
+        us(t_dev - t_protect),
+        us(total),
+    );
+    log::info!("Restore-time = {} ms", total.as_millis());
+    log::info!(
+        "Restore-tail = dev:{}us vsock:{}us freeze:{}us console:{}us handler:{}us dirty:{}us stdin:{}us net:{}us total:{}us",
+        us(t_dev),
+        us(q_vsock - t_dev),
+        us(q_freeze - q_vsock),
+        us(q_console - q_freeze),
+        us(q_handler - q_console),
+        us(q_dirty - q_handler),
+        us(q_stdin - q_dirty),
+        us(total - q_stdin),
+        us(total),
+    );
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
