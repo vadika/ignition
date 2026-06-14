@@ -1,0 +1,6 @@
+# build artifacts from run.sh
+fuzz
+repro
+*.o
+*.dSYM/
+crash.bin
