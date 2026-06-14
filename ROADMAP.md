@@ -3,7 +3,7 @@
 A research microVM for macOS / Apple Silicon on Hypervisor.framework, architecturally
 modeled on AWS Firecracker. This file tracks what is built, what is next, and the
 research questions that motivate the project. It is the living index; per-feature
-detail lives in `docs/superpowers/specs/` (design) and `docs/*-result.md` (outcomes).
+detail lives in `docs/superpowers/specs/` (design) and the documentation book under `docs/src/` (outcomes).
 
 _Last updated: 2026-06-14._
 
@@ -65,7 +65,7 @@ Two tracks carry the thesis beyond parity:
 - [x] **Fast restore** — `clonefile` + `mmap(MAP_SHARED)`: lazy page fault-in, immutable base. `docs/superpowers/specs/2026-06-13-fast-restore-clonefile-mmap-design.md`
 - [x] **Snapshot store** — `--store`/`--name`, `snapshots/<name>/` bases + `instances/<name>-<pid>/` CoW clones, `manifest.json`, auto-generated names, re-snapshot (+ same-name `--force` guard).
 - [x] **Dirty-page tracking on HVF** — `--track-dirty` arms `hv_vm_protect` write-protect; first write to each 16 KiB page traps (Data-Abort translation fault), marks dirty, re-grants. The genuinely novel platform bit — no `KVM_GET_DIRTY_LOG` equivalent. Shared foundation for diff snapshots and the (planned) in-loop reset.
-- [x] **Diff / incremental snapshots** — a restored armed guest writes a Diff layer (only changed pages, `parent` = the restored-from leaf) as an immutable delta chain; restore reassembles root + diffs transparently. `docs/superpowers/specs/2026-06-13-diff-snapshots-design.md`, `docs/diff-snapshot-research.md`
+- [x] **Diff / incremental snapshots** — a restored armed guest writes a Diff layer (only changed pages, `parent` = the restored-from leaf) as an immutable delta chain; restore reassembles root + diffs transparently. `docs/superpowers/specs/2026-06-13-diff-snapshots-design.md`, `docs/src/features/diff-snapshots.md`
 - [x] **Restore instrumentation + cost attribution** — per-stage `Restore-breakdown` / `Restore-tail` timers; bench parses + records them. The ~245 ms restore cost is **host RAM page-in** (cache-state dependent), not the HVF-object/overlay stages (~3 ms). Lazy stage-2 demand-paging (`--lazy-restore`) was prototyped (correct single-vCPU + SMP) and **shelved**: `clonefile`+`MAP_SHARED` already demand-pages host-side, so the win could not be demonstrated without a clean cold-base A/B (`sudo purge`). `docs/src/benchmarks/diff-snapshots.md` §3
 
 ### Snapshot fuzzer — demonstrator (M0–M3)
