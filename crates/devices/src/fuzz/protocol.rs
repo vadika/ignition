@@ -28,6 +28,11 @@ pub mod cmd {
 
 /// Default shared-window size in bytes (2 MiB).
 pub const DEFAULT_WINDOW_SIZE: u64 = 0x20_0000;
+/// Default coverage-region size in bytes (64 KiB). An array of 8-bit SanCov edge
+/// counters, written by the guest's `trace-pc` callback and read by the host
+/// observer. A power of two so the callback can mask the hashed edge PC with
+/// `DEFAULT_COV_SIZE - 1` (AFL-style hashed coverage map).
+pub const DEFAULT_COV_SIZE: u64 = 0x1_0000;
 /// Control region size in bytes: one 16 KiB guest page. The four registers
 /// occupy only the first 16 bytes, but the region is page-sized so the guest can
 /// `mmap` it via `/dev/mem` (mmap offsets must be 16 KiB-aligned on this guest).
@@ -57,5 +62,16 @@ mod tests {
                 assert_ne!(a, b, "command codes must be distinct");
             }
         }
+    }
+
+    #[test]
+    fn cov_size_is_page_aligned_power_of_two() {
+        // The coverage region is a host-readable 8-bit-counter map mmap'd into the
+        // guest at a 16 KiB-aligned GPA; its size must be 16 KiB-aligned so the
+        // guest can /dev/mem-mmap it, and a power of two so the trace-pc callback
+        // can mask the hashed PC with (DEFAULT_COV_SIZE - 1).
+        assert_eq!(DEFAULT_COV_SIZE % 0x4000, 0, "cov region must be 16 KiB-aligned");
+        assert!(DEFAULT_COV_SIZE.is_power_of_two(), "mask trick needs a power of two");
+        assert!(DEFAULT_COV_SIZE >= 0x4000, "at least one guest page");
     }
 }

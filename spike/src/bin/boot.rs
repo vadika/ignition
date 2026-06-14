@@ -978,6 +978,11 @@ fn fuzz_cmdline() -> String {
 /// or the boot-timer ([`layout::BOOT_TIMER_ADDR`]).
 const FUZZ_CTRL_GPA: u64 = 0x0920_0000;
 const FUZZ_WIN_GPA: u64 = 0x0920_4000; // CTRL_GPA + CONTROL_SIZE (0x4000)
+// The coverage region: a host-readable RAM-backed map of 8-bit SanCov counters,
+// mapped into the guest just above the input window. Like the window it sits
+// below RAM_BASE, so it is outside the dirty-tracked guest-RAM range and never
+// rolled back by the dirty reset (spec §6: host-managed pages are reset-exempt).
+const FUZZ_COV_GPA: u64 = 0x0940_4000; // FUZZ_WIN_GPA + DEFAULT_WINDOW_SIZE (0x20_0000)
 
 /// Boot a single-vCPU guest from an initramfs and run the in-VMM fuzz loop.
 ///
@@ -1024,14 +1029,27 @@ fn run_fuzz_mode(
         FUZZ_WIN_GPA + window_size,
         layout::RAM_BASE
     );
-    // The control region must not overlap the window (CTRL_GPA + CONTROL_SIZE == WIN_GPA).
-    // Both are consts, so check it at compile time.
+    // Region layout is fixed at compile time: ctrl | window | coverage, ascending,
+    // non-overlapping, all below RAM_BASE.
     const {
         assert!(
             FUZZ_CTRL_GPA + protocol::CONTROL_SIZE <= FUZZ_WIN_GPA,
             "fuzz control region overlaps the window"
         );
     }
+    let cov_size = protocol::DEFAULT_COV_SIZE;
+    assert!(
+        FUZZ_WIN_GPA + window_size <= FUZZ_COV_GPA,
+        "fuzz window [{FUZZ_WIN_GPA:#x}, {:#x}) overlaps the coverage region at {FUZZ_COV_GPA:#x}",
+        FUZZ_WIN_GPA + window_size
+    );
+    assert!(
+        FUZZ_COV_GPA + cov_size <= layout::RAM_BASE,
+        "fuzz coverage region [{FUZZ_COV_GPA:#x}, {:#x}) must sit below RAM_BASE {:#x}",
+        FUZZ_COV_GPA + cov_size,
+        layout::RAM_BASE
+    );
+    assert_eq!(FUZZ_COV_GPA & 0x3FFF, 0, "coverage GPA must be 16 KiB-aligned");
 
     // Allocate guest RAM on the host (private anon, same as the fresh-boot path).
     let host = unsafe {
