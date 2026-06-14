@@ -31,6 +31,28 @@ impl Rng {
     }
 }
 
+/// Which per-iteration RAM reset to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    /// v0: memcpy the whole guest RAM from base every iteration. Correct, slow,
+    /// no dirty-tracking dependency. Kept for the M2 throughput comparison.
+    Full,
+    /// v1: restore only guest-dirtied pages (drained from the DirtyTracker) and
+    /// re-protect. This is the throughput story.
+    Dirty,
+}
+
+impl std::str::FromStr for ResetMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<ResetMode, String> {
+        match s {
+            "full" => Ok(ResetMode::Full),
+            "dirty" => Ok(ResetMode::Dirty),
+            other => Err(format!("unknown reset mode {other:?} (want full|dirty)")),
+        }
+    }
+}
+
 /// Blind "havoc-lite" mutation in place: a handful of random byte sets / bit
 /// flips on a copy of `seed`, clamped to `max_len`. No coverage feedback (that
 /// is M2). Returns the mutated bytes.
@@ -60,6 +82,22 @@ pub fn mutate(seed: &[u8], rng: &mut Rng, max_len: usize) -> Vec<u8> {
 pub fn restore_ram(base: &[u8], live: &mut [u8]) {
     debug_assert_eq!(base.len(), live.len(), "base and live RAM must match in size");
     live.copy_from_slice(base);
+}
+
+/// Restore only the pages in `pages` (page indices into a region based at offset
+/// 0) from `base` to `live`, clamping the last page to the region length. v1 of
+/// the spec §6 reset: the dirty set replaces the full-RAM copy. `base`/`live`
+/// must be the same length.
+pub fn restore_pages(base: &[u8], live: &mut [u8], pages: &[u64], page: usize) {
+    debug_assert_eq!(base.len(), live.len(), "base and live RAM must match in size");
+    for &p in pages {
+        let start = (p as usize) * page;
+        if start >= live.len() {
+            continue;
+        }
+        let end = (start + page).min(live.len());
+        live[start..end].copy_from_slice(&base[start..end]);
+    }
 }
 
 /// Copy a fixed input verbatim into the window (replay/determinism mode). No
@@ -334,6 +372,41 @@ mod tests {
         // A new edge (index 7) -> new coverage.
         assert!(cm.record(&[0, 0, 0, 0, 0, 0, 0, 3]));
         assert_eq!(cm.covered(), 3);
+    }
+
+    #[test]
+    #[allow(clippy::erasing_op, clippy::identity_op)]
+    fn restore_pages_touches_only_listed_pages() {
+        let pg = 16384usize;
+        let base = vec![0xAAu8; 4 * pg];
+        let mut live = base.clone();
+        // Dirty page 1 and page 3.
+        for b in &mut live[1 * pg..2 * pg] { *b = 0x55; }
+        for b in &mut live[3 * pg..4 * pg] { *b = 0x11; }
+        // Also scribble page 2, but DON'T list it: it must stay scribbled (proves
+        // we restore only the drained set, not the whole region).
+        for b in &mut live[2 * pg..3 * pg] { *b = 0x77; }
+        restore_pages(&base, &mut live, &[1, 3], pg);
+        assert_eq!(&live[1 * pg..2 * pg], &base[1 * pg..2 * pg], "page 1 restored");
+        assert_eq!(&live[3 * pg..4 * pg], &base[3 * pg..4 * pg], "page 3 restored");
+        assert!(live[2 * pg..3 * pg].iter().all(|&b| b == 0x77), "page 2 untouched");
+    }
+
+    #[test]
+    fn restore_pages_clamps_partial_trailing_page() {
+        let pg = 16384usize;
+        let base = vec![0xAAu8; pg + 100]; // last page is partial (100 bytes)
+        let mut live = base.clone();
+        live[pg + 50] = 0x55;
+        restore_pages(&base, &mut live, &[1], pg);
+        assert_eq!(live, base, "partial trailing page restored without overrun");
+    }
+
+    #[test]
+    fn reset_mode_parses() {
+        assert_eq!("full".parse::<ResetMode>().unwrap(), ResetMode::Full);
+        assert_eq!("dirty".parse::<ResetMode>().unwrap(), ResetMode::Dirty);
+        assert!("bogus".parse::<ResetMode>().is_err());
     }
 
     #[test]
