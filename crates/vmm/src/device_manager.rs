@@ -147,6 +147,13 @@ impl DeviceManager {
                     FdtKind::Ns16550a => FdtDevice::Serial(m),
                     FdtKind::VirtioMmio => FdtDevice::VirtioMmio(m),
                     FdtKind::Pl031 => FdtDevice::Rtc(m),
+                    // The fuzz device has a two-region (control + window) FDT
+                    // shape that this single-`MmioDev` record cannot express; it
+                    // is emitted via a dedicated path, not through the record
+                    // list, so it must never appear here.
+                    FdtKind::IgnitionFuzz => {
+                        unreachable!("IgnitionFuzz is not placed via the MmioDev record list")
+                    }
                 }
             })
             .collect()

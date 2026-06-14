@@ -30,6 +30,16 @@ pub struct MmioDev {
     pub irq: u32,
 }
 
+/// The `ignition-fuzz` device placement: a trap-MMIO control region plus a
+/// RAM-backed shared window, each emitted as a `reg` range. No interrupt (the
+/// doorbell is a trapping store, not an IRQ source).
+pub struct FuzzDev {
+    pub ctrl_addr: u64,
+    pub ctrl_size: u64,
+    pub win_addr: u64,
+    pub win_size: u64,
+}
+
 /// An MMIO device to emit as an FDT node. Each variant maps to a node builder,
 /// so adding a device kind (RTC, more virtio) is a new variant + match arm rather
 /// than a new `FdtConfig` field.
@@ -41,6 +51,8 @@ pub enum FdtDevice {
     VirtioMmio(MmioDev),
     /// ARM PL031 RTC -> `arm,pl031`/`arm,primecell` node (time-only, no interrupt).
     Rtc(MmioDev),
+    /// ignition snapshot-fuzz device -> `ignition,fuzz` node (two reg ranges).
+    Fuzz(FuzzDev),
 }
 
 /// GICv3 placement, supplied by the GIC milestone. Parameterized so FDT
@@ -94,6 +106,7 @@ pub fn generate(cfg: &FdtConfig) -> Result<Vec<u8>, vm_fdt::Error> {
             FdtDevice::Serial(m) => create_serial_node(&mut fdt, m)?,
             FdtDevice::VirtioMmio(m) => create_virtio_node(&mut fdt, m)?,
             FdtDevice::Rtc(m) => create_rtc_node(&mut fdt, m)?,
+            FdtDevice::Fuzz(f) => create_fuzz_node(&mut fdt, f)?,
         }
     }
 
@@ -236,6 +249,17 @@ fn create_rtc_node(fdt: &mut FdtWriter, rtc: &MmioDev) -> Result<(), vm_fdt::Err
     fdt.property_string("clock-names", "apb_pclk")?;
     // Time-only: no "interrupts" property (alarm not wired). The device still
     // occupies a DeviceManager-allocated SPI, which simply goes unreferenced.
+    fdt.end_node(node)?;
+    Ok(())
+}
+
+fn create_fuzz_node(fdt: &mut FdtWriter, f: &FuzzDev) -> Result<(), vm_fdt::Error> {
+    let node = fdt.begin_node(&format!("fuzz@{:x}", f.ctrl_addr))?;
+    fdt.property_string("compatible", "ignition,fuzz")?;
+    // Two ranges: control registers first, then the shared window. The guest
+    // harness reads both from this `reg` (or uses the fixed GPAs directly).
+    fdt.property_array_u64("reg", &[f.ctrl_addr, f.ctrl_size, f.win_addr, f.win_size])?;
+    // No "interrupts": the doorbell is a trapping store handled inline by the VMM.
     fdt.end_node(node)?;
     Ok(())
 }
@@ -442,6 +466,26 @@ mod tests {
         let dt = Fdt::new(&blob).unwrap();
         assert!(dt.find_node("/virtio_mmio@a000000").is_some());
         assert!(dt.find_node("/virtio_mmio@a000200").is_some());
+    }
+
+    #[test]
+    fn fuzz_node_has_two_reg_ranges_and_no_interrupts() {
+        let mut cfg = sample();
+        cfg.devices.push(FdtDevice::Fuzz(FuzzDev {
+            ctrl_addr: 0x0920_0000,
+            ctrl_size: 0x1000,
+            win_addr: 0x0920_1000,
+            win_size: 0x20_0000,
+        }));
+        let blob = generate(&cfg).unwrap();
+        let dt = Fdt::new(&blob).unwrap();
+        let node = dt.find_node("/fuzz@9200000").expect("fuzz node present");
+        assert_eq!(dt_str(node.property("compatible").unwrap().value), "ignition,fuzz");
+        assert_eq!(
+            be_u64s(node.property("reg").unwrap().value),
+            vec![0x0920_0000, 0x1000, 0x0920_1000, 0x20_0000]
+        );
+        assert!(node.property("interrupts").is_none(), "fuzz device uses a polled doorbell, no IRQ");
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub enum FdtKind {
     Ns16550a,
     VirtioMmio,
     Pl031,
+    IgnitionFuzz,
 }
 
 /// Failures from device placement / restore.
