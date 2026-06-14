@@ -1,14 +1,19 @@
-/* M0 guest fuzz harness: PID 1 in an initramfs. Maps the ignition-fuzz device,
+/* Guest fuzz harness: PID 1 in an initramfs. Maps the ignition-fuzz device,
  * parks at the parse site, and drives the reset->inject->run->observe loop via
- * the doorbell. The "target" is a stub parser that overflows on a magic byte so
- * the M0 gate can plant a deterministic crash. */
+ * the doorbell. The target is the chunk parser in target.c (a planted length-
+ * field heap overflow), built with AddressSanitizer; ASan's death callback rings
+ * the CRASH doorbell, with the signal handlers below as a backstop. */
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include "ignition_fuzz.h"
+
+/* The fuzz target lives in target.c (instrumented with AddressSanitizer). */
+void target_parse(const uint8_t *data, unsigned long len);
 
 static volatile uint8_t *g_ctrl;   /* control registers (16 KiB) */
 static volatile uint8_t *g_win;    /* shared window (input bytes) */
@@ -29,32 +34,27 @@ static void crash_handler(int sig) {
     for (;;) { /* VMM resets us out of this loop */ }
 }
 
-/* The M0 stub target. A real target (libpng) replaces this in M1. */
-static void target_parse(const uint8_t *data, uint32_t len) {
-    char buf[16];
-    if (len > 0 && data[0] == 0xFF) {
-        /* Deterministic fatal fault -> SIGSEGV -> crash_handler -> CMD_CRASH.
-         * NB: a plain `char buf[N]; memset(buf, .., len+64)` is dead-store-
-         * eliminated at -O2 (buf is never read), so the planted bug vanishes and
-         * the guest never faults. Force a real, un-removable wild write instead:
-         * spray 0xAA past `buf` through a volatile pointer so the compiler must
-         * emit the stores; with a large `len` this walks off the stack into an
-         * unmapped page and faults. The volatile sink also defeats DSE. */
-        volatile char *p = buf;
-        size_t n = (size_t)len + 64;
-        for (size_t i = 0; i < n; i++) p[i] = (char)0xAA;
-        /* Fallback guarantee: a NULL deref always faults even if the loop above
-         * somehow stayed in mapped memory. Unreachable on a real fault. */
-        *(volatile char *)0 = p[n - 1];
-    } else {
-        /* touch the input so the read is real work */
-        volatile uint8_t acc = 0;
-        for (uint32_t i = 0; i < len && i < sizeof(buf); i++) acc ^= data[i];
-        (void)acc;
-    }
+/* ASan calls this just before aborting on a finding. We ring the CRASH doorbell
+ * (the VMM records the input + resets us) instead of letting ASan exit. The
+ * signal handlers remain a backstop for faults ASan does not intercept. */
+extern void __asan_set_death_callback(void (*cb)(void));
+
+#define CRASH_CODE_ASAN 0x5a  /* nonzero ASan-class marker for CRASH_CODE */
+
+static void asan_on_death(void) {
+    reg_write(REG_CRASH_CODE, CRASH_CODE_ASAN);
+    doorbell(CMD_CRASH);
+    for (;;) { }
+}
+
+/* Force ASan to abort (so the death callback fires) and keep it quiet/fast. */
+const char *__asan_default_options(void) {
+    return "abort_on_error=1:halt_on_error=1:detect_leaks=0";
 }
 
 int main(void) {
+    mount("proc", "/proc", "proc", 0, 0);   /* for ASan symbolization; ignore errors */
+
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) return 1;
     g_ctrl = mmap(0, IGNITION_FUZZ_CTRL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IGNITION_FUZZ_CTRL_GPA);
@@ -65,13 +65,15 @@ int main(void) {
     signal(SIGABRT, crash_handler);
     signal(SIGBUS,  crash_handler);
 
+    __asan_set_death_callback(asan_on_death);
+
     /* One-time setup is complete; park at the parse site. */
     doorbell(CMD_SNAPSHOT_ME);   /* <-- snapshot/reset PC lands just after here */
 
     for (;;) {
         uint32_t len = reg_read(REG_INPUT_LEN);
         if (len > IGNITION_FUZZ_WIN_SIZE) len = IGNITION_FUZZ_WIN_SIZE;
-        target_parse((const uint8_t *)g_win, len);
+        target_parse((const uint8_t *)g_win, (unsigned long)len);
         doorbell(CMD_DONE);
     }
     return 0;

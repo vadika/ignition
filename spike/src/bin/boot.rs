@@ -511,6 +511,7 @@ fn main() {
     let mut initramfs: Option<PathBuf> = None;
     let mut solutions: PathBuf = PathBuf::from("./fuzz-solutions");
     let mut seed_path: Option<PathBuf> = None;
+    let mut replay_path: Option<PathBuf> = None;
     let mut window_mib: u64 = 2;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
@@ -545,6 +546,9 @@ fn main() {
             }
             "--seed" => {
                 seed_path = Some(PathBuf::from(it.next().expect("--seed needs a path")));
+            }
+            "--replay" => {
+                replay_path = Some(PathBuf::from(it.next().expect("--replay needs a path")));
             }
             "--window-mib" => {
                 let n = it
@@ -598,12 +602,24 @@ fn main() {
             process::exit(2);
         });
         if positionals.is_empty() {
-            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
+            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
             process::exit(2);
         }
         let kernel_path = PathBuf::from(&positionals[0]);
         let window_size = window_mib << 20;
-        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), window_size, ram_size) {
+        // --replay feeds a saved crash input verbatim (no mutation) for the
+        // determinism gate; it takes precedence over --seed.
+        let replay = match replay_path {
+            Some(p) => match fs::read(&p) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    eprintln!("--replay read {}: {e}", p.display());
+                    process::exit(2);
+                }
+            },
+            None => None,
+        };
+        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size) {
             Ok(()) => eprintln!("\n[fuzz exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[fuzz error: {e}]");
@@ -627,7 +643,7 @@ fn main() {
 
     if positionals.is_empty() {
         eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
-        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
+        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -979,6 +995,7 @@ fn run_fuzz_mode(
     initramfs_path: &Path,
     solutions_dir: &Path,
     seed_path: Option<&Path>,
+    replay: Option<Vec<u8>>,
     window_size: u64,
     ram_size: u64,
 ) -> io::Result<()> {
@@ -1167,6 +1184,7 @@ fn run_fuzz_mode(
         (host as *mut u8, ram_size as usize),
         (win_host as *mut u8, window_size as usize),
         seeds,
+        replay,
         0xF1FA_5EED,
         solutions_dir.to_path_buf(),
     );
