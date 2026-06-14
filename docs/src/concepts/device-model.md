@@ -49,3 +49,4 @@ For the per-device behavior, the networking model, and the SMP wiring, see
 
 - [Architecture](architecture.md) — where the device manager sits in the VMM.
 - [The clone primitive](clone-primitive.md) — how `DeviceRecord` snapshot hooks are used.
+- [VM internal API (MMIO)](vm-internal-api.md) — the guest-facing MMIO contract (boot-timer, fuzz device).
