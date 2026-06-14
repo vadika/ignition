@@ -335,7 +335,7 @@ def main():
     ap.add_argument("--dd-samples", type=int, default=3)
     ap.add_argument("--snap-samples", type=int, default=3)
     ap.add_argument("--restore-samples", type=int, default=3)
-    ap.add_argument("--out", default=os.path.join(ROOT, "docs/diff-snapshot-benchmarks.md"))
+    ap.add_argument("--out", default=os.path.join(ROOT, "docs/src/benchmarks/diff-snapshots.md"))
     ap.add_argument("--json", default=None, help="dump raw results json")
     ap.add_argument("--write-only", action="store_true",
                     help="only the snapshot WRITE phase (skip boot/dd/restore)")

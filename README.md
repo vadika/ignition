@@ -11,8 +11,9 @@ The one genuinely lifted piece is the HVF backend — the `hvf` crate, taken fro
 [libkrun](https://github.com/containers/libkrun) (Red Hat, Apache-2.0; itself
 Firecracker-inspired) and then substantially reworked here (direct `hv_gic_*`,
 SMP, snapshot/restore). Everything else — devices, FDT, the vstate layer, boot
-harness — is original. See `docs/HANDOFF.md` and `docs/firecracker-hvf-porting-map.md`
-for the source analysis, and `docs/SPIKE_RESULTS.md` for the validation spike.
+harness — is original. See `docs/src/internals/design-decisions.md` and
+`docs/src/internals/hvf-firecracker-map.md` for the source analysis, and
+`docs/src/internals/validation-spike.md` for the validation spike.
 
 > **📖 Full documentation:** build the book with `mdbook serve docs/` (or see the
 > published site). Source under [`docs/src/`](docs/src/SUMMARY.md).
