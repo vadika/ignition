@@ -20,9 +20,9 @@
 - `crates/hvf/src/lib.rs` — `HvfVcpu::advance_pc` + `HvfVcpu::clear_pending_advance` helpers.
 - `crates/vmm/src/fuzz/mod.rs` + `crates/vmm/src/fuzz/controller.rs` — `FuzzController` (host brain: base RAM, base regs, mutator, solutions) + the pure `restore_ram` helper + xorshift mutator.
 - `crates/vmm/src/vstate/vcpu_manager.rs` — `run_fuzz` entry + `fuzz_loop`.
-- `guest/fuzz-harness/ignition_fuzz.h` — C mirror of `protocol.rs`.
-- `guest/fuzz-harness/harness.c` — guest init: setup → `SNAPSHOT_ME` → loop(parse) → `DONE`/`CRASH`.
-- `guest/fuzz-harness/build.sh` — cross-compile harness + pack cpio initramfs.
+- `kimage/build/fuzz-harness/ignition_fuzz.h` — C mirror of `protocol.rs`.
+- `kimage/build/fuzz-harness/harness.c` — guest init: setup → `SNAPSHOT_ME` → loop(parse) → `DONE`/`CRASH`.
+- `kimage/build/build-fuzz-initramfs.sh` — arm64 container build (static-musl harness → cpio), run on artemis2 per `REBUILD-GUEST-ASSETS.md`.
 - `spike/src/bin/boot.rs` — `--fuzz` CLI mode wiring.
 - `scripts/fuzz_m0_test.py` — the M0 gate integration test.
 
@@ -30,10 +30,12 @@
 
 ## Layout constants (used across tasks)
 
-The control region and shared window live in MMIO space, above guest RAM, so a full-RAM reset never touches them. Use these fixed GPAs (mirroring the boot-timer's fixed-address convention; verify no overlap against `crates/arch/src/aarch64/layout.rs` when implementing Task 8 and adjust if needed):
+The control region and shared window live in the low MMIO hole (below `layout::RAM_BASE`, just above the boot-timer at `0x091F_F000`), so a full-RAM reset never touches them. **The guest uses 16 KiB pages** (`ignition_vmm::dirty::PAGE = 16384`), so every device GPA the guest mmaps via `/dev/mem` MUST be 16 KiB-aligned (`0x4000`). Use these fixed GPAs (mirroring the boot-timer's fixed-address convention; verify no overlap against `crates/arch/src/aarch64/layout.rs` when implementing Task 8 and adjust if needed):
 
-- Control region GPA: `0x0920_0000`, size `0x1000` (4 KiB).
-- Shared window GPA: `0x0920_1000`, size = configurable, default `0x20_0000` (2 MiB).
+- Control region GPA: `0x0920_0000` (16 KiB-aligned), size `0x4000` (16 KiB, one page).
+- Shared window GPA: `0x0920_4000` (16 KiB-aligned), size = configurable, default `0x20_0000` (2 MiB, 16 KiB-aligned).
+
+Both lie below `RAM_BASE` (typically `0x4000_0000`), so they never overlap guest RAM regardless of `--mem`.
 
 ---
 
@@ -949,18 +951,21 @@ git commit -m "fuzz: in-VMM single-vCPU fuzz loop (capture/inject/reset) on the 
 
 ---
 
-### Task 7: Guest harness + initramfs build
+### Task 7: Guest harness + initramfs (remote container build)
 
 **Files:**
-- Create: `guest/fuzz-harness/ignition_fuzz.h`
-- Create: `guest/fuzz-harness/harness.c`
-- Create: `guest/fuzz-harness/build.sh`
+- Create: `kimage/build/fuzz-harness/ignition_fuzz.h`
+- Create: `kimage/build/fuzz-harness/harness.c`
+- Create: `kimage/build/build-fuzz-initramfs.sh`
+- Output (gitignored, pulled back): `kimage/out/fuzz-initramfs.cpio`
 
-The harness is PID 1 in a cpio initramfs. It maps the device regions via `/dev/mem` at the fixed GPAs, runs one-time setup, rings `SNAPSHOT_ME`, then loops: read `INPUT_LEN`, call the target, ring `DONE`. The M0 target is a stub parser that crashes (writes past a small stack buffer) when the first input byte is `0xFF`, so the gate can plant a crash deterministically. A `SIGSEGV`/`SIGABRT` handler writes `CRASH_CODE` + the `CRASH` doorbell.
+**Build model — match the existing guest-asset workflow** (`REBUILD-GUEST-ASSETS.md`, `kimage/build/build-rootfs.sh`, `kimage/build/devmem.c`). There is no local cross toolchain. Guest binaries are compiled static-musl inside an `--platform linux/arm64 alpine:3.19` container on the remote Docker host `artemis2`, then `scp`'d back to `kimage/out/`. The harness is built exactly like `devmem`. The kernel `kimage/out/Image` already has `CONFIG_DEVMEM=y, STRICT_DEVMEM=n` (that is how `devmem` poked the boot-timer at the unmapped IPA `0x091FF000`), so the harness can mmap the device GPAs via `/dev/mem` and stores to the unmapped control region trap to the VMM exactly as the doorbell design requires.
+
+The harness is PID 1 (`/init`) in a **minimal cpio initramfs** — NOT the alpine rootfs. Fuzzing needs a deterministic, near-stateless guest (spec §7: no openrc, no getty, no net, no rng). It mmaps the device regions via `/dev/mem` at the fixed 16 KiB-aligned GPAs, runs one-time setup, rings `SNAPSHOT_ME`, then loops: read `INPUT_LEN`, call the target, ring `DONE`. The M0 target overflows a small stack buffer when the first input byte is `0xFF`, so the gate can plant a crash deterministically. A `SIGSEGV`/`SIGABRT`/`SIGBUS` handler writes `CRASH_CODE` + the `CRASH` doorbell.
 
 - [ ] **Step 1: Write the C header (mirror of `protocol.rs`)**
 
-`guest/fuzz-harness/ignition_fuzz.h`:
+`kimage/build/fuzz-harness/ignition_fuzz.h`:
 
 ```c
 /* Mirror of crates/devices/src/fuzz/protocol.rs. Keep in sync by hand. */
@@ -968,11 +973,11 @@ The harness is PID 1 in a cpio initramfs. It maps the device regions via `/dev/m
 #define IGNITION_FUZZ_H
 #include <stdint.h>
 
-/* Fixed GPAs (mirror docs plan "Layout constants"). */
+/* Fixed GPAs (mirror docs plan "Layout constants"; 16 KiB-aligned). */
 #define IGNITION_FUZZ_CTRL_GPA   0x09200000UL
-#define IGNITION_FUZZ_CTRL_SIZE  0x1000UL
-#define IGNITION_FUZZ_WIN_GPA    0x09201000UL
-#define IGNITION_FUZZ_WIN_SIZE   0x200000UL  /* default 2 MiB */
+#define IGNITION_FUZZ_CTRL_SIZE  0x4000UL     /* 16 KiB, one guest page */
+#define IGNITION_FUZZ_WIN_GPA    0x09204000UL
+#define IGNITION_FUZZ_WIN_SIZE   0x200000UL   /* default 2 MiB */
 
 /* Control-register offsets. */
 #define REG_DOORBELL    0x00
@@ -990,7 +995,7 @@ The harness is PID 1 in a cpio initramfs. It maps the device regions via `/dev/m
 
 - [ ] **Step 2: Write the harness**
 
-`guest/fuzz-harness/harness.c`:
+`kimage/build/fuzz-harness/harness.c` (mmap offsets are the 16 KiB-aligned GPAs from the header; the `/dev/mem` mmap idiom matches `devmem.c`):
 
 ```c
 /* M0 guest fuzz harness: PID 1 in an initramfs. Maps the ignition-fuzz device,
@@ -1062,48 +1067,65 @@ int main(void) {
 }
 ```
 
-- [ ] **Step 3: Write the build script**
+- [ ] **Step 3: Write the build script (container build, mirrors `build-rootfs.sh`)**
 
-`guest/fuzz-harness/build.sh`:
+`kimage/build/build-fuzz-initramfs.sh`. Compiles the harness static-musl in an arm64 alpine container, stages a minimal initramfs (`/init` = harness, pre-created `/dev` nodes since initramfs has no devtmpfs auto-mount, and the dirs the kernel expects), and packs a `newc` cpio. Run on a Docker host with arm64 binfmt (artemis2):
 
 ```bash
 #!/usr/bin/env bash
-# Cross-compile the M0 fuzz harness as a static aarch64 PIE-free binary and pack
-# it into a cpio initramfs with the harness as /init. Requires an aarch64
-# musl/gcc cross toolchain (e.g. brew install aarch64-elf-gcc + musl, or a Linux
-# builder). Output: guest/fuzz-harness/initramfs.cpio
+# Build the M0 fuzz initramfs: static-musl harness as /init in a minimal cpio.
+# Mirrors build-rootfs.sh (arm64 alpine container, no host toolchain).
+# Output: ~/kbuild/out/fuzz-initramfs.cpio
 set -euo pipefail
-cd "$(dirname "$0")"
+OUT="$HOME/kbuild/out"
+mkdir -p "$OUT"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
-CC="${CC:-aarch64-linux-musl-gcc}"
-OUT=build
-mkdir -p "$OUT/root"
-
-# -static so there is no dynamic loader; the harness is /init.
-"$CC" -static -O2 -ffreestanding-safe -o "$OUT/root/init" harness.c || \
-"$CC" -static -O2 -o "$OUT/root/init" harness.c
-
-# Minimal initramfs: just /init plus the dirs the kernel expects.
-( cd "$OUT/root"
+docker rm -f fuzzinit_build >/dev/null 2>&1 || true
+docker run --platform linux/arm64 --name fuzzinit_build \
+  -v "$HERE/fuzz-harness:/src:ro" \
+  alpine:3.19 sh -euxc '
+  apk add --no-cache --virtual .build gcc musl-dev
+  mkdir -p /out/root
+  # -static: no dynamic loader; the harness is PID 1 (/init).
+  gcc -O2 -static -I/src /src/harness.c -o /out/root/init
+  apk del .build
+  cd /out/root
+  # initramfs has no devtmpfs auto-mount; pre-create the nodes the harness needs.
   mkdir -p dev proc sys
-  find . -print0 | cpio --null -ov --format=newc ) > initramfs.cpio
-echo "wrote $(pwd)/initramfs.cpio"
+  mknod -m 600 dev/mem c 1 1
+  mknod -m 622 dev/console c 5 1
+  mknod -m 666 dev/null c 1 3
+  find . | cpio -o -H newc > /out/fuzz-initramfs.cpio
+'
+docker cp fuzzinit_build:/out/fuzz-initramfs.cpio "$OUT/fuzz-initramfs.cpio"
+docker rm fuzzinit_build >/dev/null
+echo "wrote $OUT/fuzz-initramfs.cpio"
 ```
 
-- [ ] **Step 4: Verify the header matches the protocol (manual check + assertion)**
+- [ ] **Step 4: Verify the header matches the protocol**
 
-Run: `cargo test -p ignition-devices fuzz::protocol` (re-confirm the Rust side), then visually confirm `ignition_fuzz.h` values equal `protocol.rs`. Add a comment cross-reference in both files. (No automated cross-language check in M0; M1 may add a generated header.)
+Run `cargo test -p ignition-devices fuzz::protocol`, then confirm `ignition_fuzz.h` values equal `protocol.rs` (CTRL_GPA `0x09200000`, WIN_GPA `0x09204000`, offsets 0x00/0x04/0x08/0x0c, cmds 1/2/3). No automated cross-language check in M0.
 
-- [ ] **Step 5: Build the initramfs (if a cross toolchain is available)**
+- [ ] **Step 5: Build the initramfs on artemis2 and pull it back**
 
-Run: `chmod +x guest/fuzz-harness/build.sh && CC=aarch64-linux-musl-gcc ./guest/fuzz-harness/build.sh`
-Expected: `guest/fuzz-harness/initramfs.cpio` written. If no cross toolchain is present, note the blocker and provide the prebuilt cpio path to Task 8/9 via the test's `--initramfs` argument; do not block the Rust tasks on it.
+Per `REBUILD-GUEST-ASSETS.md`:
+```bash
+ssh artemis2 'mkdir -p ~/kbuild/fuzz-harness'
+scp kimage/build/fuzz-harness/harness.c kimage/build/fuzz-harness/ignition_fuzz.h artemis2:~/kbuild/fuzz-harness/
+scp kimage/build/build-fuzz-initramfs.sh artemis2:~/kbuild/
+ssh artemis2 'cd ~/kbuild && chmod +x build-fuzz-initramfs.sh && ./build-fuzz-initramfs.sh'
+scp artemis2:'~/kbuild/out/fuzz-initramfs.cpio' kimage/out/fuzz-initramfs.cpio
+# verify newc cpio magic "070701" at byte 0:
+head -c 6 kimage/out/fuzz-initramfs.cpio
+```
+Expected: `070701`. If artemis2 lacks arm64 binfmt, register it once: `ssh artemis2 'docker run --privileged --rm tonistiigi/binfmt --install arm64'`. `kimage/out/` is gitignored — the cpio is an artifact, not committed.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Commit (sources only; the cpio is gitignored)**
 
 ```bash
-git add guest/fuzz-harness/
-git commit -m "fuzz: M0 guest harness (doorbell protocol, stub crash target) + initramfs build"
+git add kimage/build/fuzz-harness/ kimage/build/build-fuzz-initramfs.sh
+git commit -m "fuzz: M0 guest harness (doorbell protocol, stub crash target) + initramfs container build"
 ```
 
 ---
