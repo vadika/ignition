@@ -71,6 +71,10 @@ scp artemis2:'~/kbuild/out/fuzz-initramfs.cpio' out/fuzz-initramfs.cpio 2>/dev/n
 head -c 6 out/fuzz-initramfs.cpio
 ```
 
+The M2 build instruments `target.c` with `-fsanitize-coverage=trace-pc` and the
+harness adds a third `/dev/mem` mapping for the coverage region at `0x09404000`
+(64 KiB); no new device nodes are needed (it reuses `/dev/mem`).
+
 After editing `harness.c` (e.g. swapping the M0 stub target for a real one),
 rebuild and re-pull. Keep `ignition_fuzz.h` in sync with
 `crates/devices/src/fuzz/protocol.rs`.

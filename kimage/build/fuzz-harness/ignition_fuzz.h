@@ -8,6 +8,8 @@
 #define IGNITION_FUZZ_CTRL_SIZE  0x4000UL     /* 16 KiB, one guest page */
 #define IGNITION_FUZZ_WIN_GPA    0x09204000UL
 #define IGNITION_FUZZ_WIN_SIZE   0x200000UL   /* default 2 MiB */
+#define IGNITION_FUZZ_COV_GPA    0x09404000UL  /* WIN_GPA + WIN_SIZE (0x200000) */
+#define IGNITION_FUZZ_COV_SIZE   0x10000UL     /* 64 KiB, 8-bit edge counters */
 
 /* Control-register offsets. */
 #define REG_DOORBELL    0x00

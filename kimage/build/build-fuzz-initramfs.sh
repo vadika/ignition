@@ -33,6 +33,10 @@
 #   -fsanitize=address; harness.c may be compiled without it but MUST be linked
 #   with clang -fsanitize=address so the ASan runtime + death-callback symbols
 #   resolve. Use -O1 (not -O2) + a volatile g_sink so the overflow isn't elided.
+# M2: target.c is additionally built with -fsanitize-coverage=trace-pc so the
+#   harness's __sanitizer_cov_trace_pc callback records edges into the shared
+#   coverage region (FUZZ_COV_GPA). Compile target.c and harness.c as separate
+#   objects (above) so the callback's TU is NOT itself instrumented.
 #
 # Bundled runtime libs (from `ldd init`) — copy into the cpio at THESE paths:
 #   /lib/ld-musl-aarch64.so.1     (the musl loader; libc.musl-aarch64.so.1 is the
@@ -67,10 +71,13 @@ docker run --platform linux/arm64 --name fuzzinit_build \
   alpine:3.19 sh -euxc '
   apk add --no-cache clang compiler-rt musl-dev
   mkdir -p /out/root/lib /out/root/usr/lib /out/root/dev /out/root/proc /out/root/sys
-  # target instrumented; harness compiled the same way is fine (ASan runtime is
-  # shared in-binary). Single clang link bakes in the ASan runtime. -O1 + the
-  # volatile g_sink keep the planted overflow from being optimized away.
-  clang -fsanitize=address -O1 -g -I/src /src/target.c /src/harness.c -o /out/root/init
+  # Instrument ONLY target.c with trace-pc coverage; harness.c (which defines the
+  # __sanitizer_cov_trace_pc callback) must stay uninstrumented or the callback
+  # recurses. ASan is applied to both; -O1 + the volatile g_sink keep the planted
+  # overflow alive.
+  clang -fsanitize=address -fsanitize-coverage=trace-pc -O1 -g -I/src -c /src/target.c -o /tmp/target.o
+  clang -fsanitize=address -O1 -g -I/src -c /src/harness.c -o /tmp/harness.o
+  clang -fsanitize=address -O1 -g /tmp/target.o /tmp/harness.o -o /out/root/init
   # bundle the dynamic loader + libgcc_s at their ldd paths (Task 1 recipe);
   # re-verify and copy any additional non-virtual deps.
   echo "=== ldd /out/root/init ==="
