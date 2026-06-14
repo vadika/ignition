@@ -206,7 +206,7 @@ plumbing.
   reproducible from the saved input.
 - [x] **M2 — coverage + dirty-page reset (v1).** Add SanCov window + libAFL feedback; swap
   reset to `hv_vm_protect` dirty set. Gate: coverage curve stabilizes; execs/sec jumps.
-- [ ] **M3 — benchmark.** Target = **libpng current**. Capture execs/sec, reset-latency
+- [x] **M3 — benchmark.** Target = **libpng current**. Capture execs/sec, reset-latency
   p50/p99, dirty-set-size distribution; compare vs a Linux/KVM snapshot fuzzer on the same
   target. Output: `docs/fuzzing-demonstrator-result.md` + numbers into `docs/benchmarks.md`.
 - [ ] **M4 — stateful targets.** `freetype` / `libxml2`: larger dirty sets, more bug surface;
