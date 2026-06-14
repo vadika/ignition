@@ -79,6 +79,51 @@ After editing `harness.c` (e.g. swapping the M0 stub target for a real one),
 rebuild and re-pull. Keep `ignition_fuzz.h` in sync with
 `crates/devices/src/fuzz/protocol.rs`.
 
+### libpng benchmark initramfs (M3)
+
+The default `./build-fuzz-initramfs.sh` (no arg → `synthetic`) keeps the ASan
+chunk-parser with the planted overflow — that build owns the bug-finding number.
+M3 adds a second target, `libpng`, that decodes real PNGs through libpng's
+simplified API (`build/fuzz-harness/target_png.c`).
+
+The `libpng` target builds **libpng 1.6.43 + zlib 1.3.1 from source with
+`-fsanitize-coverage=trace-pc` only (no ASan)**. Rationale (spec §12): the
+throughput / reset-latency / dirty-set numbers must isolate the snapshot machinery
+from ASan's shadow-memory churn, so the coverage-only build strips ASan while
+keeping edge coverage. Crashes (if any) surface via the harness signal handlers
+rather than ASan. The synthetic ASan build stays the default and unchanged.
+
+Build notes (encoded in the script):
+- `configure`'s "can the compiler link an executable?" probe compiles a trivial
+  `main` with `$CFLAGS`; with `trace-pc` that emits an unresolved
+  `__sanitizer_cov_trace_pc` (the callback lives in `harness.c`, which configure
+  never sees), so the probe is handed a no-op definition via `LDFLAGS`
+  (`/build/covstub.o`). It never enters `libz.a` / `libpng16.a`, so the shipped
+  library code stays fully instrumented.
+- `harness.c` is shared with the synthetic build and references
+  `__asan_set_death_callback`; the no-ASan link supplies a no-op
+  `/build/asanstub.o` for it (never called here). `harness.c` is unchanged.
+- zlib is fetched from the GitHub release tarball
+  (`github.com/madler/zlib/releases/...`); `zlib.net/zlib-<ver>.tar.gz` 404s for
+  non-current versions.
+
+Rebuild + pull `fuzz-initramfs-libpng.cpio` (distinct output name, coexists with
+the synthetic cpio in `out/`):
+
+```bash
+cd kimage
+ssh artemis2 'mkdir -p ~/kbuild/fuzz-harness'
+scp build/fuzz-harness/harness.c build/fuzz-harness/ignition_fuzz.h build/fuzz-harness/target_png.c artemis2:~/kbuild/fuzz-harness/
+scp build/build-fuzz-initramfs.sh artemis2:~/kbuild/
+ssh artemis2 'cd ~/kbuild && chmod +x build-fuzz-initramfs.sh && ./build-fuzz-initramfs.sh libpng'
+scp artemis2:'~/kbuild/out/fuzz-initramfs-libpng.cpio' out/fuzz-initramfs-libpng.cpio 2>/dev/null \
+  || scp artemis2:'~/kbuild/fuzz-initramfs-libpng.cpio' out/fuzz-initramfs-libpng.cpio
+head -c 6 out/fuzz-initramfs-libpng.cpio   # expect 070701
+```
+
+The remote build log should end with `ldd /out/root/init` showing only
+`ld-musl-aarch64.so.1` (libpng + zlib are static).
+
 ## Verify (must pass before committing)
 
 | Artifact | Check | Expect |
