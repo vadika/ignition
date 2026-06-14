@@ -37,9 +37,9 @@ comfortably.
 ## 3. Architecture
 
 ```
-   host (VMM + fuzzer brain)                 guest (single vCPU, initramfs)
+   host (VMM + fuzzer)                 guest (single vCPU, initramfs)
    ─────────────────────────                 ──────────────────────────────
-   libAFL: corpus, mutators,                 harness (PID 1 or init):
+   fuzzer: corpus, mutators,                 harness (PID 1 or init):
    scheduler, feedback                         one-time setup
         │                                       loop {
         │ mutate                                  doorbell SNAPSHOT_ME  ← snapshot/reset PC
