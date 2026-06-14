@@ -320,6 +320,7 @@ impl VcpuManager {
         }
         loop {
             if self.shutdown.load(Ordering::Acquire) {
+                controller.write_metrics();
                 return Ok(());
             }
             match vcpu.run(vcpus.clone())? {
@@ -371,10 +372,14 @@ impl VcpuManager {
                     }
                 }
                 VcpuExit::Shutdown => {
+                    controller.write_metrics();
                     self.request_shutdown();
                     return Ok(());
                 }
-                VcpuExit::Canceled => return Ok(()),
+                VcpuExit::Canceled => {
+                    controller.write_metrics();
+                    return Ok(());
+                }
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
                 VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
                 VcpuExit::WaitForEventExpired | VcpuExit::VtimerActivated => {}

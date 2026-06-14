@@ -515,6 +515,7 @@ fn main() {
     let mut replay_path: Option<PathBuf> = None;
     let mut window_mib: u64 = 2;
     let mut reset_mode = ignition_vmm::fuzz::controller::ResetMode::Dirty;
+    let mut metrics_path: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -565,6 +566,9 @@ fn main() {
                 let v = it.next().expect("--reset needs full|dirty");
                 reset_mode = v.parse().expect("--reset must be full|dirty");
             }
+            "--metrics" => {
+                metrics_path = Some(PathBuf::from(it.next().expect("--metrics needs a path")));
+            }
             "--net" => {
                 net = true;
             }
@@ -608,7 +612,7 @@ fn main() {
             process::exit(2);
         });
         if positionals.is_empty() {
-            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] <kernel-Image>", args[0]);
+            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--metrics <path>] [--mem MiB] <kernel-Image>", args[0]);
             process::exit(2);
         }
         let kernel_path = PathBuf::from(&positionals[0]);
@@ -625,7 +629,7 @@ fn main() {
             },
             None => None,
         };
-        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size, reset_mode) {
+        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size, reset_mode, metrics_path) {
             Ok(()) => eprintln!("\n[fuzz exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[fuzz error: {e}]");
@@ -1010,6 +1014,7 @@ fn run_fuzz_mode(
     window_size: u64,
     ram_size: u64,
     reset_mode: ResetMode,
+    metrics_path: Option<PathBuf>,
 ) -> io::Result<()> {
     let kernel_image = fs::read(kernel_path)
         .map_err(|e| io::Error::other(format!("read kernel {}: {e}", kernel_path.display())))?;
@@ -1243,6 +1248,7 @@ fn run_fuzz_mode(
         replay,
         0xF1FA_5EED,
         solutions_dir.to_path_buf(),
+        metrics_path,
     );
 
     // Run the single-vCPU fuzz loop. The doorbell GPA is the DOORBELL register
