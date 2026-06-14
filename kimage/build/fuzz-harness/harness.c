@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include "ignition_fuzz.h"
 
@@ -32,7 +33,27 @@ static void crash_handler(int sig) {
     for (;;) { /* VMM resets us out of this loop */ }
 }
 
+/* ASan calls this just before aborting on a finding. We ring the CRASH doorbell
+ * (the VMM records the input + resets us) instead of letting ASan exit. The
+ * signal handlers remain a backstop for faults ASan does not intercept. */
+extern void __asan_set_death_callback(void (*cb)(void));
+
+#define CRASH_CODE_ASAN 0x5a  /* nonzero ASan-class marker for CRASH_CODE */
+
+static void asan_on_death(void) {
+    reg_write(REG_CRASH_CODE, CRASH_CODE_ASAN);
+    doorbell(CMD_CRASH);
+    for (;;) { }
+}
+
+/* Force ASan to abort (so the death callback fires) and keep it quiet/fast. */
+const char *__asan_default_options(void) {
+    return "abort_on_error=1:halt_on_error=1:detect_leaks=0";
+}
+
 int main(void) {
+    mount("proc", "/proc", "proc", 0, 0);   /* for ASan symbolization; ignore errors */
+
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd < 0) return 1;
     g_ctrl = mmap(0, IGNITION_FUZZ_CTRL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IGNITION_FUZZ_CTRL_GPA);
@@ -42,6 +63,8 @@ int main(void) {
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGBUS,  crash_handler);
+
+    __asan_set_death_callback(asan_on_death);
 
     /* One-time setup is complete; park at the parse site. */
     doorbell(CMD_SNAPSHOT_ME);   /* <-- snapshot/reset PC lands just after here */

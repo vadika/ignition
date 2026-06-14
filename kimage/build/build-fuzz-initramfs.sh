@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build the M0 fuzz initramfs: static-musl harness as /init in a minimal cpio.
+# Build the M1 fuzz initramfs: clang-ASan (dynamic musl) target+harness as /init
+# in a minimal cpio, with the ASan runtime baked in and musl loader + libgcc_s
+# bundled (see the M1 recipe block below).
 # Mirrors build-rootfs.sh (arm64 alpine container, no host toolchain).
 # Output: ~/kbuild/out/fuzz-initramfs.cpio (or ~/kbuild/fuzz-initramfs.cpio if
 # out/ is root-owned from a prior kernel build and we cannot write into it).
@@ -63,14 +65,20 @@ docker rm -f fuzzinit_build >/dev/null 2>&1 || true
 docker run --platform linux/arm64 --name fuzzinit_build \
   -v "$HERE/fuzz-harness:/src:ro" \
   alpine:3.19 sh -euxc '
-  apk add --no-cache --virtual .build gcc musl-dev
-  mkdir -p /out/root
-  # -static: no dynamic loader; the harness is PID 1 (/init).
-  gcc -O2 -static -I/src /src/harness.c -o /out/root/init
-  apk del .build
+  apk add --no-cache clang compiler-rt musl-dev
+  mkdir -p /out/root/lib /out/root/usr/lib /out/root/dev /out/root/proc /out/root/sys
+  # target instrumented; harness compiled the same way is fine (ASan runtime is
+  # shared in-binary). Single clang link bakes in the ASan runtime. -O1 + the
+  # volatile g_sink keep the planted overflow from being optimized away.
+  clang -fsanitize=address -O1 -g -I/src /src/target.c /src/harness.c -o /out/root/init
+  # bundle the dynamic loader + libgcc_s at their ldd paths (Task 1 recipe);
+  # re-verify and copy any additional non-virtual deps.
+  echo "=== ldd /out/root/init ==="
+  ldd /out/root/init || true
+  cp -L /lib/ld-musl-aarch64.so.1 /out/root/lib/
+  cp -L /usr/lib/libgcc_s.so.1 /out/root/usr/lib/
   cd /out/root
   # initramfs has no devtmpfs auto-mount; pre-create the nodes the harness needs.
-  mkdir -p dev proc sys
   mknod -m 600 dev/mem c 1 1
   mknod -m 622 dev/console c 5 1
   mknod -m 666 dev/null c 1 3
