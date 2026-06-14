@@ -9,6 +9,7 @@ use std::time::Instant;
 use ignition_hvf::{HvfVcpu, VcpuState};
 
 use crate::dirty::{DirtyTracker, PAGE};
+use crate::fuzz::metrics::Metrics;
 
 /// Deterministic xorshift64* PRNG. A fixed seed makes a fuzz run reproducible,
 /// which the determinism requirements (spec §7) depend on.
@@ -187,6 +188,8 @@ pub struct FuzzController {
     ram_base_gpa: u64,
     started: Option<Instant>,
     last_dirty_pages: u64,
+    metrics: Metrics,
+    metrics_out: Option<PathBuf>,
     rng: Rng,
     replay: Option<Vec<u8>>,
     solutions_dir: PathBuf,
@@ -216,6 +219,7 @@ impl FuzzController {
         replay: Option<Vec<u8>>,
         seed_rng: u64,
         solutions_dir: PathBuf,
+        metrics_out: Option<PathBuf>,
     ) -> FuzzController {
         let corpus = if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds };
         FuzzController {
@@ -241,6 +245,8 @@ impl FuzzController {
             captured: false,
             started: None,
             last_dirty_pages: 0,
+            metrics: Metrics::new(),
+            metrics_out,
         }
     }
 
@@ -323,6 +329,7 @@ impl FuzzController {
         if self.iterations == 1 || self.iterations % 2000 == 0 {
             let elapsed = self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
             let eps = if elapsed > 0.0 { self.iterations as f64 / elapsed } else { 0.0 };
+            self.metrics.sample_coverage(elapsed, self.coverage.covered() as u64);
             log::info!(
                 "fuzz: iters={} execs/sec={:.0} cov={} corpus={} dirty_pages={} reset={:?}",
                 self.iterations, eps, self.coverage.covered(), self.corpus.len(),
@@ -355,6 +362,9 @@ impl FuzzController {
             log::warn!("failed to write fuzz solution: {e}");
         }
         self.crash_count += 1;
+        if let Some(t) = self.started {
+            self.metrics.record_first_crash(t.elapsed().as_secs_f64());
+        }
         log::info!("fuzz: CRASH captured (code={crash_code}, len={n}), solutions={}", self.crash_count);
         self.iterations += 1;
         self.observe_and_stats();
@@ -369,6 +379,7 @@ impl FuzzController {
     /// post-SNAPSHOT_ME value).
     fn reset(&mut self, vcpu: &mut HvfVcpu) -> Result<(), ignition_hvf::Error> {
         let base = std::mem::take(&mut self.base_ram);
+        let t_restore = Instant::now();
         match self.reset_mode {
             ResetMode::Full => {
                 restore_ram(&base, self.live_ram());
@@ -380,6 +391,7 @@ impl FuzzController {
                 // register restore — the ordering is immaterial, there is no fault window.
                 let pages = self.dirty.as_ref().expect("dirty mode requires a tracker").drain();
                 self.last_dirty_pages = pages.len() as u64;
+                self.metrics.record_dirty(pages.len() as u32);
                 restore_pages(&base, self.live_ram(), &pages, PAGE);
                 // Re-protect ALL RAM (drop WRITE) so the next iteration starts clean
                 // and re-arms the write-protect faults. drain() already cleared the
@@ -391,11 +403,33 @@ impl FuzzController {
                 )?;
             }
         }
+        let restore_us = t_restore.elapsed().as_micros().min(u32::MAX as u128) as u32;
         self.base_ram = base;
         let state = self.base_state.as_ref().expect("reset before capture");
+        let t_regs = Instant::now();
         vcpu.restore_state(state)?;
         vcpu.clear_pending_advance();
+        let regs_us = t_regs.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        self.metrics.record_reset(restore_us.saturating_add(regs_us), restore_us, regs_us);
         Ok(())
+    }
+
+    /// Write the accumulated benchmark metrics to `metrics_out` (if set) as the
+    /// machine-parseable block parsed by `scripts/fuzz_m3_bench.py`, and echo a
+    /// one-line summary to stderr. Called once on clean shutdown. Safe to call
+    /// before any iteration ran (emits zeroes).
+    pub fn write_metrics(&self) {
+        let elapsed = self.started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let report = self.metrics.report(self.iterations, elapsed);
+        if let Some(path) = &self.metrics_out {
+            if let Err(e) = std::fs::write(path, &report) {
+                log::warn!("failed to write fuzz metrics to {}: {e}", path.display());
+            }
+        }
+        // First line is the per-run summary; handy even without --metrics.
+        if let Some(first) = report.lines().next() {
+            eprintln!("fuzz-metrics {first}");
+        }
     }
 }
 
