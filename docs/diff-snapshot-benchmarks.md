@@ -129,6 +129,30 @@ dirty pages are read + copied), but for shallow chains of small deltas it is
 effectively free. Restore also beats fresh boot here (~245 ms vs ~1241 ms boot-to-
 shell) because it skips the kernel + init sequence entirely.
 
+**Where the ~245 ms goes (per-stage median, µs):**
+
+| stage | Full-only | golden+3 |
+|---|---|---|
+| chain resolve+validate | 238 | 356 |
+| read leaf state | 556 | 465 |
+| clonefile root RAM | 489 | 391 |
+| mmap | 79 | 74 |
+| diff overlay | 0 | 75451 |
+| Vm::new (hv_vm_create) | 138 | 64 |
+| HvfGicV3::new (hv_gic_create) | 1200 | 556 |
+| map_memory (hv_vm_map) | 10 | 3 |
+| protect | 0 | 0 |
+| device wiring | 531 | 216 |
+| **total** | 244040 | 243310 |
+
+The named stages sum to only ~3.2 ms (Full-only) / ~78 ms (golden+3) of the ~244 ms
+`total` — the rest is unattributed, spent demand-faulting the 512 MiB base RAM image
+into the guest as vCPUs run (not bracketed by any of these timers). Of the explicitly
+measured work, **`HvfGicV3::new` (`hv_gic_create`, ~1.2 ms) dominates the Full-only
+path**, while on a deep chain the **`diff` overlay (`read_diff_pages` + `apply_diff`,
+~75 ms for golden+3)** becomes the single largest measured stage as each layer's dirty
+pages are read and memcpy'd in.
+
 ## 4. Disk footprint
 
 | Artifact | logical (st_size) | physical (st_blocks×512) |
