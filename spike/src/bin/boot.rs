@@ -18,7 +18,10 @@ use std::{env, fs, process};
 
 use ignition_arch::aarch64::fdt::{self, FdtConfig};
 use ignition_arch::aarch64::{kernel, layout};
+use ignition_arch::aarch64::fdt::{FdtDevice, FuzzDev};
 use ignition_devices::boot_timer::BootTimer;
+use ignition_devices::fuzz::FuzzDevice;
+use ignition_devices::fuzz::protocol;
 use ignition_devices::rtc::Pl031;
 use ignition_devices::serial::Serial;
 use ignition_devices::virtio::balloon::Balloon;
@@ -32,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ignition_hvf::gic::HvfGicV3;
 use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
 use ignition_vmm::dirty::DirtyTracker;
+use ignition_vmm::fuzz::controller::FuzzController;
 use ignition_vmm::names;
 use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, DirtyConfig, VcpuManager};
@@ -493,7 +497,7 @@ fn main() {
     // Cap matches the FDT/GIC sizing we exercise; raise if a guest needs more.
     const MAX_VCPUS: u64 = 8;
     let mut smp: u64 = 1;
-    let mut mem_mib: u64 = 512; // default 512 MiB (the historical RAM_SIZE)
+    let mut mem_mib: Option<u64> = None; // None -> per-mode default (512 MiB boot, 96 MiB fuzz)
     let mut net = false;
     let mut vsock_uds: Option<PathBuf> = None;
     let mut store: PathBuf = PathBuf::from("./vmstore");
@@ -501,6 +505,13 @@ fn main() {
     let mut force = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
+    // Fuzz mode (Task 8): boot a single-vCPU guest from an initramfs and run the
+    // in-VMM fuzz loop against the ignition-fuzz device.
+    let mut fuzz = false;
+    let mut initramfs: Option<PathBuf> = None;
+    let mut solutions: PathBuf = PathBuf::from("./fuzz-solutions");
+    let mut seed_path: Option<PathBuf> = None;
+    let mut window_mib: u64 = 2;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -521,7 +532,28 @@ fn main() {
                     .parse::<u64>()
                     .expect("--mem value must be a number (MiB)");
                 assert!((1..=65536).contains(&n), "--mem must be 1..=65536 MiB");
-                mem_mib = n;
+                mem_mib = Some(n);
+            }
+            "--fuzz" => {
+                fuzz = true;
+            }
+            "--initramfs" => {
+                initramfs = Some(PathBuf::from(it.next().expect("--initramfs needs a path")));
+            }
+            "--solutions" => {
+                solutions = PathBuf::from(it.next().expect("--solutions needs a dir"));
+            }
+            "--seed" => {
+                seed_path = Some(PathBuf::from(it.next().expect("--seed needs a path")));
+            }
+            "--window-mib" => {
+                let n = it
+                    .next()
+                    .expect("--window-mib needs a value")
+                    .parse::<u64>()
+                    .expect("--window-mib value must be a number (MiB)");
+                assert!((1..=64).contains(&n), "--window-mib must be 1..=64 MiB");
+                window_mib = n;
             }
             "--net" => {
                 net = true;
@@ -553,7 +585,33 @@ fn main() {
         }
     }
 
+    // Per-mode RAM default: a fuzz guest needs only a small initramfs, so default
+    // it to 96 MiB; the normal boot path keeps the historical 512 MiB.
+    let mem_mib = mem_mib.unwrap_or(if fuzz { 96 } else { 512 });
     let ram_size: u64 = mem_mib << 20; // MiB -> bytes
+
+    // Fuzz path (Task 8): boot a single-vCPU guest from an initramfs and run the
+    // in-VMM fuzz loop. Skips the normal boot / restore paths entirely.
+    if fuzz {
+        let initramfs = initramfs.unwrap_or_else(|| {
+            eprintln!("--fuzz requires --initramfs <path>");
+            process::exit(2);
+        });
+        if positionals.is_empty() {
+            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
+            process::exit(2);
+        }
+        let kernel_path = PathBuf::from(&positionals[0]);
+        let window_size = window_mib << 20;
+        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), window_size, ram_size) {
+            Ok(()) => eprintln!("\n[fuzz exited cleanly]"),
+            Err(e) => {
+                eprintln!("\n[fuzz error: {e}]");
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
@@ -569,6 +627,7 @@ fn main() {
 
     if positionals.is_empty() {
         eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--window-mib N] [--mem MiB] <kernel-Image>", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -882,6 +941,238 @@ fn main() {
         Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
         Err(e) => eprintln!("\n[vcpu error: {e}]"),
     }
+}
+
+/// Fuzz-mode command line: run the initramfs `/init` (rdinit) and never try to
+/// mount a root disk (no `root=`). `reboot=t` + `panic=-1` keep a wedged guest
+/// from hanging the harness. Reuses the console token from `default_cmdline`.
+fn fuzz_cmdline() -> String {
+    format!(
+        "console=ttyS0 earlycon=uart8250,mmio,{:#x} reboot=t panic=-1 rdinit=/init",
+        layout::MMIO_BASE
+    )
+}
+
+/// Fixed GPAs for the ignition-fuzz device (mirror of
+/// `guest/fuzz-harness/ignition_fuzz.h`; 16 KiB-aligned). The control region sits
+/// at the very top of the device-MMIO map (just past the bump allocator + the
+/// boot-timer) and the shared window directly above it. Both are below `RAM_BASE`,
+/// so neither collides with guest RAM, the GIC (below `RAM_BASE`), the serial /
+/// virtio bump region ([`layout::MMIO_BASE`, `layout::MMIO_BASE + layout::MMIO_LEN`)),
+/// or the boot-timer ([`layout::BOOT_TIMER_ADDR`]).
+const FUZZ_CTRL_GPA: u64 = 0x0920_0000;
+const FUZZ_WIN_GPA: u64 = 0x0920_4000; // CTRL_GPA + CONTROL_SIZE (0x4000)
+
+/// Boot a single-vCPU guest from an initramfs and run the in-VMM fuzz loop.
+///
+/// Mirrors the fresh-boot body (RAM mmap, kernel load, GIC + serial + bus, FDT
+/// generate + write), then adds the fuzz wiring:
+///   * the shared WINDOW is a host anon mmap mapped into the guest at `FUZZ_WIN_GPA`
+///     (real RAM, no trap) — placed OUTSIDE guest RAM;
+///   * the CONTROL region is registered on the bus via `add_fixed` at `FUZZ_CTRL_GPA`
+///     but NOT mapped, so every guest access traps as a data abort and routes to
+///     the bus / the doorbell arm in `fuzz_loop` (same pattern as the boot-timer);
+///   * the FDT carries a `Fuzz` node + `initrd` pointing at the loaded cpio;
+///   * `FuzzController` owns the host views of guest RAM and the window.
+fn run_fuzz_mode(
+    kernel_path: &Path,
+    initramfs_path: &Path,
+    solutions_dir: &Path,
+    seed_path: Option<&Path>,
+    window_size: u64,
+    ram_size: u64,
+) -> io::Result<()> {
+    let kernel_image = fs::read(kernel_path)
+        .map_err(|e| io::Error::other(format!("read kernel {}: {e}", kernel_path.display())))?;
+    let initramfs = fs::read(initramfs_path)
+        .map_err(|e| io::Error::other(format!("read initramfs {}: {e}", initramfs_path.display())))?;
+
+    // The window is RAM-backed (guest loads/stores hit it directly), so it must
+    // live OUTSIDE guest RAM — otherwise it would shadow real RAM. Assert it.
+    assert!(
+        FUZZ_WIN_GPA + window_size <= layout::RAM_BASE,
+        "fuzz window [{FUZZ_WIN_GPA:#x}, {:#x}) must sit below RAM_BASE {:#x}",
+        FUZZ_WIN_GPA + window_size,
+        layout::RAM_BASE
+    );
+    // The control region must not overlap the window (CTRL_GPA + CONTROL_SIZE == WIN_GPA).
+    // Both are consts, so check it at compile time.
+    const {
+        assert!(
+            FUZZ_CTRL_GPA + protocol::CONTROL_SIZE <= FUZZ_WIN_GPA,
+            "fuzz control region overlaps the window"
+        );
+    }
+
+    // Allocate guest RAM on the host (private anon, same as the fresh-boot path).
+    let host = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ram_size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if host == libc::MAP_FAILED {
+        return Err(io::Error::other("mmap of guest RAM failed"));
+    }
+    let host_addr = host as u64;
+    let ram: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host as *mut u8, ram_size as usize) };
+
+    // Load the kernel; entry is where the vCPU's PC starts.
+    let entry = kernel::load_kernel(ram, layout::RAM_BASE, &kernel_image)
+        .map_err(|e| io::Error::other(format!("load_kernel: {e:?}")))?;
+
+    // The FDT occupies the top FDT_MAX_SIZE of (capped) RAM.
+    let fdt_addr = layout::fdt_addr(ram_size);
+    let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
+
+    // Place the initramfs at a 16 KiB-aligned offset above the kernel and below
+    // the FDT. 64 MiB clears any reasonable kernel; assert it fits below the DTB.
+    let initrd_off: usize = 0x0400_0000; // 64 MiB into RAM
+    let initrd_gpa = layout::RAM_BASE + initrd_off as u64;
+    assert_eq!(initrd_gpa & 0x3FFF, 0, "initrd GPA must be 16 KiB-aligned");
+    if initrd_off + initramfs.len() > fdt_off {
+        return Err(io::Error::other(format!(
+            "initramfs ({} bytes at offset {:#x}) does not fit below the FDT at offset {:#x}; \
+             increase --mem",
+            initramfs.len(),
+            initrd_off,
+            fdt_off
+        )));
+    }
+    ram[initrd_off..initrd_off + initramfs.len()].copy_from_slice(&initramfs);
+
+    // VM, then the in-kernel GIC (must be created before any vCPU). Single vCPU.
+    let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
+    let gic = Arc::new(
+        HvfGicV3::new(1, layout::RAM_BASE).map_err(|e| io::Error::other(format!("GIC create: {e}")))?,
+    );
+
+    // Device manager: serial first (its base matches the cmdline earlycon).
+    let mut mgr = DeviceManager::new(
+        gic.clone(),
+        layout::MMIO_BASE,
+        layout::MMIO_LEN,
+        layout::SPI_BASE,
+        layout::SPI_COUNT,
+    );
+    // Serial console: registered on the bus (the guest's earlycon output reaches
+    // host stdout via FlushWriter). The fuzz loop drives no host stdin reader, so
+    // we keep no handle — the frozen bus owns it.
+    mgr.add(layout::MMIO_WINDOW, |irq| Serial::with_irq(FlushWriter, irq))
+        .map_err(io::Error::other)?;
+
+    // The ignition-fuzz CONTROL region: registered on the bus but NOT mapped into
+    // the guest, so every guest access to it traps as a data abort (like the
+    // boot-timer). The doorbell store routes to the fuzz_loop's doorbell arm.
+    let fuzz_dev = Arc::new(Mutex::new(FuzzDevice::new()));
+    mgr.add_fixed(FUZZ_CTRL_GPA, protocol::CONTROL_SIZE, fuzz_dev.clone())
+        .map_err(io::Error::other)?;
+
+    // Build and place the device tree: serial console + fuzz node, with initrd.
+    let cfg = FdtConfig {
+        mem_base: layout::RAM_BASE,
+        mem_size: ram_size,
+        cpu_mpidrs: vec![mpidr_for(0)],
+        cmdline: fuzz_cmdline(),
+        devices: {
+            let mut devs = mgr.fdt_devices(); // serial (the fuzz device has no record)
+            devs.push(FdtDevice::Fuzz(FuzzDev {
+                ctrl_addr: FUZZ_CTRL_GPA,
+                ctrl_size: protocol::CONTROL_SIZE,
+                win_addr: FUZZ_WIN_GPA,
+                win_size: window_size,
+            }));
+            devs
+        },
+        gic: gic.fdt_info(),
+        initrd: Some((initrd_gpa, initramfs.len() as u64)),
+    };
+    let dtb = fdt::generate(&cfg).map_err(|e| io::Error::other(format!("fdt generate: {e:?}")))?;
+    if fdt_off + dtb.len() > ram.len() {
+        return Err(io::Error::other("DTB does not fit in RAM"));
+    }
+    ram[fdt_off..fdt_off + dtb.len()].copy_from_slice(&dtb);
+
+    // Map the populated RAM into the guest.
+    vm.map_memory(host_addr, layout::RAM_BASE, ram_size)
+        .map_err(|e| io::Error::other(format!("hv_vm_map RAM: {e}")))?;
+
+    // The shared WINDOW: a host anon mmap mapped into the guest at FUZZ_WIN_GPA, so
+    // guest loads/stores hit real RAM (no trap). Mapped read/write/exec by HVF's
+    // default map_memory grant.
+    let win_host = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            window_size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if win_host == libc::MAP_FAILED {
+        return Err(io::Error::other("mmap of fuzz window failed"));
+    }
+    let win_addr = win_host as u64;
+    vm.map_memory(win_addr, FUZZ_WIN_GPA, window_size)
+        .map_err(|e| io::Error::other(format!("hv_vm_map window: {e}")))?;
+
+    // Diagnostics (stderr) so a silent boot is debuggable.
+    let g = gic.fdt_info();
+    eprintln!("== ignition fuzz ==");
+    eprintln!("kernel : {} bytes, entry={entry:#x}", kernel_image.len());
+    eprintln!("initrd : {} bytes @ {initrd_gpa:#x}", initramfs.len());
+    eprintln!("dtb    : {} bytes @ {fdt_addr:#x}", dtb.len());
+    eprintln!(
+        "fuzz   : ctrl=[{FUZZ_CTRL_GPA:#x}, +{:#x}] (trap-mmio) window=[{FUZZ_WIN_GPA:#x}, +{window_size:#x}] (ram-backed)",
+        protocol::CONTROL_SIZE
+    );
+    eprintln!(
+        "gic    : dist=[{:#x}, {:#x}] redist=[{:#x}, {:#x}]",
+        g.dist_base, g.dist_size, g.redist_base, g.redist_size
+    );
+    eprintln!("cmdline: {}", fuzz_cmdline());
+    eprintln!("solutions: {}", solutions_dir.display());
+    eprintln!("--- guest console (stdout) ---");
+    io::stderr().flush().ok();
+
+    // Freeze the device set: transfers bus ownership to the run loop.
+    let frozen = Arc::new(mgr.freeze());
+    let bus = frozen.bus();
+
+    // Build the controller: host views of guest RAM + the window, plus the seed
+    // corpus (a single file if --seed was given, else empty -> 1-byte default).
+    let seeds: Vec<Vec<u8>> = match seed_path {
+        Some(p) => vec![fs::read(p)
+            .map_err(|e| io::Error::other(format!("read seed {}: {e}", p.display())))?],
+        None => Vec::new(),
+    };
+    let controller = FuzzController::new(
+        (host as *mut u8, ram_size as usize),
+        (win_host as *mut u8, window_size as usize),
+        seeds,
+        0xF1FA_5EED,
+        solutions_dir.to_path_buf(),
+    );
+
+    // Run the single-vCPU fuzz loop. The doorbell GPA is the DOORBELL register
+    // within the (unmapped, trapping) control region.
+    let manager = VcpuManager::new(1, bus);
+    manager
+        .run_fuzz(
+            entry,
+            fdt_addr,
+            FUZZ_CTRL_GPA + protocol::reg::DOORBELL,
+            FUZZ_CTRL_GPA,
+            fuzz_dev,
+            controller,
+        )
+        .map_err(|e| io::Error::other(format!("run_fuzz: {e}")))?;
+    Ok(())
 }
 
 /// Restore a (possibly diff-chained) base snapshot from
