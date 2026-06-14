@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use ignition_hvf::{HvfVcpu, VcpuState};
+
 /// Deterministic xorshift64* PRNG. A fixed seed makes a fuzz run reproducible,
 /// which the determinism requirements (spec §7) depend on.
 pub struct Rng {
@@ -71,6 +73,134 @@ pub fn write_solution(dir: &Path, index: u64, input: &[u8], crash_code: u32) -> 
         format!("crash_code={crash_code}\nlen={}\n", input.len()),
     )?;
     Ok(input_path)
+}
+
+/// The live fuzzer state for one M0 run. Holds the host-side base copy of guest
+/// RAM, the saved base register file, a raw view of live guest RAM and the
+/// shared window (host VAs from the boot harness's mmaps), the mutator, the seed
+/// corpus, and the solutions directory.
+///
+/// SAFETY: `ram_ptr`/`window_ptr` are host pointers to mappings that outlive the
+/// fuzz run (owned by the boot harness). The controller is used only on the
+/// single vCPU thread, so the &mut slices it forms are never aliased.
+pub struct FuzzController {
+    base_ram: Vec<u8>,
+    base_state: Option<VcpuState>,
+    ram_ptr: *mut u8,
+    ram_len: usize,
+    window_ptr: *mut u8,
+    window_len: usize,
+    rng: Rng,
+    seeds: Vec<Vec<u8>>,
+    seed_idx: usize,
+    solutions_dir: PathBuf,
+    crash_count: u64,
+    iterations: u64,
+    captured: bool,
+}
+
+// The controller lives on one thread; the raw pointers are not shared.
+unsafe impl Send for FuzzController {}
+
+impl FuzzController {
+    /// `ram`/`window` are (ptr, len) of the host mappings for guest RAM and the
+    /// shared window. `seeds` is the starting corpus (may be empty). `seed_rng`
+    /// fixes the mutation stream for reproducibility.
+    pub fn new(
+        ram: (*mut u8, usize),
+        window: (*mut u8, usize),
+        seeds: Vec<Vec<u8>>,
+        seed_rng: u64,
+        solutions_dir: PathBuf,
+    ) -> FuzzController {
+        FuzzController {
+            base_ram: Vec::new(),
+            base_state: None,
+            ram_ptr: ram.0,
+            ram_len: ram.1,
+            window_ptr: window.0,
+            window_len: window.1,
+            rng: Rng::new(seed_rng),
+            seeds: if seeds.is_empty() { vec![vec![0u8; 1]] } else { seeds },
+            seed_idx: 0,
+            solutions_dir,
+            crash_count: 0,
+            iterations: 0,
+            captured: false,
+        }
+    }
+
+    pub fn is_captured(&self) -> bool { self.captured }
+    pub fn iterations(&self) -> u64 { self.iterations }
+    pub fn crash_count(&self) -> u64 { self.crash_count }
+
+    fn live_ram(&mut self) -> &mut [u8] {
+        // SAFETY: see struct doc; single-threaded, mapping outlives the run.
+        unsafe { std::slice::from_raw_parts_mut(self.ram_ptr, self.ram_len) }
+    }
+    fn window(&mut self) -> &mut [u8] {
+        // SAFETY: see struct doc; single-threaded, mapping outlives the run.
+        unsafe { std::slice::from_raw_parts_mut(self.window_ptr, self.window_len) }
+    }
+
+    /// One-time SNAPSHOT_ME handling: PC is advanced past the doorbell store by
+    /// the caller; copy guest RAM into the base buffer and save the register
+    /// file. Returns the first input length to expose to the guest.
+    pub fn capture(&mut self, vcpu: &HvfVcpu) -> Result<u32, ignition_hvf::Error> {
+        let live = self.live_ram().to_vec();
+        self.base_ram = live;
+        self.base_state = Some(vcpu.save_state()?);
+        self.captured = true;
+        Ok(self.prepare_next_input())
+    }
+
+    /// Pick the next seed, mutate it into the shared window, return its length.
+    fn prepare_next_input(&mut self) -> u32 {
+        let seed = self.seeds[self.seed_idx % self.seeds.len()].clone();
+        self.seed_idx = self.seed_idx.wrapping_add(1);
+        let max = self.window_len;
+        let input = mutate(&seed, &mut self.rng, max);
+        let n = input.len().min(self.window_len);
+        self.window()[..n].copy_from_slice(&input[..n]);
+        n as u32
+    }
+
+    /// DONE handling: count the iteration, prepare the next input, reset.
+    pub fn on_done(&mut self, vcpu: &mut HvfVcpu) -> Result<u32, ignition_hvf::Error> {
+        self.iterations += 1;
+        let len = self.prepare_next_input();
+        self.reset(vcpu)?;
+        Ok(len)
+    }
+
+    /// CRASH handling: record the current input as a solution, then behave like
+    /// DONE. `crash_code` and `input_len` come from the device.
+    pub fn on_crash(&mut self, vcpu: &mut HvfVcpu, crash_code: u32, input_len: u32) -> Result<u32, ignition_hvf::Error> {
+        let n = (input_len as usize).min(self.window_len);
+        let input = self.window()[..n].to_vec();
+        if let Err(e) = write_solution(&self.solutions_dir, self.crash_count, &input, crash_code) {
+            log::warn!("failed to write fuzz solution: {e}");
+        }
+        self.crash_count += 1;
+        log::info!("fuzz: CRASH captured (code={crash_code}, len={n}), solutions={}", self.crash_count);
+        self.iterations += 1;
+        let len = self.prepare_next_input();
+        self.reset(vcpu)?;
+        Ok(len)
+    }
+
+    /// Roll the guest back to the snapshot: memcpy base->live RAM, restore the
+    /// register file, and cancel the pending lazy PC advance from the doorbell
+    /// trap (restore_state already set PC to the post-SNAPSHOT_ME value).
+    fn reset(&mut self, vcpu: &mut HvfVcpu) -> Result<(), ignition_hvf::Error> {
+        let base = std::mem::take(&mut self.base_ram);
+        restore_ram(&base, self.live_ram());
+        self.base_ram = base;
+        let state = self.base_state.as_ref().expect("reset before capture");
+        vcpu.restore_state(state)?;
+        vcpu.clear_pending_advance();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
