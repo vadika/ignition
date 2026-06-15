@@ -11,29 +11,28 @@ use super::queue::Virtqueue;
 const VIRTIO_ID_INPUT: u32 = 18;
 
 const CFG_ID_NAME: u8 = 0x01;
-#[allow(dead_code)] // used in later tasks
 const CFG_EV_BITS: u8 = 0x11;
-#[allow(dead_code)] // used in later tasks
 const CFG_ABS_INFO: u8 = 0x12;
 
-#[allow(dead_code)] // used in later tasks
+#[allow(dead_code)] // translator-only
 const EV_SYN: u16 = 0;
-#[allow(dead_code)] // used in later tasks
 const EV_KEY: u16 = 1;
-#[allow(dead_code)] // used in later tasks
 const EV_ABS: u16 = 3;
 #[allow(dead_code)] // emitted by the host translator (spike), documents the protocol
 const SYN_REPORT: u16 = 0;
-#[allow(dead_code)] // used in later tasks
 const ABS_X: u16 = 0;
-#[allow(dead_code)] // used in later tasks
 const ABS_Y: u16 = 1;
-#[allow(dead_code)] // used in later tasks
 const BTN_LEFT: u16 = 0x110;
-#[allow(dead_code)] // advertised in the EV_KEY bitmap; emitted by the translator
 const BTN_RIGHT: u16 = 0x111;
-#[allow(dead_code)]
 const BTN_MIDDLE: u16 = 0x112;
+
+/// Set bit `code` in a little-endian bitmap slice (no-op if out of range).
+fn set_bit(bitmap: &mut [u8], code: u16) {
+    let (byte, bit) = ((code / 8) as usize, code % 8);
+    if byte < bitmap.len() {
+        bitmap[byte] |= 1 << bit;
+    }
+}
 
 /// One virtio-input event on the wire (no timestamp): type, code, value — 8 LE bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,13 +55,11 @@ impl InputEvent {
 
 enum Flavor {
     Keyboard,
-    #[allow(dead_code)] // fields read in later tasks (config_read ABS_INFO path)
     Tablet { w: u32, h: u32 },
 }
 
 /// virtio-input device (keyboard or absolute tablet).
 pub struct VirtioInput {
-    #[allow(dead_code)] // read in later tasks (config_read dispatches on flavor)
     flavor: Flavor,
     select: u8,
     subsel: u8,
@@ -77,6 +74,70 @@ impl VirtioInput {
     }
 }
 
+impl VirtioInput {
+    /// Build the 136-byte config window for the current (flavor, select, subsel):
+    /// [select:1][subsel:1][size:1][reserved:5][union:128].
+    fn config_image(&self) -> [u8; 136] {
+        let mut c = [0u8; 136];
+        c[0] = self.select;
+        c[1] = self.subsel;
+        let u = &mut c[8..136];
+        let size: usize = match self.select {
+            CFG_ID_NAME => {
+                let name: &[u8] = match self.flavor {
+                    Flavor::Keyboard => b"ignition-keyboard",
+                    Flavor::Tablet { .. } => b"ignition-tablet",
+                };
+                u[..name.len()].copy_from_slice(name);
+                name.len()
+            }
+            CFG_EV_BITS => match (self.subsel as u16, &self.flavor) {
+                (EV_KEY, Flavor::Keyboard) => {
+                    for code in 1..=127u16 {
+                        set_bit(u, code);
+                    }
+                    16
+                }
+                (EV_KEY, Flavor::Tablet { .. }) => {
+                    set_bit(u, BTN_LEFT);
+                    set_bit(u, BTN_RIGHT);
+                    set_bit(u, BTN_MIDDLE);
+                    35
+                }
+                (EV_ABS, Flavor::Tablet { .. }) => {
+                    set_bit(u, ABS_X);
+                    set_bit(u, ABS_Y);
+                    1
+                }
+                _ => 0,
+            },
+            CFG_ABS_INFO => match &self.flavor {
+                Flavor::Tablet { w, h } => {
+                    // Only the advertised axes (ABS_X/ABS_Y) have absinfo; any other
+                    // axis returns size 0 so the guest doesn't see a phantom [0,0] axis.
+                    let max = match self.subsel as u16 {
+                        ABS_X => Some(w.saturating_sub(1)),
+                        ABS_Y => Some(h.saturating_sub(1)),
+                        _ => None,
+                    };
+                    match max {
+                        Some(max) => {
+                            u[0..4].copy_from_slice(&0u32.to_le_bytes());
+                            u[4..8].copy_from_slice(&max.to_le_bytes());
+                            20
+                        }
+                        None => 0,
+                    }
+                }
+                Flavor::Keyboard => 0,
+            },
+            _ => 0,
+        };
+        c[2] = size as u8;
+        c
+    }
+}
+
 impl VirtioDevice for VirtioInput {
     fn device_id(&self) -> u32 {
         VIRTIO_ID_INPUT
@@ -87,10 +148,11 @@ impl VirtioDevice for VirtioInput {
     }
 
     fn config_read(&self, offset: u64, data: &mut [u8]) {
-        for b in data.iter_mut() {
-            *b = 0;
+        let img = self.config_image();
+        for (i, b) in data.iter_mut().enumerate() {
+            let idx = (offset as usize).saturating_add(i);
+            *b = if idx < img.len() { img[idx] } else { 0 };
         }
-        let _ = offset;
     }
 
     fn config_write(&mut self, offset: u64, data: &[u8]) {
@@ -169,5 +231,69 @@ mod tests {
         kbd.config_write(1, &[0x00]);
         assert_eq!(kbd.select, CFG_ID_NAME);
         assert_eq!(kbd.subsel, 0);
+    }
+
+    fn read_cfg(dev: &VirtioInput, select: u8, subsel: u8) -> (u8, Vec<u8>) {
+        let d = dev_clone_with_sel(dev, select, subsel);
+        let mut size = [0u8; 1];
+        d.config_read(2, &mut size);
+        let mut u = vec![0u8; 128];
+        d.config_read(8, &mut u);
+        (size[0], u)
+    }
+    fn dev_clone_with_sel(dev: &VirtioInput, select: u8, subsel: u8) -> VirtioInput {
+        let mut d = match dev.flavor {
+            Flavor::Keyboard => VirtioInput::keyboard(),
+            Flavor::Tablet { w, h } => VirtioInput::tablet(w, h),
+        };
+        d.config_write(0, &[select]);
+        d.config_write(1, &[subsel]);
+        d
+    }
+
+    #[test]
+    fn config_id_name() {
+        let kbd = VirtioInput::keyboard();
+        let (size, u) = read_cfg(&kbd, CFG_ID_NAME, 0);
+        assert_eq!(&u[..size as usize], b"ignition-keyboard");
+        let tab = VirtioInput::tablet(1280, 800);
+        let (size, u) = read_cfg(&tab, CFG_ID_NAME, 0);
+        assert_eq!(&u[..size as usize], b"ignition-tablet");
+    }
+
+    #[test]
+    fn config_ev_bits_keyboard_has_keys() {
+        let kbd = VirtioInput::keyboard();
+        let (size, u) = read_cfg(&kbd, CFG_EV_BITS, EV_KEY as u8);
+        assert!(size > 0);
+        assert_ne!(u[30 / 8] & (1 << (30 % 8)), 0); // KEY_A = 30
+    }
+
+    #[test]
+    fn config_ev_bits_tablet_has_abs_and_buttons() {
+        let tab = VirtioInput::tablet(1280, 800);
+        let (size, u) = read_cfg(&tab, CFG_EV_BITS, EV_ABS as u8);
+        assert!(size >= 1);
+        assert_ne!(u[0] & 0b11, 0); // ABS_X(0), ABS_Y(1)
+        let (_size, u) = read_cfg(&tab, CFG_EV_BITS, EV_KEY as u8);
+        assert_ne!(u[272 / 8] & (1 << (272 % 8)), 0); // BTN_LEFT = 272
+    }
+
+    #[test]
+    fn config_abs_info_unknown_axis_is_empty() {
+        let tab = VirtioInput::tablet(1280, 800);
+        let (size, _u) = read_cfg(&tab, CFG_ABS_INFO, 2); // ABS_Z: not advertised
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn config_abs_info_ranges() {
+        let tab = VirtioInput::tablet(1280, 800);
+        let (size, u) = read_cfg(&tab, CFG_ABS_INFO, ABS_X as u8);
+        assert_eq!(size, 20);
+        assert_eq!(u32::from_le_bytes(u[0..4].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 1279);
+        let (_size, u) = read_cfg(&tab, CFG_ABS_INFO, ABS_Y as u8);
+        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 799);
     }
 }
