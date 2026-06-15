@@ -16,3 +16,4 @@ pub mod fuzz;
 pub mod rtc;
 pub mod serial;
 pub mod virtio;
+pub mod display;
