@@ -235,7 +235,9 @@ impl ApplicationHandler for App {
                         InputEvent { etype: 1, code, value },       // EV_KEY
                         InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
                     ];
-                    let _ = kbd.lock().unwrap().inject_input(&evs);
+                    // Best-effort: recover the guard if a vCPU panic poisoned the
+                    // device mutex, so a GUI event can't mask the original crash.
+                    let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -247,7 +249,7 @@ impl ApplicationHandler for App {
                         InputEvent { etype: 3, code: 1, value: y }, // EV_ABS ABS_Y
                         InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN
                     ];
-                    let _ = tab.lock().unwrap().inject_input(&evs);
+                    let _ = tab.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -265,7 +267,7 @@ impl ApplicationHandler for App {
                         InputEvent { etype: 1, code, value }, // EV_KEY BTN_*
                         InputEvent { etype: 0, code: 0, value: 0 },
                     ];
-                    let _ = tab.lock().unwrap().inject_input(&evs);
+                    let _ = tab.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
                 }
             }
             _ => {}

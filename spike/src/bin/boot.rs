@@ -352,6 +352,9 @@ struct DeviceContext {
     /// Display sink for the virtio-gpu device (Some only in --gui boot). Taken by
     /// the gpu builder; None means no virtio-gpu device is added.
     display_sink: Option<Box<dyn ignition_devices::display::DisplaySink>>,
+    /// virtio-input device handles (Some only in --gui boot), kept for the event loop.
+    keyboard_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+    tablet_mmio: Option<Arc<Mutex<VirtioMmio>>>,
 }
 
 impl DeviceContext {
@@ -493,6 +496,22 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
                 mem,
                 irq,
             ))?;
+        let mem_kbd = ctx.guest_ram();
+        if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-keyboard", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new(
+                "virtio-keyboard",
+                Box::new(ignition_devices::virtio::input::VirtioInput::keyboard()),
+                mem_kbd, irq))? {
+            ctx.keyboard_mmio = Some(h);
+        }
+        let mem_tab = ctx.guest_ram();
+        if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-tablet", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new(
+                "virtio-tablet",
+                Box::new(ignition_devices::virtio::input::VirtioInput::tablet(1280, 800)),
+                mem_tab, irq))? {
+            ctx.tablet_mmio = Some(h);
+        }
     }
 
     Ok(())
@@ -795,8 +814,12 @@ fn main() {
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
         display_sink: gui_sink,
+        keyboard_mmio: None,
+        tablet_mmio: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
+    let kbd_handle = ctx.keyboard_mmio.clone();
+    let tab_handle = ctx.tablet_mmio.clone();
     let serial = ctx.serial.clone().expect("serial device");
     let balloon_target = ctx.balloon_target.clone().expect("balloon target");
     let balloon = ctx.balloon.clone().expect("balloon device");
@@ -1098,7 +1121,7 @@ fn main() {
                 Err(e) => eprintln!("\n[vcpu error: {e}]"),
             }
         });
-        display_sink::run_event_loop(rx, done, 1280, 800, None, None, 1280, 800);
+        display_sink::run_event_loop(rx, done, 1280, 800, kbd_handle, tab_handle, 1280, 800);
     } else {
         apply_or_exit(&sb_paths, no_sandbox);
 
@@ -1638,6 +1661,8 @@ fn run_restore(
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
         display_sink: None,
+        keyboard_mmio: None,
+        tablet_mmio: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
     let t_dev = restore_start.elapsed();
