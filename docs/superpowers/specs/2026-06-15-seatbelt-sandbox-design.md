@@ -131,8 +131,10 @@ syntax.
   (subpath "{store}")                     ; each canonicalized SandboxPaths.writable
   (subpath "{writable_i}") ...)
 
-;; --- keep the VMM out of host secrets (reads otherwise allowed) ---
-(deny file-read*
+;; --- host secrets: ALWAYS the last block, so these denies win over any
+;;     user-supplied --store/writable path that overlaps a secret dir
+;;     (SBPL is last-match-wins). Denies both read and write. ---
+(deny file-read* file-write*
   (subpath "{home}/.ssh")
   (subpath "{home}/Library/Keychains")
   (subpath "/Library/Keychains")
@@ -150,9 +152,14 @@ Rationale:
 - **`file-write*` deny-then-allow** is the one inverted island: writes denied
   everywhere except `/private/var/folders` (temp clones) and each canonicalized
   writable dir (store, solutions, metrics parent, uds parent).
-- **secret-read denies** are belt-and-suspenders against a guest-escape reading host
-  creds. Reads are otherwise allowed (kernel/rootfs/dyld need broad read; enumerating
-  every legit read is the brittle path v1 avoids).
+- **secret denies** are belt-and-suspenders against a guest-escape reading *or
+  writing* host creds. Reads are otherwise allowed (kernel/rootfs/dyld need broad read;
+  enumerating every legit read is the brittle path v1 avoids). This block is emitted
+  **last** and denies both `file-read*` and `file-write*`, so under SBPL last-match-wins
+  it overrides the `file-write*` allow above — a user who points `--store` (or any
+  writable path) inside a secret dir is refused, not granted. `build_profile` must
+  always render this block after the writable-allow block; a unit test asserts the
+  ordering.
 - **Staged seam:** v2 flips the first line to `(deny default)` and grows an explicit
   allow-list (including the HVF + vmnet mach services). `build_profile` is the single
   place that changes.
@@ -188,15 +195,19 @@ Unit (`crates/sandbox`, no entitlement, pure string — run in CI):
    `process-fork`, and the secret-read denies.
 2. **SBPL escaping** — a writable path containing a space and a `"` is emitted as a
    valid, escaped SBPL string literal (assert no raw unescaped quote, no syntax break).
+3. **Secret-deny is last** — the `(deny file-read* file-write* ... secret subpaths)`
+   block appears at a byte offset *after* the `(allow file-write* ...)` block, even when
+   a writable path is passed that overlaps a secret dir. Guards the last-match-wins
+   guarantee.
 
 Integration (macOS, actually calls `sandbox_init`; `#[cfg(target_os = "macos")]`):
-3. **Apply succeeds** — `apply(&minimal_paths)` returns `Ok` on the test host.
-4. **Egress denied** — after `apply`, `TcpStream::connect` to a routable host:port
+4. **Apply succeeds** — `apply(&minimal_paths)` returns `Ok` on the test host.
+5. **Egress denied** — after `apply`, `TcpStream::connect` to a routable host:port
    fails with `PermissionDenied`; an `AF_UNIX` connect under an allowed dir succeeds.
-5. **Write-jail** — after `apply`, writing `temp_dir()/ign-sbtest` succeeds; writing
+6. **Write-jail** — after `apply`, writing `temp_dir()/ign-sbtest` succeeds; writing
    `$HOME/ign-sbtest` fails with `PermissionDenied`.
 
-   (Tests 3–5 each fork a child process that applies the sandbox and asserts, because
+   (Tests 4–6 each fork a child process that applies the sandbox and asserts, because
    `sandbox_init` is irreversible and process-wide — a sandboxed test process would
    poison sibling tests. The child reports via exit code.)
 
