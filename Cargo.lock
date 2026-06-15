@@ -230,6 +230,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignition-sandbox"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ignition-spike"
 version = "0.1.0"
 dependencies = [
@@ -237,6 +244,7 @@ dependencies = [
  "ignition-arch",
  "ignition-devices",
  "ignition-hvf",
+ "ignition-sandbox",
  "ignition-vmm",
  "ignition-vmnet",
  "libc",
