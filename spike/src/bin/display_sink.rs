@@ -210,6 +210,9 @@ impl ApplicationHandler for App {
         // Size the surface to the window's PHYSICAL pixels (may be > logical on HiDPI).
         self.resize_surface();
         self.force_paint = true;
+        // A CLI-launched window may not become the key window automatically on macOS;
+        // ask for focus so keyboard events flow without a manual click.
+        window.focus_window();
         window.request_redraw();
     }
 
