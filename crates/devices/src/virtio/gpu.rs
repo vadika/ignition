@@ -16,22 +16,16 @@ use super::queue::{DescChain, Virtqueue};
 const VIRTIO_ID_GPU: u32 = 16;
 
 const GET_DISPLAY_INFO: u32 = 0x0100;
-#[allow(dead_code)] // used in later tasks
 const RESOURCE_CREATE_2D: u32 = 0x0101;
-#[allow(dead_code)] // used in later tasks
 const RESOURCE_UNREF: u32 = 0x0102;
-#[allow(dead_code)] // used in later tasks
 const SET_SCANOUT: u32 = 0x0103;
 #[allow(dead_code)] // used in later tasks
 const RESOURCE_FLUSH: u32 = 0x0104;
 #[allow(dead_code)] // used in later tasks
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
-#[allow(dead_code)] // used in later tasks
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
-#[allow(dead_code)] // used in later tasks
 const RESOURCE_DETACH_BACKING: u32 = 0x0107;
 
-#[allow(dead_code)] // used in later tasks
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
@@ -45,11 +39,10 @@ const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 struct Resource2D {
     #[allow(dead_code)] // recorded at create; format negotiation is a later milestone.
     format: u32,
-    #[allow(dead_code)] // used in later tasks
+    #[allow(dead_code)] // read in tests; used by TRANSFER_TO_HOST_2D in later tasks
     width: u32,
-    #[allow(dead_code)] // used in later tasks
+    #[allow(dead_code)] // read in tests; used by TRANSFER_TO_HOST_2D in later tasks
     height: u32,
-    #[allow(dead_code)] // used in later tasks
     backing: Vec<(u64, u32)>,
     #[allow(dead_code)] // used in later tasks
     pixels: Arc<Mutex<Vec<u8>>>,
@@ -59,9 +52,7 @@ struct Resource2D {
 pub struct VirtioGpu {
     width: u32,
     height: u32,
-    #[allow(dead_code)] // used in later tasks
     resources: HashMap<u32, Resource2D>,
-    #[allow(dead_code)] // used in later tasks
     scanout_res: u32, // resource id bound to scanout 0; 0 = none
     #[allow(dead_code)] // used in later tasks
     sink: Box<dyn DisplaySink>,
@@ -77,7 +68,6 @@ impl VirtioGpu {
 fn le32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
 }
-#[allow(dead_code)] // used in later tasks
 fn le64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
 }
@@ -128,10 +118,106 @@ impl VirtioGpu {
         let cmd = le32(req, 0);
         let fence = le64(req, 8);
         let ctx = le32(req, 16);
+        let body = &req[CTRL_HDR_LEN..];
         match cmd {
             GET_DISPLAY_INFO => self.display_info(fence, ctx),
+            RESOURCE_CREATE_2D => self.create_2d(body, fence, ctx),
+            RESOURCE_UNREF => self.unref(body, fence, ctx),
+            RESOURCE_ATTACH_BACKING => self.attach_backing(body, fence, ctx),
+            RESOURCE_DETACH_BACKING => self.detach_backing(body, fence, ctx),
+            SET_SCANOUT => self.set_scanout(body, fence, ctx),
             _ => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
         }
+    }
+
+    fn create_2d(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 16 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let id = le32(body, 0);
+        let format = le32(body, 4);
+        let w = le32(body, 8);
+        let h = le32(body, 12);
+        // Reject a w*h*4 that overflows usize: a malformed guest must not wrap the
+        // size to a tiny buffer that later TRANSFER writes would overrun.
+        let Some(size) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+        else {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        };
+        self.resources.insert(id, Resource2D {
+            format,
+            width: w,
+            height: h,
+            backing: Vec::new(),
+            pixels: Arc::new(Mutex::new(vec![0u8; size])),
+        });
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
+    }
+
+    fn unref(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 4 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let id = le32(body, 0);
+        self.resources.remove(&id);
+        if self.scanout_res == id {
+            self.scanout_res = 0;
+        }
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
+    }
+
+    fn attach_backing(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 8 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let id = le32(body, 0);
+        // Each mem_entry is 16 bytes ({addr:u64, len:u32, pad:u32}). Cap the count
+        // to what the body can actually hold so a bogus nr_entries can't drive a
+        // huge `with_capacity` reservation (OOM-abort) before the loop guards it.
+        let nr = (le32(body, 4) as usize).min(body.len().saturating_sub(8) / 16);
+        let mut sg = Vec::with_capacity(nr);
+        for i in 0..nr {
+            let off = 8 + i * 16;
+            if off + 16 > body.len() {
+                break;
+            }
+            sg.push((le64(body, off), le32(body, off + 8)));
+        }
+        match self.resources.get_mut(&id) {
+            Some(r) => {
+                r.backing = sg;
+                resp_hdr(RESP_OK_NODATA, fence, ctx)
+            }
+            None => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
+        }
+    }
+
+    fn detach_backing(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 4 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let id = le32(body, 0);
+        if let Some(r) = self.resources.get_mut(&id) {
+            r.backing.clear();
+        }
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
+    }
+
+    fn set_scanout(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 24 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        // body: rect(16) + scanout_id(4) + resource_id(4). Only scanout 0 exists.
+        let resource_id = le32(body, 20);
+        // Binding to a nonexistent resource is an error (virtio 1.2 §5.7.6.8);
+        // resource_id 0 disables the scanout and is always allowed.
+        if resource_id != 0 && !self.resources.contains_key(&resource_id) {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        self.scanout_res = resource_id;
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
     }
 
     fn display_info(&self, fence: u64, ctx: u32) -> Vec<u8> {
@@ -284,6 +370,90 @@ mod tests {
         assert_eq!(u32::from_le_bytes(resp[e0 + 16..e0 + 20].try_into().unwrap()), 1);
         let e1 = CTRL_HDR_LEN + 24;
         assert_eq!(u32::from_le_bytes(resp[e1 + 16..e1 + 20].try_into().unwrap()), 0);
+    }
+
+    fn create_2d_req(id: u32, w: u32, h: u32) -> Vec<u8> {
+        let mut r = hdr(RESOURCE_CREATE_2D);
+        r.extend_from_slice(&id.to_le_bytes());
+        r.extend_from_slice(&FORMAT_B8G8R8A8_UNORM.to_le_bytes());
+        r.extend_from_slice(&w.to_le_bytes());
+        r.extend_from_slice(&h.to_le_bytes());
+        r
+    }
+    fn attach_backing_req(id: u32, entries: &[(u64, u32)]) -> Vec<u8> {
+        let mut r = hdr(RESOURCE_ATTACH_BACKING);
+        r.extend_from_slice(&id.to_le_bytes());
+        r.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for &(addr, len) in entries {
+            r.extend_from_slice(&addr.to_le_bytes());
+            r.extend_from_slice(&len.to_le_bytes());
+            r.extend_from_slice(&0u32.to_le_bytes());
+        }
+        r
+    }
+    fn set_scanout_req(scanout_id: u32, resource_id: u32) -> Vec<u8> {
+        let mut r = hdr(SET_SCANOUT);
+        r.extend_from_slice(&[0u8; 16]);
+        r.extend_from_slice(&scanout_id.to_le_bytes());
+        r.extend_from_slice(&resource_id.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn create_and_attach_backing() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &create_2d_req(1, 8, 4))), RESP_OK_NODATA);
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing,
+            &attach_backing_req(1, &[(0x1000, 64), (0x2000, 64)]))), RESP_OK_NODATA);
+        let r = gpu.resources.get(&1).expect("resource 1 exists");
+        assert_eq!((r.width, r.height), (8, 4));
+        assert_eq!(r.pixels.lock().unwrap().len(), 8 * 4 * 4);
+        assert_eq!(r.backing, vec![(0x1000, 64), (0x2000, 64)]);
+    }
+
+    #[test]
+    fn create_2d_with_overflowing_dims_errs() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        // w*h*4 overflows usize → must be rejected, not wrapped to a tiny buffer.
+        let resp = submit(&mut gpu, &mut backing, &create_2d_req(1, 0x8000_0000, 0x8000_0000));
+        assert_eq!(resp_type(&resp), RESP_ERR_UNSPEC);
+        assert!(!gpu.resources.contains_key(&1));
+    }
+
+    #[test]
+    fn set_scanout_to_missing_resource_errs() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        let resp = submit(&mut gpu, &mut backing, &set_scanout_req(0, 42));
+        assert_eq!(resp_type(&resp), RESP_ERR_UNSPEC);
+        assert_eq!(gpu.scanout_res, 0);
+    }
+
+    #[test]
+    fn set_scanout_binds_and_unbinds() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 8, 4));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
+        assert_eq!(gpu.scanout_res, 1);
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 0));
+        assert_eq!(gpu.scanout_res, 0);
+    }
+
+    #[test]
+    fn unref_removes_resource_and_clears_scanout() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 8, 4));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
+        let mut unref = hdr(RESOURCE_UNREF);
+        unref.extend_from_slice(&1u32.to_le_bytes());
+        unref.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &unref)), RESP_OK_NODATA);
+        assert!(!gpu.resources.contains_key(&1));
+        assert_eq!(gpu.scanout_res, 0);
     }
 
     #[test]
