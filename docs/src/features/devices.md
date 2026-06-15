@@ -39,6 +39,33 @@ no manual steps.
 vmnet survives snapshot/restore: on restore the link is bounced and the guest's
 carrier-watch re-runs DHCP. Each clone gets a distinct MAC and IP.
 
+## virtio-vsock
+
+virtio-vsock carries stream connections between host and guest over the virtio
+transport. E1 (guest→host) exposes per-port host listeners at `{uds}_{port}`: a guest
+process connecting to a vsock port surfaces on the host as a connection to the matching
+Unix socket path.
+
+### vsock host→guest (E2)
+
+A host process opens a connection *into* a listening guest over the same control
+socket, using Firecracker's hybrid protocol:
+
+1. The host connects to `{uds}` (the base path of `--vsock-uds`) and sends
+   `CONNECT <guest_port>\n`.
+2. ignition allocates an ephemeral host port, signals the guest (`REQUEST`), and the
+   guest's listener accepts (`RESPONSE`).
+3. ignition replies `OK <host_port>\n` to the host; raw bytes then flow both ways on
+   that same connection. If no guest process is listening, the connection is closed.
+
+```console
+# guest init runs e.g.:  socat VSOCK-LISTEN:5000,fork EXEC:cat
+socat - UNIX-CONNECT:/tmp/ignition-vsock-e2 <<<'CONNECT 5000'
+```
+
+Guest→host (E1) and host→guest (E2) coexist; per-port paths `{uds}_{port}` remain the
+E1 guest→host listeners.
+
 ## SMP
 
 `--smp N` (default 1, cap 8) boots a real aarch64 Linux with N vCPUs. Secondaries come

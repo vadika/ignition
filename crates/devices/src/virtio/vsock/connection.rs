@@ -14,6 +14,8 @@ pub const READ_CHUNK: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ConnState {
+    /// Host-initiated, awaiting the guest's RESPONSE. No payload moves yet.
+    LocalInit,
     Established,
     Closed,
 }
@@ -44,6 +46,36 @@ impl Connection {
             fwd_cnt: Wrapping(0),
             txbuf: VecDeque::new(),
         }
+    }
+
+    /// A host-initiated connection awaiting the guest's RESPONSE. `host` is the
+    /// accepted control stream (caller sets non-blocking), reused as the data
+    /// stream once established. Credit fields fill in via `confirm_established`.
+    pub fn new_local_init(guest_port: u32, host_port: u32, host: UnixStream) -> Connection {
+        Connection {
+            guest_port,
+            host_port,
+            host,
+            state: ConnState::LocalInit,
+            peer_buf_alloc: Wrapping(0),
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            fwd_cnt: Wrapping(0),
+            txbuf: VecDeque::new(),
+        }
+    }
+
+    /// Guest accepted: absorb its advertised credit and go Established.
+    pub fn confirm_established(&mut self, peer_buf_alloc: u32, peer_fwd_cnt: u32) {
+        self.peer_buf_alloc = Wrapping(peer_buf_alloc);
+        self.peer_fwd_cnt = Wrapping(peer_fwd_cnt);
+        self.state = ConnState::Established;
+    }
+
+    /// Write a raw control line (e.g. `OK <port>\n`) straight to the host stream.
+    /// Not payload: does not touch txbuf or fwd_cnt. Best-effort; the line is tiny.
+    pub fn write_host_raw(&mut self, data: &[u8]) {
+        let _ = self.host.write_all(data);
     }
 
     pub fn state(&self) -> ConnState {
@@ -77,6 +109,9 @@ impl Connection {
     /// Flush buffered guest->host bytes to the host stream (non-blocking). Advances
     /// fwd_cnt by what was written. Stops on WouldBlock; marks Closed on hard error.
     pub fn flush_tx(&mut self) {
+        if self.state != ConnState::Established {
+            return;
+        }
         while !self.txbuf.is_empty() {
             self.txbuf.make_contiguous();
             let (front, _) = self.txbuf.as_slices();
@@ -103,6 +138,9 @@ impl Connection {
     /// `Some(bytes)` (advancing rx_cnt), `None` if nothing available right now, or
     /// transitions to Closed on EOF/error (returns None).
     pub fn read_host(&mut self) -> Option<Vec<u8>> {
+        if self.state != ConnState::Established {
+            return None;
+        }
         let budget = std::cmp::min(self.peer_free() as usize, READ_CHUNK);
         if budget == 0 {
             return None;
@@ -177,5 +215,39 @@ mod tests {
         drop(app);
         assert!(conn.read_host().is_none());
         assert_eq!(conn.state(), ConnState::Closed);
+    }
+
+    #[test]
+    fn local_init_does_not_move_bytes_until_established() {
+        let (dev, mut app) = UnixStream::pair().unwrap();
+        dev.set_nonblocking(true).unwrap();
+        let mut conn = Connection::new_local_init(1024, 1100, dev);
+        assert_eq!(conn.state(), ConnState::LocalInit);
+
+        // While LocalInit: queued tx is held, host reads yield nothing.
+        conn.enqueue_tx(b"early");
+        let mut buf = [0u8; 5];
+        app.set_nonblocking(true).unwrap();
+        assert!(app.read(&mut buf).is_err(), "no bytes forwarded while LocalInit");
+        app.write_all(b"hi").unwrap();
+        assert!(conn.read_host().is_none(), "no host->guest read while LocalInit");
+
+        // After confirmation the buffered tx flushes and reads work.
+        conn.confirm_established(64 * 1024, 0);
+        assert_eq!(conn.state(), ConnState::Established);
+        conn.flush_tx();
+        let n = app.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"early");
+    }
+
+    #[test]
+    fn write_host_raw_sends_control_line() {
+        let (dev, mut app) = UnixStream::pair().unwrap();
+        dev.set_nonblocking(true).unwrap();
+        let mut conn = Connection::new_local_init(1024, 1100, dev);
+        conn.write_host_raw(b"OK 1100\n");
+        let mut buf = [0u8; 8];
+        app.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"OK 1100\n");
     }
 }

@@ -93,8 +93,10 @@ Ordered so the clone primitive gets proven and hardened before it gets dressed u
   (`docs/src/benchmarks/diff-snapshots.md` §3); remaining is the cross-platform comparison
   (ignition fast-restore vs Linux/KVM Firecracker) and a clean cold-base eager-vs-lazy A/B
   if a cold-start workload shows the page-in is on the critical path.
-- [ ] **virtio-vsock E2** — host→guest connections (E1 is guest→host only). Gates
-  control-plane designs that talk *into* clones.
+- [x] **virtio-vsock E2** — host→guest connections via Firecracker's hybrid control
+  protocol (`CONNECT <port>` → `OK <host_port>`); host control socket `{uds}`, guest
+  RESPONSE establishes the conn, bidirectional streaming reuses E1's `Connection`.
+  `docs/superpowers/specs/2026-06-15-virtio-vsock-e2-design.md`, `scripts/vsock_e2_test.py`.
 
 ---
 
@@ -179,8 +181,7 @@ real and strong today; the VMM *process* is not yet jailed.
 - [ ] **Seatbelt sandbox** — `sandbox_init` profile + separate uid (no Linux jailer/seccomp
   equivalent). **Gates any "untrusted / multi-tenant" positioning.** Until it lands, lead
   with "your own code, your own machine," never "secure multi-tenant hosting."
-- [ ] **virtio-vsock E2** (host→guest) — listed in near-term; repeated here because it gates
-  control-plane integration designs.
+- [x] **virtio-vsock E2** (host→guest) — shipped; unblocks control-plane integration designs.
 
 ---
 
@@ -228,7 +229,7 @@ real and strong today; the VMM *process* is not yet jailed.
 | Area | ignition | Firecracker | Notes |
 |---|---|---|---|
 | Boot, GIC, SMP, console | ✅ | ✅ | HVF-equivalent |
-| virtio blk/net/rng/balloon/vsock, RTC | ✅ | ✅ | vsock host→guest (E2) pending |
+| virtio blk/net/rng/balloon/vsock, RTC | ✅ | ✅ | vsock both directions (E1+E2) |
 | Snapshot/restore (multi-vCPU, net) | ✅ | ✅ | |
 | Lazy/CoW restore (immutable base) | ✅ `clonefile`+`MAP_SHARED` | ✅ `mmap MAP_PRIVATE` / UFFD | macOS has no `userfaultfd` |
 | Diff snapshots (dirty tracking) | ✅ `hv_vm_protect` write-fault | ✅ `KVM_GET_DIRTY_LOG` | no `KVM_GET_DIRTY_LOG` equivalent |

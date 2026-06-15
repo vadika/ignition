@@ -3,7 +3,8 @@
 //! for the guest (RESPONSE/RST/RW/CREDIT_UPDATE) in `rxq`.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::unix::io::RawFd;
+use std::io::Read;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -16,17 +17,34 @@ pub struct RxPacket {
     pub data: Vec<u8>,
 }
 
+/// A host control client whose `CONNECT <port>\n` line may arrive in pieces.
+struct ControlStream {
+    stream: UnixStream,
+    buf: Vec<u8>,
+}
+
 pub struct Muxer {
     uds_base: PathBuf,
     conns: HashMap<(u32, u32), Connection>, // (guest_port, host_port)
     rxq: VecDeque<RxPacket>,
     /// Connection keys carried over a snapshot; RST'd to the guest on the first service() after restore (host UDS peers no longer exist).
     pending_rst: Vec<(u32, u32)>,
+    /// Host control clients mid-CONNECT, keyed by fd.
+    ctrl_streams: HashMap<RawFd, ControlStream>,
+    /// Ephemeral host-port allocator for host-initiated connections.
+    next_host_port: u32,
 }
 
 impl Muxer {
     pub fn new(uds_base: PathBuf) -> Muxer {
-        Muxer { uds_base, conns: HashMap::new(), rxq: VecDeque::new(), pending_rst: Vec::new() }
+        Muxer {
+            uds_base,
+            conns: HashMap::new(),
+            rxq: VecDeque::new(),
+            pending_rst: Vec::new(),
+            ctrl_streams: HashMap::new(),
+            next_host_port: 1024,
+        }
     }
 
     /// Open connection keys for the snapshot (guest_port, host_port). Sorted so
@@ -65,6 +83,71 @@ impl Muxer {
     fn port_path(&self, host_port: u32) -> PathBuf {
         let name = self.uds_base.file_name().and_then(|s| s.to_str()).unwrap_or("vsock");
         self.uds_base.with_file_name(format!("{name}_{host_port}"))
+    }
+
+    /// Pick the next free ephemeral host port (skips ports held by live conns).
+    fn alloc_host_port(&mut self) -> u32 {
+        loop {
+            let p = self.next_host_port;
+            self.next_host_port = if p == u32::MAX { 1024 } else { p + 1 };
+            if !self.conns.keys().any(|&(_, h)| h == p) {
+                return p;
+            }
+        }
+    }
+
+    /// Register an accepted host control client (caller set it non-blocking).
+    pub fn accept_control(&mut self, stream: UnixStream) {
+        let fd = stream.as_raw_fd();
+        self.ctrl_streams.insert(fd, ControlStream { stream, buf: Vec::new() });
+    }
+
+    /// Read all pending control clients (non-blocking). On a complete
+    /// `CONNECT <port>\n`: allocate a host port, insert a LocalInit conn, queue a
+    /// REQUEST to the guest. Malformed lines or EOF drop the client silently.
+    pub fn poll_controls(&mut self) {
+        let fds: Vec<RawFd> = self.ctrl_streams.keys().copied().collect();
+        for fd in fds {
+            let mut done = false; // remove this client after the loop?
+            let mut promote_port: Option<u32> = None; // guest_port from a parsed CONNECT
+            {
+                let cs = self.ctrl_streams.get_mut(&fd).unwrap();
+                let mut tmp = [0u8; 256];
+                loop {
+                    match cs.stream.read(&mut tmp) {
+                        Ok(0) => { done = true; break; }
+                        Ok(n) => cs.buf.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => { done = true; break; }
+                    }
+                    if cs.buf.len() > 512 { done = true; break; } // runaway line guard
+                }
+                if let Some(pos) = cs.buf.iter().position(|&b| b == b'\n') {
+                    let line = String::from_utf8_lossy(&cs.buf[..pos]).trim().to_string();
+                    done = true; // the stream moves into a conn or is dropped
+                    if let Some(port_str) = line.strip_prefix("CONNECT ")
+                        && let Ok(guest_port) = port_str.trim().parse::<u32>()
+                    {
+                        promote_port = Some(guest_port);
+                    }
+                }
+            }
+            if done {
+                // Take the client out of the map; on a parsed CONNECT, move its
+                // stream straight into the new conn (no dup), else drop it.
+                let removed = self.ctrl_streams.remove(&fd);
+                if let (Some(guest_port), Some(cs)) = (promote_port, removed) {
+                    let host_port = self.alloc_host_port();
+                    cs.stream.set_nonblocking(true).ok();
+                    let conn = Connection::new_local_init(guest_port, host_port, cs.stream);
+                    self.conns.insert((guest_port, host_port), conn);
+                    // ctrl_hdr already sets src_cid=HOST, dst_cid=GUEST for the REQUEST.
+                    let hdr = Self::ctrl_hdr(OP_REQUEST, guest_port, host_port, 0);
+                    self.rxq.push_back(RxPacket { hdr, data: Vec::new() });
+                }
+            }
+        }
     }
 
     /// Drive one guest->host TX packet. `payload` is the RW data (empty otherwise).
@@ -116,7 +199,14 @@ impl Muxer {
                     self.queue(OP_RST, guest_port, host_port, 0);
                 }
             }
-            OP_RESPONSE => { /* host->guest connect ack — E2 */ }
+            OP_RESPONSE => {
+                if let Some(conn) = self.conns.get_mut(&key)
+                    && conn.state() == ConnState::LocalInit
+                {
+                    conn.confirm_established(hdr.buf_alloc, hdr.fwd_cnt);
+                    conn.write_host_raw(format!("OK {host_port}\n").as_bytes());
+                }
+            }
             _ => {
                 if self.conns.contains_key(&key) {
                     self.queue(OP_RST, guest_port, host_port, 0);
@@ -158,10 +248,15 @@ impl Muxer {
         }
     }
 
-    /// Host fds to poll (POLLIN). Buffered guest->host tx is flushed each service()
-    /// tick, so POLLOUT is not needed (and would busy-loop on idle-writable sockets).
+    /// Host fds to poll (POLLIN): live connection streams plus control clients
+    /// still parsing their CONNECT line. Buffered guest->host tx flushes each
+    /// service() tick, so POLLOUT is not needed.
     pub fn poll_set(&self) -> Vec<RawFd> {
-        self.conns.values().map(|c| c.raw_fd()).collect()
+        self.conns
+            .values()
+            .map(|c| c.raw_fd())
+            .chain(self.ctrl_streams.keys().copied())
+            .collect()
     }
 
     pub fn pop_rx(&mut self) -> Option<RxPacket> {
@@ -262,5 +357,118 @@ mod tests {
         mux.handle_tx(&req(1024, 5000), &[]);
         assert_eq!(mux.save_conns(), vec![(1024, 5000)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_line_queues_request_and_localinit_conn() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join("ign-vsock-e2-connect/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        client.write_all(b"CONNECT 1234\n").unwrap();
+        mux.poll_controls();
+
+        let pkt = mux.pop_rx().expect("REQUEST queued");
+        assert_eq!(pkt.hdr.op, OP_REQUEST);
+        assert_eq!(pkt.hdr.dst_port, 1234);
+        assert!(pkt.hdr.src_port >= 1024, "ephemeral host port allocated");
+        assert_eq!(mux.save_conns().len(), 1, "one LocalInit conn inserted");
+    }
+
+    #[test]
+    fn partial_connect_line_waits_for_newline() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join("ign-vsock-e2-partial/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+
+        client.write_all(b"CONN").unwrap();
+        mux.poll_controls();
+        assert!(mux.pop_rx().is_none(), "no packet before newline");
+
+        client.write_all(b"ECT 1234\n").unwrap();
+        mux.poll_controls();
+        let pkt = mux.pop_rx().expect("REQUEST after newline");
+        assert_eq!(pkt.hdr.op, OP_REQUEST);
+        assert_eq!(pkt.hdr.dst_port, 1234);
+        assert!(mux.pop_rx().is_none(), "exactly one REQUEST");
+    }
+
+    #[test]
+    fn malformed_control_line_drops_stream_no_packet() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join("ign-vsock-e2-bad/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        client.write_all(b"HELLO\n").unwrap();
+        mux.poll_controls();
+        assert!(mux.pop_rx().is_none(), "no packet for malformed line");
+        assert_eq!(mux.save_conns().len(), 0, "no conn created");
+    }
+
+    #[test]
+    fn two_connects_get_distinct_host_ports() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join("ign-vsock-e2-two/vsock");
+        let mut mux = Muxer::new(base);
+        let (h1, mut c1) = UnixStream::pair().unwrap();
+        let (h2, mut c2) = UnixStream::pair().unwrap();
+        h1.set_nonblocking(true).unwrap();
+        h2.set_nonblocking(true).unwrap();
+        mux.accept_control(h1);
+        mux.accept_control(h2);
+        c1.write_all(b"CONNECT 10\n").unwrap();
+        c2.write_all(b"CONNECT 20\n").unwrap();
+        mux.poll_controls();
+        let p1 = mux.pop_rx().unwrap();
+        let p2 = mux.pop_rx().unwrap();
+        assert_ne!(p1.hdr.src_port, p2.hdr.src_port, "distinct ephemeral host ports");
+    }
+
+    fn resp(guest: u32, host: u32) -> VsockHeader {
+        VsockHeader {
+            src_cid: VSOCK_GUEST_CID, dst_cid: VSOCK_CID_HOST, src_port: guest, dst_port: host,
+            len: 0, type_: VSOCK_TYPE_STREAM, op: OP_RESPONSE, flags: 0, buf_alloc: 64 * 1024, fwd_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn response_establishes_conn_and_writes_ok() {
+        use std::io::{Read, Write};
+        let base = std::env::temp_dir().join("ign-vsock-e2-ok/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        client.write_all(b"CONNECT 1234\n").unwrap();
+        mux.poll_controls();
+        let req = mux.pop_rx().unwrap();
+        let host_port = req.hdr.src_port;
+
+        // Guest accepts.
+        mux.handle_tx(&resp(1234, host_port), &[]);
+
+        let mut buf = [0u8; 32];
+        client.set_nonblocking(true).unwrap();
+        let n = client.read(&mut buf).unwrap();
+        let line = std::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(line, format!("OK {host_port}\n"));
+    }
+
+    #[test]
+    fn poll_set_includes_control_fds() {
+        let base = std::env::temp_dir().join("ign-vsock-e2-pollset/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, _client) = UnixStream::pair().unwrap();
+        let fd = { use std::os::unix::io::AsRawFd; host.as_raw_fd() };
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        assert!(mux.poll_set().contains(&fd), "control fd is polled");
     }
 }

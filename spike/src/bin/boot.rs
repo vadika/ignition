@@ -225,10 +225,35 @@ fn spawn_stdin_reader(
 
 /// Poll the vsock device's host connection fds and drive RX. A 200 ms timeout also
 /// re-checks for newly-connected fds (TX adds connections between ticks).
-fn spawn_vsock_reactor(vsock: Arc<Mutex<ignition_devices::virtio::mmio::VirtioMmio>>) {
-    use std::os::unix::io::RawFd;
+fn spawn_vsock_reactor(
+    vsock: Arc<Mutex<ignition_devices::virtio::mmio::VirtioMmio>>,
+    uds_base: Option<PathBuf>,
+) {
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixListener;
+
+    // Bind the control listener ({uds} itself) for host->guest (E2). Per-port
+    // paths {uds}_{port} remain the E1 guest->host listeners (host side).
+    let listener: Option<UnixListener> = uds_base.and_then(|base| {
+        let _ = std::fs::remove_file(&base); // clear a stale socket
+        match UnixListener::bind(&base) {
+            Ok(l) => {
+                l.set_nonblocking(true).ok();
+                Some(l)
+            }
+            Err(e) => {
+                eprintln!("vsock: control listener bind {base:?} failed: {e}");
+                None
+            }
+        }
+    });
+    let listener_fd: Option<RawFd> = listener.as_ref().map(|l| l.as_raw_fd());
+
     std::thread::spawn(move || loop {
-        let fds: Vec<RawFd> = { vsock.lock().unwrap().vsock_poll_set() };
+        let mut fds: Vec<RawFd> = { vsock.lock().unwrap().vsock_poll_set() };
+        if let Some(lfd) = listener_fd {
+            fds.push(lfd);
+        }
         if fds.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(200));
         } else {
@@ -239,6 +264,19 @@ fn spawn_vsock_reactor(vsock: Arc<Mutex<ignition_devices::virtio::mmio::VirtioMm
                 .map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
                 .collect();
             unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+        }
+        // Accept any new control clients (non-blocking) and hand them to the device.
+        if let Some(l) = &listener {
+            loop {
+                match l.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true).ok();
+                        vsock.lock().unwrap().vsock_accept_control(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
         }
         vsock.lock().unwrap().poll_vsock_rx();
     });
@@ -711,7 +749,7 @@ fn main() {
     let balloon_target = ctx.balloon_target.clone().expect("balloon target");
     let balloon = ctx.balloon.clone().expect("balloon device");
     if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
-        spawn_vsock_reactor(vsock_mmio);
+        spawn_vsock_reactor(vsock_mmio, ctx.vsock_uds.clone());
         eprintln!("virtio-vsock: enabled (host uds base {})",
             ctx.vsock_uds.as_ref().unwrap().display());
     }
@@ -1493,7 +1531,7 @@ fn run_restore(
     let balloon = ctx.balloon.clone()
         .ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
     if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
-        spawn_vsock_reactor(vsock_mmio);
+        spawn_vsock_reactor(vsock_mmio, ctx.vsock_uds.clone());
     }
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
