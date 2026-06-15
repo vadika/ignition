@@ -56,6 +56,11 @@ Two tracks carry the thesis beyond parity:
 - [x] virtio-vsock **E1** (guest→host streams over a host UDS). `docs/superpowers/specs/2026-06-13-virtio-vsock-e1-design.md`
 - [x] PL031 RTC + boot-timer. `docs/superpowers/specs/2026-06-13-rtc-pl031-design.md`
 
+### GUI display (software-rendered, snapshot-safe) — beyond FC parity
+- [x] **M2 structural** — `--gui` inverts the main thread to a `winit`+`softbuffer` event loop; VMM runs off-main; non-blocking coalescing `DisplaySink` seam. `docs/superpowers/specs/2026-06-15-gui-display-refactor-design.md`
+- [x] **M1 virtio-gpu 2D** — device id 16, controlq + cursorq, SG-correct `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`→present; the guest framebuffer console renders in the `--gui` window. No 3D/VIRGL; GPU-state snapshot is M5. `docs/superpowers/specs/2026-06-15-virtio-gpu-m1-design.md`, umbrella `docs/superpowers/specs/2026-06-15-gui-bringup-plan.md`
+- [ ] **M3 virtio-input**, **M4 compositor/app**, **M5 snapshot/clone with the GUI live** — remaining GUI milestones.
+
 ### Snapshot / restore — *the load-bearing feature*
 - [x] Snapshot/restore to a shell — resume from saved PC, idles ~0% CPU, responsive. `docs/src/features/snapshot-restore.md`
 - [x] Self-describing v2 format — `DeviceRecord` list, version guard.

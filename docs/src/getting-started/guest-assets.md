@@ -50,6 +50,10 @@ scp artemis2:'~/kbuild/out/Image' out/Image
 xxd -s 56 -l 4 out/Image
 ```
 
+For the GUI (virtio-gpu) milestone, the kernel config also needs `CONFIG_DRM=y`,
+`CONFIG_DRM_VIRTIO_GPU=y`, `CONFIG_DRM_FBDEV_EMULATION=y`, `CONFIG_FB=y`, and
+`CONFIG_FRAMEBUFFER_CONSOLE=y` so `/dev/dri/card0` + `/dev/fb0` appear and fbcon binds.
+
 ## Rebuild the fuzz initramfs
 
 The snapshot fuzzer (`boot --fuzz`) uses a separate minimal initramfs whose

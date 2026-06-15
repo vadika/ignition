@@ -106,9 +106,15 @@ the serial console keeps working alongside the window.
 Without `--gui` (the default), and for `--restore` and `--fuzz`, behavior is
 unchanged: no window opens and the vCPU loop runs on the main thread as before.
 
-This is the structural foundation for the 2D GUI bring-up. The `virtio-gpu` device
-that actually paints guest pixels into the window is a later milestone; today the
-window opens cleared to a solid color.
+A **virtio-gpu** device (2D only, device id 16) is added under `--gui`: the Linux
+`virtio_gpu` driver binds it, `/dev/dri/card0` and `/dev/fb0` appear, and the kernel
+framebuffer console renders live in the macOS window. `RESOURCE_FLUSH` from the guest
+presents the scanned-out resource through the display sink; `TRANSFER_TO_HOST_2D`
+copies guest pixels (scatter-gather correct) into a host buffer. No 3D/VIRGL/Venus, no
+display resize or hotplug, and snapshot of GPU state is a later milestone.
+
+The guest kernel must be built with `CONFIG_DRM`, `CONFIG_DRM_VIRTIO_GPU`,
+`CONFIG_DRM_FBDEV_EMULATION`, `CONFIG_FB`, and `CONFIG_FRAMEBUFFER_CONSOLE`.
 
 ## Related
 
