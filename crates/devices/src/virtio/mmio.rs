@@ -44,6 +44,16 @@ pub trait VirtioDevice: Send {
         false
     }
 
+    /// Fill the eventq (queue 0) with input events. Default: not an input device.
+    fn inject_input(
+        &mut self,
+        _eventq: &mut Virtqueue,
+        _mem: &GuestRam,
+        _events: &[crate::virtio::input::InputEvent],
+    ) -> bool {
+        false
+    }
+
     /// Reactor entry for async-RX devices (vsock): read host-side data and fill the
     /// RX virtqueue. Default: no-op.
     fn fill_rx(&mut self, _rx_vq: &mut Virtqueue, _mem: &GuestRam) -> bool {
@@ -264,6 +274,25 @@ impl VirtioMmio {
             return false;
         };
         let used = self.dev.inject_rx(vq, &self.mem, frame);
+        if used {
+            self.raise();
+        }
+        used
+    }
+
+    /// Inject host input events into the eventq (queue 0) and raise the IRQ if any
+    /// were delivered. Mirrors `inject_rx`; called from the GUI event-loop thread.
+    pub fn inject_input(&mut self, events: &[crate::virtio::input::InputEvent]) -> bool {
+        let Some(q) = self.queues.get_mut(0) else {
+            return false;
+        };
+        if q.ready == 0 {
+            return false;
+        }
+        let Some(vq) = q.vq.as_mut() else {
+            return false;
+        };
+        let used = self.dev.inject_input(vq, &self.mem, events);
         if used {
             self.raise();
         }

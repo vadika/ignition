@@ -43,7 +43,6 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
-    #[allow(dead_code)] // used in later tasks (inject path)
     fn to_le_bytes(self) -> [u8; 8] {
         let mut b = [0u8; 8];
         b[0..2].copy_from_slice(&self.etype.to_le_bytes());
@@ -75,6 +74,24 @@ impl VirtioInput {
 }
 
 impl VirtioInput {
+    /// Write one `InputEvent` per available eventq buffer; push each used (len 8).
+    /// Returns true if at least one event was delivered (caller raises the IRQ).
+    pub fn fill_events(&mut self, eventq: &mut Virtqueue, mem: &GuestRam, events: &[InputEvent]) -> bool {
+        let mut any = false;
+        for ev in events {
+            let Some(chain) = eventq.pop_avail(mem) else { break };
+            let target = chain.descriptors.iter().find(|d| d.writable && d.len >= 8);
+            if let Some(d) = target {
+                mem.write_slice(d.addr, &ev.to_le_bytes());
+                eventq.push_used(mem, chain.head, 8);
+                any = true;
+            } else {
+                eventq.push_used(mem, chain.head, 0);
+            }
+        }
+        any
+    }
+
     /// Build the 136-byte config window for the current (flavor, select, subsel):
     /// [select:1][subsel:1][size:1][reserved:5][union:128].
     fn config_image(&self) -> [u8; 136] {
@@ -178,6 +195,15 @@ impl VirtioDevice for VirtioInput {
             serviced = true;
         }
         serviced
+    }
+
+    fn inject_input(
+        &mut self,
+        eventq: &mut Virtqueue,
+        mem: &GuestRam,
+        events: &[InputEvent],
+    ) -> bool {
+        self.fill_events(eventq, mem, events)
     }
 }
 
@@ -295,5 +321,39 @@ mod tests {
         assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 1279);
         let (_size, u) = read_cfg(&tab, CFG_ABS_INFO, ABS_Y as u8);
         assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 799);
+    }
+
+    #[test]
+    fn inject_writes_evdev_triples() {
+        let mut kbd = VirtioInput::keyboard();
+        let mut backing = vec![0u8; 0x4000];
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        write_desc(&m, 0, BUF, 8, 2, 0);
+        write_desc(&m, 1, BUF + 0x40, 8, 2, 0);
+        m.write_u16(AVAIL + 2, 2);
+        m.write_u16(AVAIL + 4, 0);
+        m.write_u16(AVAIL + 6, 1);
+        let mut vq = Virtqueue::new(8, DESC, AVAIL, USED);
+        let evs = [
+            InputEvent { etype: EV_KEY, code: 30, value: 1 },
+            InputEvent { etype: EV_SYN, code: 0, value: 0 },
+        ];
+        assert!(kbd.fill_events(&mut vq, &m, &evs));
+        assert_eq!(m.read_u16(BUF).unwrap(), EV_KEY);
+        assert_eq!(m.read_u16(BUF + 2).unwrap(), 30);
+        assert_eq!(m.read_u32(BUF + 4).unwrap(), 1);
+        assert_eq!(m.read_u16(BUF + 0x40).unwrap(), EV_SYN);
+        assert_eq!(m.read_u16(USED + 2), Some(2));
+    }
+
+    #[test]
+    fn inject_with_no_buffers_returns_false() {
+        let mut kbd = VirtioInput::keyboard();
+        let mut backing = vec![0u8; 0x4000];
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        m.write_u16(AVAIL + 2, 0);
+        let mut vq = Virtqueue::new(8, DESC, AVAIL, USED);
+        let evs = [InputEvent { etype: EV_KEY, code: 30, value: 1 }];
+        assert!(!kbd.fill_events(&mut vq, &m, &evs));
     }
 }
