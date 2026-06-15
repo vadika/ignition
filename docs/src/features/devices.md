@@ -66,6 +66,9 @@ socat - UNIX-CONNECT:/tmp/ignition-vsock-e2 <<<'CONNECT 5000'
 Guest→host (E1) and host→guest (E2) coexist; per-port paths `{uds}_{port}` remain the
 E1 guest→host listeners.
 
+For a full worked example with `socat` servers and clients on both ends, see the
+[vsock round-trip use case](https://github.com/vadika/ignition/blob/main/examples/vsock-roundtrip.md).
+
 ## SMP
 
 `--smp N` (default 1, cap 8) boots a real aarch64 Linux with N vCPUs. Secondaries come
