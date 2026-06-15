@@ -66,6 +66,15 @@ impl VsockDevice {
         written as u32
     }
 
+    #[cfg(test)]
+    fn drain_controls_for_test(&mut self) {
+        self.muxer.poll_controls();
+    }
+    #[cfg(test)]
+    fn muxer_rx_pending_for_test(&self) -> bool {
+        self.muxer.rx_pending()
+    }
+
     fn fill_guest_rx(&mut self, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
         let mut delivered = false;
         while self.muxer.rx_pending() {
@@ -110,11 +119,15 @@ impl VirtioDevice for VsockDevice {
         }
     }
     fn fill_rx(&mut self, rx_vq: &mut Virtqueue, mem: &GuestRam) -> bool {
+        self.muxer.poll_controls();
         self.muxer.service();
         self.fill_guest_rx(rx_vq, mem)
     }
     fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
         self.muxer.poll_set()
+    }
+    fn vsock_accept_control(&mut self, stream: std::os::unix::net::UnixStream) {
+        self.muxer.accept_control(stream);
     }
     fn save(&self) -> serde_json::Value {
         serde_json::json!({ "conns": self.muxer.save_conns() })
@@ -146,6 +159,22 @@ mod tests {
         let mut c = [0u8; 8];
         dev.config_read(0, &mut c);
         assert_eq!(u64::from_le_bytes(c), 3);
+    }
+
+    #[test]
+    fn fill_rx_drains_control_connect_into_request() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        // A control client sends CONNECT; fill_rx (the reactor's per-tick entry)
+        // must parse it and queue a REQUEST for the guest, even with no RX chain.
+        let mut dev = VsockDevice::new(PathBuf::from("/tmp/ign-e2-fillrx/vsock"));
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        dev.vsock_accept_control(host);
+        client.write_all(b"CONNECT 4321\n").unwrap();
+
+        dev.drain_controls_for_test();
+        assert!(dev.muxer_rx_pending_for_test(), "REQUEST queued from CONNECT");
     }
 
     #[test]

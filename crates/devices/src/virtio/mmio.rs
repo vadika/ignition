@@ -55,6 +55,9 @@ pub trait VirtioDevice: Send {
         Vec::new()
     }
 
+    /// Accept a host control client for vsock E2 (no-op for non-vsock devices).
+    fn vsock_accept_control(&mut self, _stream: std::os::unix::net::UnixStream) {}
+
     /// Set link state for devices that have one (virtio-net). Default: no-op.
     fn set_link(&mut self, _up: bool) {}
 
@@ -283,6 +286,11 @@ impl VirtioMmio {
     /// vsock reactor support: the host fds the device wants polled (empty for others).
     pub fn vsock_poll_set(&self) -> Vec<std::os::unix::io::RawFd> {
         self.dev.vsock_poll_set()
+    }
+
+    /// vsock reactor support: hand an accepted host control client to the device.
+    pub fn vsock_accept_control(&mut self, stream: std::os::unix::net::UnixStream) {
+        self.dev.vsock_accept_control(stream);
     }
 
     fn raise(&mut self) {
