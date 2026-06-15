@@ -18,7 +18,6 @@ use winit::keyboard::KeyCode;
 /// Map a winit physical key to a Linux evdev key code. Covers the committed subset
 /// (letters, digits, common control/navigation/modifier/punctuation keys). Unmapped
 /// keys return None and are dropped.
-#[allow(dead_code)] // wired in Task 5
 pub fn map_keycode(kc: KeyCode) -> Option<u16> {
     use KeyCode::*;
     Some(match kc {
@@ -42,7 +41,6 @@ pub fn map_keycode(kc: KeyCode) -> Option<u16> {
 
 /// Scale a window-physical position to a guest absolute axis coordinate, clamped.
 /// `surf_w`/`surf_h` are the physical surface size; `gw`/`gh` the guest resolution.
-#[allow(dead_code)] // wired in Task 5
 pub fn scale_pos(px: f64, py: f64, surf_w: u32, surf_h: u32, gw: u32, gh: u32) -> (u32, u32) {
     let clamp = |v: f64, max: u32| -> u32 {
         if v <= 0.0 {
@@ -147,6 +145,10 @@ struct App {
     force_paint: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    keyboard: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    gw: u32,
+    gh: u32,
 }
 
 impl App {
@@ -222,6 +224,50 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                use ignition_devices::virtio::input::InputEvent;
+                use winit::keyboard::PhysicalKey;
+                if let PhysicalKey::Code(kc) = event.physical_key
+                    && let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard)
+                {
+                    let value = if event.state.is_pressed() { 1 } else { 0 };
+                    let evs = [
+                        InputEvent { etype: 1, code, value },       // EV_KEY
+                        InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
+                    ];
+                    let _ = kbd.lock().unwrap().inject_input(&evs);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                use ignition_devices::virtio::input::InputEvent;
+                if let Some(tab) = &self.tablet {
+                    let (x, y) = scale_pos(position.x, position.y, self.surf_w, self.surf_h, self.gw, self.gh);
+                    let evs = [
+                        InputEvent { etype: 3, code: 0, value: x }, // EV_ABS ABS_X
+                        InputEvent { etype: 3, code: 1, value: y }, // EV_ABS ABS_Y
+                        InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN
+                    ];
+                    let _ = tab.lock().unwrap().inject_input(&evs);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                use ignition_devices::virtio::input::InputEvent;
+                use winit::event::MouseButton;
+                if let Some(tab) = &self.tablet {
+                    let code = match button {
+                        MouseButton::Left => 0x110u16,
+                        MouseButton::Right => 0x111,
+                        MouseButton::Middle => 0x112,
+                        _ => return,
+                    };
+                    let value = if state.is_pressed() { 1 } else { 0 };
+                    let evs = [
+                        InputEvent { etype: 1, code, value }, // EV_KEY BTN_*
+                        InputEvent { etype: 0, code: 0, value: 0 },
+                    ];
+                    let _ = tab.lock().unwrap().inject_input(&evs);
+                }
+            }
             _ => {}
         }
     }
@@ -245,7 +291,17 @@ impl ApplicationHandler for App {
 /// Run the winit event loop on the calling thread (must be the main thread on
 /// macOS). Returns when the window closes or `done` is set. Drains `rx` and clears
 /// the window to a solid color each frame.
-pub fn run_event_loop(rx: Receiver<Frame>, done: Arc<AtomicBool>, width: u32, height: u32) {
+#[allow(clippy::too_many_arguments)]
+pub fn run_event_loop(
+    rx: Receiver<Frame>,
+    done: Arc<AtomicBool>,
+    width: u32,
+    height: u32,
+    keyboard: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    gw: u32,
+    gh: u32,
+) {
     let event_loop = EventLoop::new().expect("winit event loop");
     event_loop.set_control_flow(ControlFlow::WaitUntil(
         std::time::Instant::now() + Duration::from_millis(16),
@@ -261,6 +317,10 @@ pub fn run_event_loop(rx: Receiver<Frame>, done: Arc<AtomicBool>, width: u32, he
         force_paint: true,
         window: None,
         surface: None,
+        keyboard,
+        tablet,
+        gw,
+        gh,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("[gui] event loop exited with error: {e}");

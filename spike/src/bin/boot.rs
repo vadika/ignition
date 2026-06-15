@@ -1098,7 +1098,7 @@ fn main() {
                 Err(e) => eprintln!("\n[vcpu error: {e}]"),
             }
         });
-        display_sink::run_event_loop(rx, done, 1280, 800);
+        display_sink::run_event_loop(rx, done, 1280, 800, None, None, 1280, 800);
     } else {
         apply_or_exit(&sb_paths, no_sandbox);
 
