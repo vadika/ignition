@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[allow(unused_imports)] // DirtyRect and Frame used in later tasks (RESOURCE_FLUSH)
 use crate::display::{DirtyRect, DisplaySink, Frame};
 
 use super::guest_ram::GuestRam;
@@ -19,7 +18,6 @@ const GET_DISPLAY_INFO: u32 = 0x0100;
 const RESOURCE_CREATE_2D: u32 = 0x0101;
 const RESOURCE_UNREF: u32 = 0x0102;
 const SET_SCANOUT: u32 = 0x0103;
-#[allow(dead_code)] // used in later tasks
 const RESOURCE_FLUSH: u32 = 0x0104;
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
@@ -50,7 +48,6 @@ pub struct VirtioGpu {
     height: u32,
     resources: HashMap<u32, Resource2D>,
     scanout_res: u32, // resource id bound to scanout 0; 0 = none
-    #[allow(dead_code)] // used in later tasks
     sink: Box<dyn DisplaySink>,
 }
 
@@ -153,6 +150,7 @@ impl VirtioGpu {
             RESOURCE_DETACH_BACKING => self.detach_backing(body, fence, ctx),
             SET_SCANOUT => self.set_scanout(body, fence, ctx),
             TRANSFER_TO_HOST_2D => self.transfer_2d(body, mem, fence, ctx),
+            RESOURCE_FLUSH => self.flush(body, fence, ctx),
             _ => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
         }
     }
@@ -277,6 +275,32 @@ impl VirtioGpu {
             return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
         }
         self.scanout_res = resource_id;
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
+    }
+
+    fn flush(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 20 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let rx = le32(body, 0);
+        let ry = le32(body, 4);
+        let rw = le32(body, 8);
+        let rh = le32(body, 12);
+        let id = le32(body, 16);
+        // Only present the resource currently bound to the scanout (0 = none).
+        if id != 0 && id == self.scanout_res
+            && let Some(r) = self.resources.get(&id)
+        {
+            let frame = Frame {
+                scanout_id: 0,
+                width: r.width,
+                height: r.height,
+                stride: r.width * 4,
+                dirty: DirtyRect { x: rx, y: ry, w: rw, h: rh },
+                pixels: r.pixels.clone(),
+            };
+            self.sink.present(frame);
+        }
         resp_hdr(RESP_OK_NODATA, fence, ctx)
     }
 
@@ -555,6 +579,50 @@ mod tests {
         assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &t)), RESP_OK_NODATA);
         let host = gpu.resources.get(&1).unwrap().pixels.lock().unwrap();
         assert_eq!(&host[..], &pat[..], "fragmented backing must reassemble in order");
+    }
+
+    #[derive(Clone)]
+    struct CapSink(Arc<Mutex<Vec<Frame>>>);
+    impl DisplaySink for CapSink {
+        fn present(&self, frame: Frame) {
+            self.0.lock().unwrap().push(frame);
+        }
+    }
+
+    fn flush_req(id: u32) -> Vec<u8> {
+        let mut r = hdr(RESOURCE_FLUSH);
+        r.extend_from_slice(&[0u8; 16]); // rect {0,0,0,0}
+        r.extend_from_slice(&id.to_le_bytes());
+        r.extend_from_slice(&0u32.to_le_bytes()); // padding
+        r
+    }
+
+    #[test]
+    fn flush_of_scanned_out_resource_presents_one_frame() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut gpu = VirtioGpu::new(1280, 800, Box::new(CapSink(captured.clone())));
+        let mut backing = vec![0u8; 0x4000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 8, 4));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &flush_req(1))), RESP_OK_NODATA);
+        let frames = captured.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].scanout_id, 0);
+        assert_eq!((frames[0].width, frames[0].height), (8, 4));
+        assert_eq!(frames[0].stride, 8 * 4);
+        assert_eq!(frames[0].pixels.lock().unwrap().len(), 8 * 4 * 4);
+    }
+
+    #[test]
+    fn flush_of_non_scanned_out_resource_presents_nothing() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut gpu = VirtioGpu::new(1280, 800, Box::new(CapSink(captured.clone())));
+        let mut backing = vec![0u8; 0x4000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 8, 4));
+        submit(&mut gpu, &mut backing, &create_2d_req(2, 8, 4));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
+        submit(&mut gpu, &mut backing, &flush_req(2));
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     #[test]
