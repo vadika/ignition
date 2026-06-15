@@ -164,6 +164,13 @@ impl VirtioMmio {
             0x060 => self.interrupt_status,
             0x070 => self.status,
             0x0fc => 0,
+            // Shared-memory region query (SHM_SEL @ 0x0ac selects the region; LEN
+            // LOW/HIGH read back its size). We expose no shm regions, and the
+            // virtio-mmio contract signals "no such region" with a length of all
+            // ones (~0). Returning 0 here instead makes a querying driver (e.g.
+            // virtio-gpu's VIRTIO_GPU_SHM_ID_HOST_VISIBLE probe) believe a
+            // zero-length region exists and fail with -EBUSY. Report ~0.
+            0x0b0 | 0x0b4 => 0xFFFF_FFFF, // SHM_LEN_LOW / SHM_LEN_HIGH
             // Config space (>= 0x100) is byte-addressable and served in
             // BusDevice::read, not here (it handles non-32-bit widths).
             _ => 0,
@@ -481,6 +488,17 @@ mod tests {
         // DeviceFeatures high word advertises VERSION_1.
         wr(&mut d, 0x014, 1); // DeviceFeaturesSel = 1
         assert_eq!(rd(&mut d, 0x010), 1);
+    }
+
+    #[test]
+    fn shm_region_length_reads_all_ones() {
+        // virtio-mmio "no shared-memory region" sentinel: SHM_LEN_LOW/HIGH must
+        // read ~0, else a querying driver (virtio-gpu host-visible) fails -EBUSY.
+        let mut backing = vec![0u8; 0x1000];
+        let mut d = dev(&mut backing, Arc::new(FakeIrq::default()));
+        wr(&mut d, 0x0ac, 0); // SHM_SEL = region 0
+        assert_eq!(rd(&mut d, 0x0b0), 0xFFFF_FFFF); // SHM_LEN_LOW
+        assert_eq!(rd(&mut d, 0x0b4), 0xFFFF_FFFF); // SHM_LEN_HIGH
     }
 
     #[test]
