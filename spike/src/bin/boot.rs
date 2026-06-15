@@ -1021,6 +1021,11 @@ fn main() {
 
     // Jail the VMM before running guest code. Reads of kernel/rootfs are already
     // done or held; writes must stay open for snapshot-on-demand to the store.
+    // Note: on fresh boot the rootfs is opened read+write *before* this point
+    // (virtio-blk holds the fd), so guest disk writes keep working even though the
+    // rootfs path is not in `writable` — Seatbelt's file-write* check is at open()
+    // time, not on writes through an already-open fd. Nothing reopens it after apply.
+    // (Restore is unaffected: it writes a CoW instance copy under the store.)
     let sb_paths = ignition_sandbox::SandboxPaths {
         readable: [Some(PathBuf::from(&positionals[0])), positionals.get(1).map(PathBuf::from)]
             .into_iter().flatten().collect(),

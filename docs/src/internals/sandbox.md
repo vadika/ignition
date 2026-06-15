@@ -15,7 +15,11 @@ The profile is `(allow default)` then carves out the high-value escape surfaces:
 - **`process-exec*` / `process-fork`** — no spawning shells or helpers.
 - **Filesystem writes** — denied everywhere except `/private/var/folders` (the
   `temp_dir()` CoW-clone root) and the declared VM-state dirs (the `--store`, plus the
-  solutions/metrics/vsock paths in scope for the run mode).
+  solutions/metrics/vsock paths in scope for the run mode). On a fresh boot the rootfs
+  is *not* in the writable set, yet guest disk writes still work: virtio-blk opens the
+  rootfs read+write before the profile is applied, and Seatbelt checks `file-write*` at
+  `open()` time, not on writes through an already-open fd. (Restore writes a CoW
+  instance copy under the store, so it is covered directly.)
 - **Host secrets** — `~/.ssh`, `~/.aws`, `~/.gnupg`, and the Keychains are denied for
   both read and write. This block is emitted **last**, so it overrides a `--store`
   that a user points inside a secret dir (SBPL is last-match-wins).

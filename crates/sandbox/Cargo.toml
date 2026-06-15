@@ -9,5 +9,7 @@ license = "Apache-2.0"
 name = "ignition_sandbox"
 path = "src/lib.rs"
 
-[dependencies]
+# lib code calls sandbox_init via its own extern block (std::ffi types); libc is
+# only used by the forked-child integration tests.
+[dev-dependencies]
 libc = "0.2"
