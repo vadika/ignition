@@ -1,0 +1,13 @@
+[package]
+name = "ignition-sandbox"
+version = "0.0.0"
+edition = "2024"
+description = "Self-applied macOS Seatbelt (sandbox_init) profile for the ignition VMM process"
+license = "Apache-2.0"
+
+[lib]
+name = "ignition_sandbox"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
