@@ -153,7 +153,7 @@ impl VirtioGpu {
             RESOURCE_DETACH_BACKING => self.detach_backing(body, fence, ctx),
             SET_SCANOUT => self.set_scanout(body, fence, ctx),
             TRANSFER_TO_HOST_2D => self.transfer_2d(body, mem, fence, ctx),
-            RESOURCE_FLUSH => self.flush(body, fence, ctx),
+            RESOURCE_FLUSH => self.flush(body, mem, fence, ctx),
             _ => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
         }
     }
@@ -284,7 +284,7 @@ impl VirtioGpu {
         resp_hdr(RESP_OK_NODATA, fence, ctx)
     }
 
-    fn flush(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
+    fn flush(&mut self, body: &[u8], mem: &GuestRam, fence: u64, ctx: u32) -> Vec<u8> {
         if body.len() < 20 {
             return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
         }
@@ -297,6 +297,16 @@ impl VirtioGpu {
         if id != 0 && id == self.scanout_res
             && let Some(r) = self.resources.get(&id)
         {
+            // Re-read the whole scanout from its guest backing before presenting.
+            // The guest framebuffer IS the backing, and fbcon scrolls by memmove
+            // inside it without re-transferring the moved region; relying only on the
+            // small per-FLUSH TRANSFER rects would leave our host copy stale (garbled
+            // scrollback). A full read keeps the host buffer == the live framebuffer.
+            {
+                let mut host = r.pixels.lock().unwrap();
+                let len = host.len();
+                read_backing(&r.backing, mem, 0, &mut host[..len]);
+            }
             let frame = Frame {
                 scanout_id: 0,
                 width: r.width,
