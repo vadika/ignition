@@ -123,6 +123,17 @@ into the guest's eventq (the `inject_rx`-style path), so typing logs in at the c
 and the pointer tracks the macOS cursor 1:1 over the 1280x800 scanout. The guest kernel
 needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVDEV=y`.
 
+### Wayland compositor (cage + foot)
+
+With the GUI rootfs (`rootfs-gui.ext4`, built by `kimage/build/build-rootfs-gui.sh`),
+`--gui` runs a **cage** Wayland kiosk (wlroots **pixman** software renderer — no GL,
+matching the 2D-only virtio-gpu) hosting a **foot** terminal: an interactive
+software-rendered Linux desktop in the macOS window, driven by the virtio-input keyboard
++ pointer. The compositor path exercises fenced virtio-gpu commands — page-flips set
+`VIRTIO_GPU_FLAG_FENCE`, and the device signals the fence in its response so wlroots's
+render loop keeps producing frames (without it the compositor renders one frame then
+stalls). The minimal base rootfs has no compositor and uses the framebuffer console.
+
 ## Related
 
 - [Device model](../concepts/device-model.md) — the trait these devices implement.

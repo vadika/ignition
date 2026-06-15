@@ -60,7 +60,8 @@ Two tracks carry the thesis beyond parity:
 - [x] **M2 structural** — `--gui` inverts the main thread to a `winit`+`softbuffer` event loop; VMM runs off-main; non-blocking coalescing `DisplaySink` seam. `docs/superpowers/specs/2026-06-15-gui-display-refactor-design.md`
 - [x] **M1 virtio-gpu 2D** — device id 16, controlq + cursorq, SG-correct `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`→present; the guest framebuffer console renders in the `--gui` window. No 3D/VIRGL; GPU-state snapshot is M5. `docs/superpowers/specs/2026-06-15-virtio-gpu-m1-design.md`, umbrella `docs/superpowers/specs/2026-06-15-gui-bringup-plan.md`
 - [x] **M3 virtio-input** — keyboard + absolute tablet (device id 18); winit key/pointer/click events injected into the guest eventq; typing logs in, pointer tracks 1:1. `docs/superpowers/specs/2026-06-15-virtio-input-m3-design.md`
-- [ ] **M4 compositor/app**, **M5 snapshot/clone with the GUI live** — remaining GUI milestones.
+- [x] **M4 compositor/app** — cage (wlroots, pixman software renderer) + foot terminal, interactive over virtio-input, on a separate `rootfs-gui.ext4`. Surfaced the virtio-gpu fence-signal fix (wlroots page-flips are fenced). `docs/superpowers/specs/2026-06-15-gui-compositor-m4-design.md`
+- [ ] **M5 snapshot/clone with the GUI live** — final GUI milestone.
 
 ### Snapshot / restore — *the load-bearing feature*
 - [x] Snapshot/restore to a shell — resume from saved PC, idles ~0% CPU, responsive. `docs/src/features/snapshot-restore.md`

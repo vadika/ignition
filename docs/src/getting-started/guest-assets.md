@@ -53,6 +53,25 @@ xxd -s 56 -l 4 out/Image
 For the GUI (virtio-gpu) milestone, the kernel config also needs `CONFIG_DRM=y`,
 `CONFIG_DRM_VIRTIO_GPU=y`, `CONFIG_DRM_FBDEV_EMULATION=y`, `CONFIG_FB=y`, and
 `CONFIG_FRAMEBUFFER_CONSOLE=y` so `/dev/dri/card0` + `/dev/fb0` appear and fbcon binds.
+The GUI compositor (M4) also needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVDEV=y`.
+
+## Rebuild the GUI rootfs
+
+A separate, larger rootfs (`rootfs-gui.ext4`) adds a cage (wlroots, pixman software
+renderer) Wayland kiosk running foot, plus eudev/seatd/xkeyboard-config, for the `--gui`
+window. Built by its own script so the minimal base rootfs stays untouched.
+
+```bash
+cd kimage
+scp build/build-rootfs-gui.sh build/devmem.c artemis2:~/kbuild/
+ssh artemis2 'cd ~/kbuild && chmod +x build-rootfs-gui.sh && ./build-rootfs-gui.sh'
+scp artemis2:'~/kbuild/out/rootfs-gui.ext4' out/rootfs-gui.ext4
+```
+
+Run it: `boot --gui --mem 512 out/Image out/rootfs-gui.ext4`. The compositor takes the
+framebuffer VT and foot renders fullscreen; type to drive the shell, move the pointer for
+a software cursor. Without `--gui` (no `/dev/dri/card0`) the cage service no-ops and the
+guest falls back to the serial console.
 
 ## Rebuild the fuzz initramfs
 
