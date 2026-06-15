@@ -28,6 +28,9 @@ const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 
 const CTRL_HDR_LEN: usize = 24;
+/// Cap on a single 2D resource's host pixel buffer — bounds a guest-driven
+/// allocation. 256 MiB dwarfs any real scanout (1280x800x4 = 4 MiB).
+const MAX_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
 #[allow(dead_code)] // referenced by guests/tests; documents the only accepted format.
 const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 
@@ -196,11 +199,14 @@ impl VirtioGpu {
         let format = le32(body, 4);
         let w = le32(body, 8);
         let h = le32(body, 12);
-        // Reject a w*h*4 that overflows usize: a malformed guest must not wrap the
-        // size to a tiny buffer that later TRANSFER writes would overrun.
+        // Reject a w*h*4 that overflows usize (malformed guest must not wrap the
+        // size to a tiny buffer that later TRANSFER writes would overrun) AND reject
+        // a valid-but-absurd size so a guest can't drive a multi-GiB allocation that
+        // aborts the VMM. 256 MiB is far above any 1280x800-class scanout buffer.
         let Some(size) = (w as usize)
             .checked_mul(h as usize)
             .and_then(|n| n.checked_mul(4))
+            .filter(|&n| n <= MAX_RESOURCE_BYTES)
         else {
             return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
         };
@@ -502,6 +508,16 @@ mod tests {
         let mut backing = vec![0u8; 0x4000];
         // w*h*4 overflows usize → must be rejected, not wrapped to a tiny buffer.
         let resp = submit(&mut gpu, &mut backing, &create_2d_req(1, 0x8000_0000, 0x8000_0000));
+        assert_eq!(resp_type(&resp), RESP_ERR_UNSPEC);
+        assert!(!gpu.resources.contains_key(&1));
+    }
+
+    #[test]
+    fn create_2d_with_absurd_but_valid_size_errs() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        // 65536*65536*4 = 16 GiB: fits usize (no overflow) but exceeds the cap.
+        let resp = submit(&mut gpu, &mut backing, &create_2d_req(1, 0x10000, 0x10000));
         assert_eq!(resp_type(&resp), RESP_ERR_UNSPEC);
         assert!(!gpu.resources.contains_key(&1));
     }

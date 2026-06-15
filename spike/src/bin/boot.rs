@@ -1070,8 +1070,8 @@ fn main() {
         // GUI mode: the winit event loop must own the main thread on macOS, so the
         // VMM (sandbox apply + the vCPU join loop) moves to a spawned thread and the
         // event loop runs on main. `manager` is an Arc; cloning shares the VMM.
-        // `_sink` establishes the present seam (a later milestone hands it to the
-        // virtio-gpu device); for now no frames flow and the window clears to a color.
+        // The virtio-gpu device (registered in setup_devices under --gui) presents
+        // frames into `rx`; the event loop drains and blits them.
         // The `TermiosGuard` (`termios`) stays alive in this scope; when the event
         // loop returns and `main` returns, the guard's Drop restores the terminal and
         // the process exits (killing the VMM thread). Window close → loop exit; VMM

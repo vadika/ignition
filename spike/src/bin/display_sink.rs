@@ -1,8 +1,9 @@
 //! Host-side display sink for `--gui`: a `Send + Sync` proxy (`WindowSink`) that
 //! forwards frames over an mpsc channel without blocking, plus a `winit` +
 //! `softbuffer` event loop that owns the main thread, drains the channel,
-//! coalesces to the latest frame, and presents it. This milestone has no
-//! virtio-gpu device, so no frames arrive and the window clears to a solid color.
+//! coalesces to the latest frame, and blits it (B8G8R8A8 -> 0RGB). The virtio-gpu
+//! device feeds frames on RESOURCE_FLUSH; an idle tick with no frame clears to a
+//! solid color.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
