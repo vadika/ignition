@@ -140,8 +140,10 @@ narrowest interface (a buffer in memory), so there is no external interface to r
   on a Mac" into "snapshot-fuzz firmware/TEE parsers on Apple Silicon" — novel and
   publishable, squarely in ignition's wheelhouse (vtpmd, fTPM, OP-TEE).
 
-Honest threat-model note: until the Seatbelt sandbox lands (below), the fuzzing/sandbox
-framing is *"your own / your agent's code on your own machine,"* not secure multi-tenant.
+Honest threat-model note: the Seatbelt sandbox v1 (below) confines egress/exec/writes/secrets,
+but full read+mach confinement (deny-default) and the uid drop are still v2, so the
+fuzzing/sandbox framing stays *"your own / your agent's code on your own machine,"* not secure
+multi-tenant.
 
 ---
 
@@ -178,9 +180,11 @@ then add the next.
 These gate the claims the adoption track is allowed to make. The HVF *hardware* boundary is
 real and strong today; the VMM *process* is not yet jailed.
 
-- [ ] **Seatbelt sandbox** — `sandbox_init` profile + separate uid (no Linux jailer/seccomp
-  equivalent). **Gates any "untrusted / multi-tenant" positioning.** Until it lands, lead
-  with "your own code, your own machine," never "secure multi-tenant hosting."
+- [~] **Seatbelt sandbox** — **v1 shipped** (`docs/src/internals/sandbox.md`): self-applied
+  `sandbox_init` targeted-deny profile (no IP egress, no exec/fork, writes only to VM-state
+  dirs, host secrets denied), on by default, fail-closed, `--no-sandbox` opt-out; HVF + vmnet
+  intact. **Remaining (v2):** flip to `(deny default)` for full read+mach confinement, and the
+  separate-uid privilege drop. Until v2, lead with "your own code, your own machine."
 - [x] **virtio-vsock E2** (host→guest) — shipped; unblocks control-plane integration designs.
 
 ---
@@ -234,7 +238,7 @@ real and strong today; the VMM *process* is not yet jailed.
 | Lazy/CoW restore (immutable base) | ✅ `clonefile`+`MAP_SHARED` | ✅ `mmap MAP_PRIVATE` / UFFD | macOS has no `userfaultfd` |
 | Diff snapshots (dirty tracking) | ✅ `hv_vm_protect` write-fault | ✅ `KVM_GET_DIRTY_LOG` | no `KVM_GET_DIRTY_LOG` equivalent |
 | REST API | ❌ adoption track | ✅ | inherits FC's tool ecosystem |
-| Jailer / seccomp | ❌ planned (Seatbelt) | ✅ | gates untrusted-tenant claims |
+| Jailer / seccomp | 🟡 Seatbelt v1 (targeted-deny) | ✅ | full deny-default + uid drop = v2 |
 | MMDS, rate limiters, CPU templates, metrics | ❌ planned | ✅ | |
 | Nested virt (EL2) | ❌ research | n/a | HVF M3+/macOS 15+ bonus |
 
