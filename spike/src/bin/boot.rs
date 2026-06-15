@@ -349,6 +349,9 @@ struct DeviceContext {
     vsock_mmio: Option<Arc<Mutex<VirtioMmio>>>,
     net_mmio: Option<Arc<Mutex<VirtioMmio>>>,
     rx_stop: Option<std::sync::Arc<AtomicBool>>, // set when a net feeder is running
+    /// Display sink for the virtio-gpu device (Some only in --gui boot). Taken by
+    /// the gpu builder; None means no virtio-gpu device is added.
+    display_sink: Option<Box<dyn ignition_devices::display::DisplaySink>>,
 }
 
 impl DeviceContext {
@@ -477,6 +480,19 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
             move |irq| VirtioMmio::new("vsock", Box::new(vsock_dev), mem, irq))? {
             ctx.vsock_mmio = Some(h);
         }
+    }
+
+    // virtio-gpu — present only when a display sink was provided (--gui, boot).
+    // GUI restore is M5; the device is not added in restore mode.
+    if let (Mode::Boot, Some(sink)) = (&mode, ctx.display_sink.take()) {
+        let mem = ctx.guest_ram();
+        place::<VirtioMmio, _>(mgr, &mode, "virtio-gpu", layout::MMIO_WINDOW,
+            move |irq| VirtioMmio::new(
+                "virtio-gpu",
+                Box::new(ignition_devices::virtio::gpu::VirtioGpu::new(1280, 800, sink)),
+                mem,
+                irq,
+            ))?;
     }
 
     Ok(())
@@ -759,6 +775,17 @@ fn main() {
         layout::SPI_COUNT,
     );
 
+    // In --gui, create the display sink/receiver pair up front: the sink goes to the
+    // virtio-gpu device (via DeviceContext), the receiver to the event loop.
+    let mut gui_sink: Option<Box<dyn ignition_devices::display::DisplaySink>> = None;
+    let gui_rx = if gui {
+        let (sink, rx) = display_sink::WindowSink::new();
+        gui_sink = Some(Box::new(sink));
+        Some(rx)
+    } else {
+        None
+    };
+
     let mut ctx = DeviceContext {
         host: host as *mut u8,
         ram_size,
@@ -767,6 +794,7 @@ fn main() {
         net,
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
+        display_sink: gui_sink,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
     let serial = ctx.serial.clone().expect("serial device");
@@ -1049,7 +1077,7 @@ fn main() {
         // the process exits (killing the VMM thread). Window close → loop exit; VMM
         // done → loop exit.
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (_sink, rx) = display_sink::WindowSink::new();
+        let rx = gui_rx.expect("gui implies a receiver was created");
         let done_vmm = done.clone();
         let mgr = manager.clone();
         std::thread::spawn(move || {
@@ -1609,6 +1637,7 @@ fn run_restore(
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
+        display_sink: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
     let t_dev = restore_start.elapsed();
