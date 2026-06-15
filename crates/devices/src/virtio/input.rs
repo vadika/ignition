@@ -186,9 +186,15 @@ impl VirtioDevice for VirtioInput {
         2
     }
 
-    fn handle_notify(&mut self, _queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
-        // eventq (0) buffers are consumed by inject (Task 3); a stray kick releases
-        // them with len 0. statusq (1) chains are acked with len 0 as well.
+    fn handle_notify(&mut self, queue_idx: usize, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
+        // statusq (1): guest->device LED/repeat writes — ack and drop.
+        // eventq (0): device->guest. The guest posts writable buffers here for the
+        // device to FILL on input; a kick must NOT consume them. `inject` (fill_events)
+        // pops them when real input arrives. Releasing them here with len 0 makes the
+        // guest re-post in a tight loop (IRQ storm -> guest soft-lockup), so do nothing.
+        if queue_idx != 1 {
+            return false;
+        }
         let mut serviced = false;
         while let Some(chain) = vq.pop_avail(mem) {
             vq.push_used(mem, chain.head, 0);
@@ -248,6 +254,21 @@ mod tests {
         assert!(kbd.handle_notify(1, &mut vq, &m));
         assert_eq!(m.read_u32(USED + 4), Some(0));
         assert_eq!(m.read_u32(USED + 8), Some(0));
+    }
+
+    #[test]
+    fn eventq_kick_does_not_consume_buffers() {
+        // A notify on the eventq (queue 0) must leave the guest's posted buffers in
+        // the avail ring for `inject` to fill — consuming them here storms the guest.
+        let mut kbd = VirtioInput::keyboard();
+        let mut backing = vec![0u8; 0x4000];
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        write_desc(&m, 0, BUF, 8, 2, 0); // a writable eventq buffer
+        m.write_u16(AVAIL + 2, 1);
+        m.write_u16(AVAIL + 4, 0);
+        let mut vq = Virtqueue::new(8, DESC, AVAIL, USED);
+        assert!(!kbd.handle_notify(0, &mut vq, &m)); // no-op
+        assert_eq!(m.read_u16(USED + 2), Some(0)); // used.idx still 0 (nothing consumed)
     }
 
     #[test]
