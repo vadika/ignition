@@ -17,6 +17,7 @@ ignition_vmm = { package = "ignition-vmm", path = "../crates/vmm" }
 ignition_devices = { package = "ignition-devices", path = "../crates/devices" }
 ignition_arch = { package = "ignition-arch", path = "../crates/arch" }
 ignition-vmnet = { path = "../crates/vmnet" }
+ignition-sandbox = { path = "../crates/sandbox" }
 
 [dev-dependencies]
 serde_json = "1"

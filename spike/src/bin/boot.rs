@@ -223,6 +223,21 @@ fn spawn_stdin_reader(
     });
 }
 
+/// Apply the Seatbelt sandbox, or exit. Fail-closed: an apply error terminates
+/// the process (a security gate must not silently degrade open). `--no-sandbox`
+/// is the one explicit, loudly-logged way to run unconfined.
+fn apply_or_exit(paths: &ignition_sandbox::SandboxPaths, no_sandbox: bool) {
+    if no_sandbox {
+        eprintln!("WARN: sandbox disabled (--no-sandbox) — VMM runs unconfined");
+        return;
+    }
+    if let Err(e) = ignition_sandbox::apply(paths) {
+        eprintln!("FATAL: failed to apply sandbox: {e}");
+        process::exit(1);
+    }
+    eprintln!("sandbox: applied (targeted-deny v1)");
+}
+
 /// Poll the vsock device's host connection fds and drive RX. A 200 ms timeout also
 /// re-checks for newly-connected fds (TX adds connections between ticks).
 fn spawn_vsock_reactor(
@@ -542,6 +557,7 @@ fn main() {
     let mut store: PathBuf = PathBuf::from("./vmstore");
     let mut name: Option<String> = None;
     let mut force = false;
+    let mut no_sandbox = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
     // Fuzz mode (Task 8): boot a single-vCPU guest from an initramfs and run the
@@ -619,6 +635,9 @@ fn main() {
             "--force" => {
                 force = true;
             }
+            "--no-sandbox" => {
+                no_sandbox = true;
+            }
             "--track-dirty" => {
                 track_dirty = true;
             }
@@ -650,7 +669,7 @@ fn main() {
             process::exit(2);
         });
         if positionals.is_empty() {
-            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--metrics <path>] [--mem MiB] <kernel-Image>", args[0]);
+            eprintln!("usage: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--metrics <path>] [--mem MiB] [--no-sandbox] <kernel-Image>", args[0]);
             process::exit(2);
         }
         let kernel_path = PathBuf::from(&positionals[0]);
@@ -667,7 +686,7 @@ fn main() {
             },
             None => None,
         };
-        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size, reset_mode, metrics_path) {
+        match run_fuzz_mode(&kernel_path, &initramfs, &solutions, seed_path.as_deref(), replay, window_size, ram_size, reset_mode, metrics_path, no_sandbox) {
             Ok(()) => eprintln!("\n[fuzz exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[fuzz error: {e}]");
@@ -679,7 +698,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
-        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds) {
+        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -690,8 +709,8 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] <kernel-Image> [rootfs-disk]", args[0]);
-        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] <kernel-Image>", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] [--no-sandbox] <kernel-Image>", args[0]);
         process::exit(2);
     }
     // Capture the start instant as early as possible in the fresh-boot path so
@@ -1000,6 +1019,22 @@ fn main() {
     eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b), {smp} vCPU(s) ---");
     eprintln!("--- snapshots will be saved as '{write_name}' under {} ---", store.display());
 
+    // Jail the VMM before running guest code. Reads of kernel/rootfs are already
+    // done or held; writes must stay open for snapshot-on-demand to the store.
+    // Note: on fresh boot the rootfs is opened read+write *before* this point
+    // (virtio-blk holds the fd), so guest disk writes keep working even though the
+    // rootfs path is not in `writable` — Seatbelt's file-write* check is at open()
+    // time, not on writes through an already-open fd. Nothing reopens it after apply.
+    // (Restore is unaffected: it writes a CoW instance copy under the store.)
+    let sb_paths = ignition_sandbox::SandboxPaths {
+        readable: [Some(PathBuf::from(&positionals[0])), positionals.get(1).map(PathBuf::from)]
+            .into_iter().flatten().collect(),
+        writable: [Some(store.clone()), Some(std::env::temp_dir()),
+                   vsock_uds.as_ref().and_then(|u| u.parent().map(PathBuf::from))]
+            .into_iter().flatten().collect(),
+    };
+    apply_or_exit(&sb_paths, no_sandbox);
+
     // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
     match manager.run(entry, fdt_addr) {
         Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
@@ -1053,6 +1088,7 @@ fn run_fuzz_mode(
     ram_size: u64,
     reset_mode: ResetMode,
     metrics_path: Option<PathBuf>,
+    no_sandbox: bool,
 ) -> io::Result<()> {
     // Fuzz mode has no guest console to absorb Ctrl-C, so install a SIGINT/SIGTERM
     // handler that flips the global stop flag; the fuzz loop polls it and exits
@@ -1289,6 +1325,9 @@ fn run_fuzz_mode(
         None
     };
 
+    // Capture the metrics parent dir before `metrics_path` is moved into the
+    // controller below; the sandbox is applied LATE (right before run_fuzz).
+    let metrics_parent = metrics_path.as_ref().and_then(|m| m.parent().map(PathBuf::from));
     let controller = FuzzController::new(
         (host as *mut u8, ram_size as usize),
         (win_host as *mut u8, window_size as usize),
@@ -1313,6 +1352,14 @@ fn run_fuzz_mode(
             tracker: tracker.clone(),
         });
     }
+    let sb_paths = ignition_sandbox::SandboxPaths {
+        readable: vec![kernel_path.to_path_buf(), initramfs_path.to_path_buf()],
+        writable: [Some(solutions_dir.to_path_buf()), Some(std::env::temp_dir()),
+                   metrics_parent]
+            .into_iter().flatten().collect(),
+    };
+    apply_or_exit(&sb_paths, no_sandbox);
+
     manager
         .run_fuzz(
             entry,
@@ -1339,6 +1386,7 @@ fn run_restore(
     force: bool,
     track_dirty: bool,
     vsock_uds: Option<PathBuf>,
+    no_sandbox: bool,
 ) -> io::Result<()> {
     // Host-side restore clock: chain resolution + mmap + diff overlay + GIC/device/vCPU
     // state restore, up to handing the guest to the run loop. The boot-timer device
@@ -1749,6 +1797,14 @@ fn run_restore(
     );
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
+
+    let sb_paths = ignition_sandbox::SandboxPaths {
+        readable: vec![store.to_path_buf()],
+        writable: [Some(store.to_path_buf()), Some(std::env::temp_dir()),
+                   vsock_uds.as_ref().and_then(|u| u.parent().map(PathBuf::from))]
+            .into_iter().flatten().collect(),
+    };
+    apply_or_exit(&sb_paths, no_sandbox);
 
     // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
     let run_result = manager.run_restored(snap.vcpus, Some(gic_blob));

@@ -29,6 +29,7 @@
 - [HVF and Firecracker map](internals/hvf-firecracker-map.md)
 - [Design decisions](internals/design-decisions.md)
 - [Validation spike](internals/validation-spike.md)
+- [Seatbelt sandbox](internals/sandbox.md)
 
 # Appendix
 - [Specs & plans (agentic reference)](appendix/specs-and-plans.md)
