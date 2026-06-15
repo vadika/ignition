@@ -54,26 +54,29 @@ pub fn coalesce(rx: &Receiver<Frame>) -> Option<Frame> {
     latest
 }
 
-/// Blit a B8G8R8A8 frame into a softbuffer `0RGB` u32 buffer (`surf_w`×`surf_h`),
-/// honoring the frame's dirty rect (clamped to both surfaces). Source pixel bytes
-/// are B,G,R,A; the destination u32 is `(R<<16)|(G<<8)|B`.
+/// Blit a B8G8R8A8 frame into a softbuffer `0RGB` u32 buffer sized `surf_w`×`surf_h`
+/// (the window's PHYSICAL pixels), scaling the guest image to fill the surface with
+/// nearest-neighbor sampling. On a Retina display the surface is larger than the
+/// guest mode (e.g. 2560×1600 vs 1280×800), so a 1:1 copy would fill only a corner;
+/// scaling fills the whole window. Source pixel bytes are B,G,R,A; the destination
+/// u32 is `(R<<16)|(G<<8)|B`.
 pub fn blit_frame(buf: &mut [u32], surf_w: u32, surf_h: u32, frame: &Frame) {
+    if surf_w == 0 || surf_h == 0 || frame.width == 0 || frame.height == 0 {
+        return;
+    }
     let src = frame.pixels.lock().unwrap();
-    let x0 = frame.dirty.x.min(surf_w);
-    let y0 = frame.dirty.y.min(surf_h);
-    let x1 = frame.dirty.x.saturating_add(frame.dirty.w).min(surf_w).min(frame.width);
-    let y1 = frame.dirty.y.saturating_add(frame.dirty.h).min(surf_h).min(frame.height);
-    // Index math in usize: frame.width is guest-sized, so `y * frame.width` can
-    // exceed u32 even when the dirty rect is clamped to the small window.
-    let (fw, sw) = (frame.width as usize, surf_w as usize);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let s = ((y as usize) * fw + x as usize) * 4;
+    let (fw, fh) = (frame.width as usize, frame.height as usize);
+    let (sw, sh) = (surf_w as usize, surf_h as usize);
+    for dy in 0..sh {
+        let sy = dy * fh / sh; // nearest-neighbor source row
+        for dx in 0..sw {
+            let sx = dx * fw / sw; // nearest-neighbor source column
+            let s = (sy * fw + sx) * 4;
             if s + 3 >= src.len() {
                 continue;
             }
             let (b, g, r) = (src[s] as u32, src[s + 1] as u32, src[s + 2] as u32);
-            let d = (y as usize) * sw + x as usize;
+            let d = dy * sw + dx;
             if d < buf.len() {
                 buf[d] = (r << 16) | (g << 8) | b;
             }
@@ -83,23 +86,63 @@ pub fn blit_frame(buf: &mut [u32], surf_w: u32, surf_h: u32, frame: &Frame) {
 
 /// winit application state: owns the window + softbuffer surface (main thread only).
 struct App {
+    /// Requested window size in logical points (the physical surface may be larger
+    /// on a HiDPI display; `surf_w`/`surf_h` track the actual physical size).
     width: u32,
     height: u32,
+    /// Physical surface size (window inner_size in pixels) the buffer is blitted to.
+    surf_w: u32,
+    surf_h: u32,
     rx: Receiver<Frame>,
     done: Arc<AtomicBool>,
+    /// The most recent presented frame, re-blitted on idle redraws so the window
+    /// holds its image between guest flushes instead of flashing the clear color.
+    last: Option<Frame>,
+    /// Force a repaint even with no new frame (first paint, resize). Otherwise an
+    /// idle redraw with nothing new skips the present and the window keeps its image.
+    force_paint: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
 
 impl App {
+    /// Resize the softbuffer surface to the window's current physical size.
+    fn resize_surface(&mut self) {
+        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
+            return;
+        };
+        let size = window.inner_size();
+        self.surf_w = size.width.max(1);
+        self.surf_h = size.height.max(1);
+        let _ = surface.resize(
+            NonZeroU32::new(self.surf_w).unwrap_or(NonZeroU32::MIN),
+            NonZeroU32::new(self.surf_h).unwrap_or(NonZeroU32::MIN),
+        );
+    }
+
     fn redraw(&mut self) {
+        // Take any newly presented frame; if none arrived, keep showing the last one.
+        let got_new = if let Some(frame) = coalesce(&self.rx) {
+            self.last = Some(frame);
+            true
+        } else {
+            false
+        };
+        // Nothing changed since the last present: leave the window as-is (no blink,
+        // no wasted full-surface rescale).
+        if !got_new && !self.force_paint {
+            return;
+        }
+        self.force_paint = false;
+        let (surf_w, surf_h) = (self.surf_w, self.surf_h);
         let Some(surface) = self.surface.as_mut() else { return };
         let mut buf = match surface.buffer_mut() {
             Ok(b) => b,
             Err(_) => return,
         };
-        match coalesce(&self.rx) {
-            Some(frame) => blit_frame(&mut buf, self.width, self.height, &frame),
+        match &self.last {
+            Some(frame) => blit_frame(&mut buf, surf_w, surf_h, frame),
+            // Nothing has ever been presented: clear to the slate color once.
             None => buf.fill(CLEAR_0RGB),
         }
         let _ = buf.present();
@@ -114,22 +157,26 @@ impl ApplicationHandler for App {
             .with_resizable(false);
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let mut surface =
+        let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
-        surface
-            .resize(
-                NonZeroU32::new(self.width).unwrap_or(NonZeroU32::MIN),
-                NonZeroU32::new(self.height).unwrap_or(NonZeroU32::MIN),
-            )
-            .expect("surface resize");
         self.window = Some(window.clone());
         self.surface = Some(surface);
+        // Size the surface to the window's PHYSICAL pixels (may be > logical on HiDPI).
+        self.resize_surface();
+        self.force_paint = true;
         window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => {
+                self.resize_surface();
+                self.force_paint = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -162,8 +209,12 @@ pub fn run_event_loop(rx: Receiver<Frame>, done: Arc<AtomicBool>, width: u32, he
     let mut app = App {
         width,
         height,
+        surf_w: width,
+        surf_h: height,
         rx,
         done,
+        last: None,
+        force_paint: true,
         window: None,
         surface: None,
     };
