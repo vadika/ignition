@@ -31,6 +31,10 @@ docker run --rm \
     #   VIRTIO_BALLOON  - guest memory balloon
     #   VIRTIO_VSOCKETS - guest vsock transport (what Firecracker needs)
     #   VHOST_VSOCK     - host-side vsock; inert in a guest image, added on request
+    #   DRM/DRM_VIRTIO_GPU/DRM_FBDEV_EMULATION/FB/FRAMEBUFFER_CONSOLE - 2D GUI
+    #     (virtio-gpu, --gui): the virtio_gpu driver binds, /dev/dri/card0 +
+    #     /dev/fb0 appear, the framebuffer console renders in the window.
+    #   VIRTIO_INPUT - keyboard/pointer for the GUI (M3); harmless built-in now.
     ./scripts/config \
       --enable VIRTIO_BALLOON \
       --enable VSOCKETS \
@@ -39,12 +43,19 @@ docker run --rm \
       --enable VHOST_VSOCK \
       --enable DEVMEM \
       --disable STRICT_DEVMEM \
-      --disable IO_STRICT_DEVMEM
+      --disable IO_STRICT_DEVMEM \
+      --enable DRM \
+      --enable DRM_VIRTIO_GPU \
+      --enable DRM_FBDEV_EMULATION \
+      --enable FB \
+      --enable FRAMEBUFFER_CONSOLE \
+      --enable VIRTIO_INPUT
 
     export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
     make olddefconfig
     echo "=== requested configs after olddefconfig ==="
     grep -E "CONFIG_(VIRTIO_BALLOON|VSOCKETS|VIRTIO_VSOCKETS|VHOST|VHOST_VSOCK|DEVMEM|STRICT_DEVMEM)=" .config || true
+    grep -E "CONFIG_(DRM|DRM_VIRTIO_GPU|DRM_FBDEV_EMULATION|FB|FRAMEBUFFER_CONSOLE|VIRTIO_INPUT)=" .config || true
     grep -E "CONFIG_STRICT_DEVMEM" .config || echo "CONFIG_STRICT_DEVMEM not set (good)"
     make -j"$(nproc)" Image
 
