@@ -95,9 +95,116 @@ fn secret_subpaths() -> Vec<String> {
     ]
 }
 
+use std::ffi::{c_char, c_int, CString};
+
+// macOS Seatbelt. Deprecated, no SDK header, but the symbols are live in
+// libSystem (auto-linked). flags = 0 => `profile` is a literal SBPL string.
+unsafe extern "C" {
+    fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
+    fn sandbox_free_error(errorbuf: *mut c_char);
+}
+
+/// Render the v1 profile for `paths` and apply it to the current process.
+/// Process-wide and irreversible; call once, late in startup. Every thread is
+/// affected, including those already spawned.
+pub fn apply(paths: &SandboxPaths) -> Result<(), SandboxError> {
+    let mut canonical = SandboxPaths { readable: Vec::new(), writable: Vec::new() };
+    for w in &paths.writable {
+        std::fs::create_dir_all(w).map_err(SandboxError::Path)?;
+        canonical.writable.push(std::fs::canonicalize(w).map_err(SandboxError::Path)?);
+    }
+    for r in &paths.readable {
+        canonical.readable.push(std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()));
+    }
+
+    let profile = build_profile(&canonical);
+    let c_profile = CString::new(profile).map_err(|e| {
+        SandboxError::Path(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    })?;
+
+    let mut err: *mut c_char = std::ptr::null_mut();
+    // SAFETY: c_profile is a valid NUL-terminated string for the call; err is a
+    // valid out-pointer; on failure we read then free it via sandbox_free_error.
+    let rc = unsafe { sandbox_init(c_profile.as_ptr(), 0, &mut err) };
+    if rc != 0 {
+        let msg = if err.is_null() {
+            "sandbox_init failed (no error string)".to_string()
+        } else {
+            let s = unsafe { std::ffi::CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sandbox_free_error(err) };
+            s
+        };
+        return Err(SandboxError::Apply(msg));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `body` in a forked child after applying `paths`. Returns true iff the
+    /// child exited 0. The parent stays unsandboxed (sandbox_init is irreversible).
+    #[cfg(target_os = "macos")]
+    fn in_sandboxed_child(paths: &SandboxPaths, body: impl FnOnce() -> bool) -> bool {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let ok = apply(paths).is_ok() && body();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    #[cfg(target_os = "macos")]
+    fn minimal_paths() -> SandboxPaths {
+        SandboxPaths { readable: vec![], writable: vec![std::env::temp_dir()] }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn apply_succeeds() {
+        assert!(in_sandboxed_child(&minimal_paths(), || true));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn egress_is_denied_after_apply() {
+        let ok = in_sandboxed_child(&minimal_paths(), || {
+            use std::net::TcpStream;
+            use std::time::Duration;
+            match TcpStream::connect_timeout(
+                &"1.1.1.1:80".parse().unwrap(),
+                Duration::from_secs(2),
+            ) {
+                Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+                Ok(_) => false,
+            }
+        });
+        assert!(ok, "TcpStream::connect must be PermissionDenied under the sandbox");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn write_jail_after_apply() {
+        let ok = in_sandboxed_child(&minimal_paths(), || {
+            let tmp = std::env::temp_dir().join("ign-sbtest-allowed");
+            let allowed = std::fs::File::create(&tmp).is_ok();
+            let _ = std::fs::remove_file(&tmp);
+            let home = std::env::var("HOME").unwrap();
+            let denied = std::fs::File::create(format!("{home}/ign-sbtest-denied"));
+            let denied_blocked = matches!(
+                denied.as_ref().map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::PermissionDenied)
+            );
+            allowed && denied_blocked
+        });
+        assert!(ok, "temp write allowed, $HOME write denied");
+    }
 
     #[test]
     fn profile_contains_denies_and_writable_subpaths() {
