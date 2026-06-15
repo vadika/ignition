@@ -25,17 +25,23 @@ docker run --platform linux/arm64 --name fcroot_gui_build \
   ln -sf agetty /etc/init.d/agetty.ttyS0
   echo ttyS0 > /etc/securetty
   rc-update add agetty.ttyS0 default
-  ln -sf agetty /etc/init.d/agetty.tty1
-  echo tty1 >> /etc/securetty
-  rc-update add agetty.tty1 default
+  # NOTE: no agetty on tty1 in the GUI rootfs — cage owns the framebuffer VT, and a
+  # getty there competes with cage for the keyboard (events go to the VT, not
+  # libinput). Serial (ttyS0) stays as the debug login. Alpine ALSO spawns gettys on
+  # tty1..tty6 from busybox /etc/inittab; strip those VT gettys so none grabs the
+  # keyboard from cage (ttyS0 line, if present, is kept — [0-9] does not match "S").
+  sed -i "/^tty[0-9].*getty/d" /etc/inittab
   rc-update add devfs boot
   rc-update add procfs boot
   rc-update add sysfs boot
 
   passwd -d root || true
 
-  grep -q "ln -sf /dev/ttyS0 /dev/tty" /etc/inittab ||
-    printf "::sysinit:/bin/ln -sf /dev/ttyS0 /dev/tty\n" >> /etc/inittab
+  # NOTE: the base rootfs symlinks /dev/tty -> /dev/ttyS0 for serial-console programs.
+  # The GUI rootfs MUST NOT: foot runs its app on a pty and the app opens /dev/tty as
+  # its controlling terminal; if /dev/tty is a symlink to the serial port the app gets
+  # the wrong device (the cannot-access-tty error, no echo). Leave /dev/tty as the real
+  # kernel ctty node (c 5 0) from devtmpfs so it resolves to foots pty.
 
   mkdir -p /etc/network /etc/local.d
   printf "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n" > /etc/network/interfaces
@@ -50,7 +56,19 @@ docker run --platform linux/arm64 --name fcroot_gui_build \
   echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories
   apk update
   # pixman software path: no mesa/GL. cage pulls wlroots/libinput/wayland/pixman/libdrm.
-  apk add --no-cache cage foot seatd font-terminus
+  # libinput-tools: `libinput list-devices` / `debug-events` for bring-up diagnosis.
+  # xkeyboard-config: XKB layout data — without it libxkbcommon compiles an empty
+  # keymap, so cage focuses the window but keystrokes map to nothing (verified: key
+  # events reach the guest, but no characters appear until this is installed).
+  apk add --no-cache cage foot seatd font-terminus libinput-tools xkeyboard-config wev
+
+  # udev (eudev): wlroots libinput discovers /dev/input/event* via udev. Without it
+  # cage aborts ("libinput initialization failed, no input devices"). Run at sysinit
+  # so input + DRM nodes are enumerated before cage starts.
+  apk add --no-cache eudev
+  rc-update add udev sysinit
+  rc-update add udev-trigger sysinit
+  rc-update add udev-settle sysinit
 
   # seat daemon for cage to open DRM + input devices.
   rc-update add seatd default
@@ -66,6 +84,12 @@ export XDG_RUNTIME_DIR=/run/user/0
 export WLR_RENDERER=pixman
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 export XKB_DEFAULT_LAYOUT=us
+# NOTE: deliberately NOT setting WLR_LIBINPUT_NO_DEVICES — that flag makes wlroots
+# skip enumerating the already-present (cold-boot) input devices and only listen for
+# new hotplug uevents, which never fire for devices present before cage starts, so
+# cage ends up with no keyboard (no wl_keyboard -> the app never gets focus). Instead
+# start_pre waits until libinput can actually see the keyboard, then cage enumerates
+# it normally at startup.
 
 command="/usr/bin/cage"
 command_args="-- /usr/bin/foot"
@@ -76,7 +100,7 @@ error_log="/var/log/cage.log"
 
 depend() {
     need seatd
-    after udev devfs
+    after udev-settle udev-trigger udev devfs
 }
 
 start_pre() {
@@ -86,6 +110,17 @@ start_pre() {
     fi
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 0700 "$XDG_RUNTIME_DIR"
+    # Wait until libinput can enumerate the keyboard (udev has finished tagging
+    # /dev/input/event*). cage enumerates input once at startup; if it starts before
+    # tagging, it gets no keyboard and the app never receives focus.
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if libinput list-devices 2>/dev/null | grep -qi keyboard; then
+            break
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
 }
 CAGEEOF
   chmod +x /etc/init.d/cage-kiosk
