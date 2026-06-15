@@ -53,6 +53,33 @@ pub fn coalesce(rx: &Receiver<Frame>) -> Option<Frame> {
     latest
 }
 
+/// Blit a B8G8R8A8 frame into a softbuffer `0RGB` u32 buffer (`surf_w`×`surf_h`),
+/// honoring the frame's dirty rect (clamped to both surfaces). Source pixel bytes
+/// are B,G,R,A; the destination u32 is `(R<<16)|(G<<8)|B`.
+pub fn blit_frame(buf: &mut [u32], surf_w: u32, surf_h: u32, frame: &Frame) {
+    let src = frame.pixels.lock().unwrap();
+    let x0 = frame.dirty.x.min(surf_w);
+    let y0 = frame.dirty.y.min(surf_h);
+    let x1 = frame.dirty.x.saturating_add(frame.dirty.w).min(surf_w).min(frame.width);
+    let y1 = frame.dirty.y.saturating_add(frame.dirty.h).min(surf_h).min(frame.height);
+    // Index math in usize: frame.width is guest-sized, so `y * frame.width` can
+    // exceed u32 even when the dirty rect is clamped to the small window.
+    let (fw, sw) = (frame.width as usize, surf_w as usize);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let s = ((y as usize) * fw + x as usize) * 4;
+            if s + 3 >= src.len() {
+                continue;
+            }
+            let (b, g, r) = (src[s] as u32, src[s + 1] as u32, src[s + 2] as u32);
+            let d = (y as usize) * sw + x as usize;
+            if d < buf.len() {
+                buf[d] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+
 /// winit application state: owns the window + softbuffer surface (main thread only).
 struct App {
     width: u32,
@@ -70,10 +97,10 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        // No virtio-gpu device this milestone: drain the channel (so it can't grow
-        // unbounded) and clear the window. A later milestone blits the frame here.
-        let _ = coalesce(&self.rx);
-        buf.fill(CLEAR_0RGB);
+        match coalesce(&self.rx) {
+            Some(frame) => blit_frame(&mut buf, self.width, self.height, &frame),
+            None => buf.fill(CLEAR_0RGB),
+        }
         let _ = buf.present();
     }
 }
@@ -191,5 +218,25 @@ mod tests {
     fn coalesce_empty_is_none() {
         let (_sink, rx) = WindowSink::new();
         assert!(coalesce(&rx).is_none());
+    }
+
+    #[test]
+    fn blit_converts_bgra_to_0rgb() {
+        use std::sync::{Arc, Mutex};
+        use ignition_devices::display::{DirtyRect, Frame};
+        // 2x1 surface: pixel0 = B,G,R,A = (0x11,0x22,0x33,0xff); pixel1 = (0x44,0x55,0x66,0xff)
+        let px = vec![0x11, 0x22, 0x33, 0xff, 0x44, 0x55, 0x66, 0xff];
+        let frame = Frame {
+            scanout_id: 0,
+            width: 2,
+            height: 1,
+            stride: 8,
+            dirty: DirtyRect { x: 0, y: 0, w: 2, h: 1 },
+            pixels: Arc::new(Mutex::new(px)),
+        };
+        let mut buf = vec![0u32; 2];
+        blit_frame(&mut buf, 2, 1, &frame);
+        assert_eq!(buf[0], (0x33u32 << 16) | (0x22 << 8) | 0x11);
+        assert_eq!(buf[1], (0x66u32 << 16) | (0x55 << 8) | 0x44);
     }
 }
