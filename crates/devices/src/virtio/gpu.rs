@@ -21,7 +21,6 @@ const RESOURCE_UNREF: u32 = 0x0102;
 const SET_SCANOUT: u32 = 0x0103;
 #[allow(dead_code)] // used in later tasks
 const RESOURCE_FLUSH: u32 = 0x0104;
-#[allow(dead_code)] // used in later tasks
 const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const RESOURCE_DETACH_BACKING: u32 = 0x0107;
@@ -39,12 +38,9 @@ const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 struct Resource2D {
     #[allow(dead_code)] // recorded at create; format negotiation is a later milestone.
     format: u32,
-    #[allow(dead_code)] // read in tests; used by TRANSFER_TO_HOST_2D in later tasks
     width: u32,
-    #[allow(dead_code)] // read in tests; used by TRANSFER_TO_HOST_2D in later tasks
     height: u32,
     backing: Vec<(u64, u32)>,
-    #[allow(dead_code)] // used in later tasks
     pixels: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -81,6 +77,36 @@ fn resp_hdr(resp_type: u32, fence_id: u64, ctx_id: u32) -> Vec<u8> {
     h
 }
 
+/// Copy `out.len()` bytes starting at logical offset `logical_start` from the
+/// scatter-gather backing into `out`. A span may straddle multiple segments.
+fn read_backing(sg: &[(u64, u32)], mem: &GuestRam, logical_start: u64, out: &mut [u8]) {
+    let mut seg_base = 0u64; // cumulative logical offset at the start of this segment
+    let mut out_off = 0usize;
+    for &(gpa, len) in sg {
+        if out_off >= out.len() {
+            break;
+        }
+        let seg_len = len as u64;
+        let seg_end = seg_base.saturating_add(seg_len);
+        // `logical_start`/`gpa` come from the guest; use checked math so a malformed
+        // request degrades to zeroed pixels rather than a debug-build overflow panic.
+        let Some(cur) = logical_start.checked_add(out_off as u64) else { break };
+        if cur >= seg_base && cur < seg_end {
+            let within = cur - seg_base; // offset into this segment
+            let avail = (seg_len - within) as usize;
+            let n = std::cmp::min(out.len() - out_off, avail);
+            let dst = &mut out[out_off..out_off + n];
+            // A bad guest GPA (overflow or out of RAM) must not leave stale pixels.
+            match gpa.checked_add(within) {
+                Some(src) if mem.read_slice(src, dst) => {}
+                _ => dst.fill(0),
+            }
+            out_off += n;
+        }
+        seg_base = seg_end;
+    }
+}
+
 /// Concatenate all device-readable descriptors into one request byte vector.
 fn read_request(chain: &DescChain, mem: &GuestRam) -> Vec<u8> {
     let mut req = Vec::new();
@@ -111,7 +137,7 @@ fn write_response(chain: &DescChain, mem: &GuestRam, resp: &[u8]) -> u32 {
 
 impl VirtioGpu {
     /// Dispatch one controlq request, returning the response bytes.
-    fn dispatch(&mut self, req: &[u8], _mem: &GuestRam) -> Vec<u8> {
+    fn dispatch(&mut self, req: &[u8], mem: &GuestRam) -> Vec<u8> {
         if req.len() < CTRL_HDR_LEN {
             return resp_hdr(RESP_ERR_UNSPEC, 0, 0);
         }
@@ -126,8 +152,42 @@ impl VirtioGpu {
             RESOURCE_ATTACH_BACKING => self.attach_backing(body, fence, ctx),
             RESOURCE_DETACH_BACKING => self.detach_backing(body, fence, ctx),
             SET_SCANOUT => self.set_scanout(body, fence, ctx),
+            TRANSFER_TO_HOST_2D => self.transfer_2d(body, mem, fence, ctx),
             _ => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
         }
+    }
+
+    fn transfer_2d(&mut self, body: &[u8], mem: &GuestRam, fence: u64, ctx: u32) -> Vec<u8> {
+        if body.len() < 32 {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        }
+        let rx = le32(body, 0);
+        let ry = le32(body, 4);
+        let rw = le32(body, 8);
+        let rh = le32(body, 12);
+        let offset = le64(body, 16);
+        let id = le32(body, 24);
+        let Some(r) = self.resources.get(&id) else {
+            return resp_hdr(RESP_ERR_UNSPEC, fence, ctx);
+        };
+        // Clamp the rect to the resource so a bad request cannot index out of bounds.
+        let x_end = rx.saturating_add(rw).min(r.width);
+        let y_end = ry.saturating_add(rh).min(r.height);
+        if rx >= r.width || ry >= r.height {
+            return resp_hdr(RESP_OK_NODATA, fence, ctx); // nothing in bounds
+        }
+        let row_w = x_end - rx; // pixels per row to copy
+        let mut host = r.pixels.lock().unwrap();
+        for y in ry..y_end {
+            // row_logical is bounded by the (checked) buffer size; only the
+            // guest-supplied `offset` can overflow, so guard that add.
+            let row_logical = ((y as u64) * (r.width as u64) + rx as u64) * 4;
+            let Some(logical) = offset.checked_add(row_logical) else { continue };
+            let host_off = ((y as usize) * (r.width as usize) + rx as usize) * 4;
+            let row_bytes = (row_w as usize) * 4;
+            read_backing(&r.backing, mem, logical, &mut host[host_off..host_off + row_bytes]);
+        }
+        resp_hdr(RESP_OK_NODATA, fence, ctx)
     }
 
     fn create_2d(&mut self, body: &[u8], fence: u64, ctx: u32) -> Vec<u8> {
@@ -454,6 +514,47 @@ mod tests {
         assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &unref)), RESP_OK_NODATA);
         assert!(!gpu.resources.contains_key(&1));
         assert_eq!(gpu.scanout_res, 0);
+    }
+
+    #[test]
+    fn transfer_with_huge_offset_does_not_panic() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x8000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 4, 1));
+        submit(&mut gpu, &mut backing, &attach_backing_req(1, &[(BASE + 0x4000, 16)]));
+        let mut t = hdr(TRANSFER_TO_HOST_2D);
+        t.extend_from_slice(&0u32.to_le_bytes()); // x
+        t.extend_from_slice(&0u32.to_le_bytes()); // y
+        t.extend_from_slice(&4u32.to_le_bytes()); // w
+        t.extend_from_slice(&1u32.to_le_bytes()); // h
+        t.extend_from_slice(&u64::MAX.to_le_bytes()); // offset: overflows if unchecked
+        t.extend_from_slice(&1u32.to_le_bytes()); // resource_id
+        t.extend_from_slice(&0u32.to_le_bytes()); // padding
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &t)), RESP_OK_NODATA);
+    }
+
+    #[test]
+    fn transfer_reassembles_fragmented_backing() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x8000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 4, 1)); // 4x1 => 16 bytes
+        // backing SG: seg A = 10 bytes @ 0x1000, seg B = 6 bytes @ 0x2000 (straddles).
+        submit(&mut gpu, &mut backing, &attach_backing_req(1, &[(BASE + 0x4000, 10), (BASE + 0x5000, 6)]));
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        let pat: Vec<u8> = (0..16u8).collect();
+        m.write_slice(BASE + 0x4000, &pat[0..10]);
+        m.write_slice(BASE + 0x5000, &pat[10..16]);
+        let mut t = hdr(TRANSFER_TO_HOST_2D);
+        t.extend_from_slice(&0u32.to_le_bytes()); // x
+        t.extend_from_slice(&0u32.to_le_bytes()); // y
+        t.extend_from_slice(&4u32.to_le_bytes()); // w
+        t.extend_from_slice(&1u32.to_le_bytes()); // h
+        t.extend_from_slice(&0u64.to_le_bytes()); // offset
+        t.extend_from_slice(&1u32.to_le_bytes()); // resource_id
+        t.extend_from_slice(&0u32.to_le_bytes()); // padding
+        assert_eq!(resp_type(&submit(&mut gpu, &mut backing, &t)), RESP_OK_NODATA);
+        let host = gpu.resources.get(&1).unwrap().pixels.lock().unwrap();
+        assert_eq!(&host[..], &pat[..], "fragmented backing must reassemble in order");
     }
 
     #[test]
