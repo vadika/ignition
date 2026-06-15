@@ -559,6 +559,7 @@ fn main() {
     let mut name: Option<String> = None;
     let mut force = false;
     let mut no_sandbox = false;
+    let mut gui = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
     // Fuzz mode (Task 8): boot a single-vCPU guest from an initramfs and run the
@@ -639,6 +640,9 @@ fn main() {
             "--no-sandbox" => {
                 no_sandbox = true;
             }
+            "--gui" => {
+                gui = true;
+            }
             "--track-dirty" => {
                 track_dirty = true;
             }
@@ -710,7 +714,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] [--gui] <kernel-Image> [rootfs-disk]", args[0]);
         eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] [--no-sandbox] <kernel-Image>", args[0]);
         process::exit(2);
     }
@@ -1034,12 +1038,47 @@ fn main() {
                    vsock_uds.as_ref().and_then(|u| u.parent().map(PathBuf::from))]
             .into_iter().flatten().collect(),
     };
-    apply_or_exit(&sb_paths, no_sandbox);
+    if gui {
+        // GUI mode: the winit event loop must own the main thread on macOS, so the
+        // VMM (sandbox apply + the vCPU join loop) moves to a spawned thread and the
+        // event loop runs on main. `manager` is an Arc; cloning shares the VMM.
+        // `_sink` establishes the present seam (a later milestone hands it to the
+        // virtio-gpu device); for now no frames flow and the window clears to a color.
+        // The `TermiosGuard` (`termios`) stays alive in this scope; when the event
+        // loop returns and `main` returns, the guard's Drop restores the terminal and
+        // the process exits (killing the VMM thread). Window close → loop exit; VMM
+        // done → loop exit.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_sink, rx) = display_sink::WindowSink::new();
+        let done_vmm = done.clone();
+        let mgr = manager.clone();
+        std::thread::spawn(move || {
+            // Release the event loop however this thread leaves — clean return OR a
+            // panic in the VMM — so a crashed guest still closes the window. Drop runs
+            // on unwind; `apply_or_exit`'s process::exit on sandbox failure ends the
+            // whole process, which tears the loop down too.
+            struct SignalOnExit(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for SignalOnExit {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _signal = SignalOnExit(done_vmm);
+            apply_or_exit(&sb_paths, no_sandbox);
+            match mgr.run(entry, fdt_addr) {
+                Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
+                Err(e) => eprintln!("\n[vcpu error: {e}]"),
+            }
+        });
+        display_sink::run_event_loop(rx, done, 1280, 800);
+    } else {
+        apply_or_exit(&sb_paths, no_sandbox);
 
-    // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
-    match manager.run(entry, fdt_addr) {
-        Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
-        Err(e) => eprintln!("\n[vcpu error: {e}]"),
+        // Run. Earlycon + virtio MMIO exits are dispatched through the bus.
+        match manager.run(entry, fdt_addr) {
+            Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
+            Err(e) => eprintln!("\n[vcpu error: {e}]"),
+        }
     }
 }
 
