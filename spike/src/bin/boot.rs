@@ -43,6 +43,7 @@ use ignition_vmm::vstate::vcpu_manager::{mpidr_for, DirtyConfig, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
 use ignition_hvf::bindings::{HV_MEMORY_EXEC, HV_MEMORY_READ};
 
+mod display_sink;
 
 /// Host console escape key: Ctrl-A (0x01).
 const CTRL_A: u8 = 0x01;
