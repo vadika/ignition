@@ -13,6 +13,50 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ignition_devices::display::{DisplaySink, Frame};
+use winit::keyboard::KeyCode;
+
+/// Map a winit physical key to a Linux evdev key code. Covers the committed subset
+/// (letters, digits, common control/navigation/modifier/punctuation keys). Unmapped
+/// keys return None and are dropped.
+#[allow(dead_code)] // wired in Task 5
+pub fn map_keycode(kc: KeyCode) -> Option<u16> {
+    use KeyCode::*;
+    Some(match kc {
+        KeyA => 30, KeyB => 48, KeyC => 46, KeyD => 32, KeyE => 18, KeyF => 33,
+        KeyG => 34, KeyH => 35, KeyI => 23, KeyJ => 36, KeyK => 37, KeyL => 38,
+        KeyM => 50, KeyN => 49, KeyO => 24, KeyP => 25, KeyQ => 16, KeyR => 19,
+        KeyS => 31, KeyT => 20, KeyU => 22, KeyV => 47, KeyW => 17, KeyX => 45,
+        KeyY => 21, KeyZ => 44,
+        Digit1 => 2, Digit2 => 3, Digit3 => 4, Digit4 => 5, Digit5 => 6,
+        Digit6 => 7, Digit7 => 8, Digit8 => 9, Digit9 => 10, Digit0 => 11,
+        Enter => 28, Escape => 1, Backspace => 14, Tab => 15, Space => 57,
+        Minus => 12, Equal => 13, BracketLeft => 26, BracketRight => 27,
+        Backslash => 43, Semicolon => 39, Quote => 40, Backquote => 41,
+        Comma => 51, Period => 52, Slash => 53, CapsLock => 58,
+        ArrowUp => 103, ArrowDown => 108, ArrowLeft => 105, ArrowRight => 106,
+        ShiftLeft => 42, ShiftRight => 54, ControlLeft => 29, ControlRight => 97,
+        AltLeft => 56, AltRight => 100, SuperLeft => 125, SuperRight => 126,
+        _ => return None,
+    })
+}
+
+/// Scale a window-physical position to a guest absolute axis coordinate, clamped.
+/// `surf_w`/`surf_h` are the physical surface size; `gw`/`gh` the guest resolution.
+#[allow(dead_code)] // wired in Task 5
+pub fn scale_pos(px: f64, py: f64, surf_w: u32, surf_h: u32, gw: u32, gh: u32) -> (u32, u32) {
+    let clamp = |v: f64, max: u32| -> u32 {
+        if v <= 0.0 {
+            0
+        } else if v >= max as f64 {
+            max
+        } else {
+            v as u32
+        }
+    };
+    let x = px * (gw.saturating_sub(1) as f64) / (surf_w.max(1) as f64 - 1.0).max(1.0);
+    let y = py * (gh.saturating_sub(1) as f64) / (surf_h.max(1) as f64 - 1.0).max(1.0);
+    (clamp(x, gw - 1), clamp(y, gh - 1))
+}
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -270,6 +314,25 @@ mod tests {
     fn coalesce_empty_is_none() {
         let (_sink, rx) = WindowSink::new();
         assert!(coalesce(&rx).is_none());
+    }
+
+    #[test]
+    fn keycode_maps_known_keys() {
+        use winit::keyboard::KeyCode;
+        assert_eq!(map_keycode(KeyCode::KeyA), Some(30));
+        assert_eq!(map_keycode(KeyCode::Enter), Some(28));
+        assert_eq!(map_keycode(KeyCode::Space), Some(57));
+        assert_eq!(map_keycode(KeyCode::Digit1), Some(2));
+        assert_eq!(map_keycode(KeyCode::ArrowUp), Some(103));
+        assert_eq!(map_keycode(KeyCode::F13), None);
+    }
+
+    #[test]
+    fn pointer_scale_maps_corners() {
+        assert_eq!(scale_pos(0.0, 0.0, 2560, 1600, 1280, 800), (0, 0));
+        assert_eq!(scale_pos(2559.0, 1599.0, 2560, 1600, 1280, 800), (1279, 799));
+        assert_eq!(scale_pos(99999.0, 99999.0, 2560, 1600, 1280, 800), (1279, 799));
+        assert_eq!(scale_pos(-5.0, -5.0, 2560, 1600, 1280, 800), (0, 0));
     }
 
     #[test]
