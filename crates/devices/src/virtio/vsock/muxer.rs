@@ -197,7 +197,14 @@ impl Muxer {
                     self.queue(OP_RST, guest_port, host_port, 0);
                 }
             }
-            OP_RESPONSE => { /* host->guest connect ack — E2 */ }
+            OP_RESPONSE => {
+                if let Some(conn) = self.conns.get_mut(&key)
+                    && conn.state() == ConnState::LocalInit
+                {
+                    conn.confirm_established(hdr.buf_alloc, hdr.fwd_cnt);
+                    conn.write_host_raw(format!("OK {host_port}\n").as_bytes());
+                }
+            }
             _ => {
                 if self.conns.contains_key(&key) {
                     self.queue(OP_RST, guest_port, host_port, 0);
@@ -239,10 +246,15 @@ impl Muxer {
         }
     }
 
-    /// Host fds to poll (POLLIN). Buffered guest->host tx is flushed each service()
-    /// tick, so POLLOUT is not needed (and would busy-loop on idle-writable sockets).
+    /// Host fds to poll (POLLIN): live connection streams plus control clients
+    /// still parsing their CONNECT line. Buffered guest->host tx flushes each
+    /// service() tick, so POLLOUT is not needed.
     pub fn poll_set(&self) -> Vec<RawFd> {
-        self.conns.values().map(|c| c.raw_fd()).collect()
+        self.conns
+            .values()
+            .map(|c| c.raw_fd())
+            .chain(self.ctrl_streams.keys().copied())
+            .collect()
     }
 
     pub fn pop_rx(&mut self) -> Option<RxPacket> {
@@ -415,5 +427,46 @@ mod tests {
         let p1 = mux.pop_rx().unwrap();
         let p2 = mux.pop_rx().unwrap();
         assert_ne!(p1.hdr.src_port, p2.hdr.src_port, "distinct ephemeral host ports");
+    }
+
+    fn resp(guest: u32, host: u32) -> VsockHeader {
+        VsockHeader {
+            src_cid: VSOCK_GUEST_CID, dst_cid: VSOCK_CID_HOST, src_port: guest, dst_port: host,
+            len: 0, type_: VSOCK_TYPE_STREAM, op: OP_RESPONSE, flags: 0, buf_alloc: 64 * 1024, fwd_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn response_establishes_conn_and_writes_ok() {
+        use std::io::{Read, Write};
+        let base = std::env::temp_dir().join("ign-vsock-e2-ok/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, mut client) = UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        client.write_all(b"CONNECT 1234\n").unwrap();
+        mux.poll_controls();
+        let req = mux.pop_rx().unwrap();
+        let host_port = req.hdr.src_port;
+
+        // Guest accepts.
+        mux.handle_tx(&resp(1234, host_port), &[]);
+
+        let mut buf = [0u8; 32];
+        client.set_nonblocking(true).unwrap();
+        let n = client.read(&mut buf).unwrap();
+        let line = std::str::from_utf8(&buf[..n]).unwrap();
+        assert_eq!(line, format!("OK {host_port}\n"));
+    }
+
+    #[test]
+    fn poll_set_includes_control_fds() {
+        let base = std::env::temp_dir().join("ign-vsock-e2-pollset/vsock");
+        let mut mux = Muxer::new(base);
+        let (host, _client) = UnixStream::pair().unwrap();
+        let fd = { use std::os::unix::io::AsRawFd; host.as_raw_fd() };
+        host.set_nonblocking(true).unwrap();
+        mux.accept_control(host);
+        assert!(mux.poll_set().contains(&fd), "control fd is polled");
     }
 }
