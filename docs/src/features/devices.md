@@ -92,6 +92,24 @@ A PL031 RTC plus the EL1 virtual timer keep guest time. The vtimer PPI (INTID 27
 delivered through the in-kernel GIC, and on restore the vtimer offset is set so that
 `CNTVCT` resumes continuously across the snapshot rather than jumping forward.
 
+## GUI display (software-rendered)
+
+`boot --gui <kernel> <rootfs>` opens a 1280x800 macOS window backed by a CPU
+framebuffer (`winit` + `softbuffer`, no Metal). On macOS the windowing event loop
+must own the main thread, so under `--gui` the entire VMM — vCPU threads, the serial
+console reader, the vsock reactor, and the vmnet RX feeder — runs on spawned threads
+while the event loop runs on main. The present path is non-blocking and coalesces to
+the latest frame, so a slow or frozen window never backpressures the guest. Closing
+the window ends the session (the process exits, tearing the disposable guest down);
+the serial console keeps working alongside the window.
+
+Without `--gui` (the default), and for `--restore` and `--fuzz`, behavior is
+unchanged: no window opens and the vCPU loop runs on the main thread as before.
+
+This is the structural foundation for the 2D GUI bring-up. The `virtio-gpu` device
+that actually paints guest pixels into the window is a later milestone; today the
+window opens cleared to a solid color.
+
 ## Related
 
 - [Device model](../concepts/device-model.md) — the trait these devices implement.
