@@ -116,6 +116,13 @@ display resize or hotplug, and snapshot of GPU state is a later milestone.
 The guest kernel must be built with `CONFIG_DRM`, `CONFIG_DRM_VIRTIO_GPU`,
 `CONFIG_DRM_FBDEV_EMULATION`, `CONFIG_FB`, and `CONFIG_FRAMEBUFFER_CONSOLE`.
 
+Under `--gui`, two **virtio-input** devices (device id 18) make the window interactive:
+a keyboard (`EV_KEY`) and an absolute tablet (`EV_ABS` x/y + buttons). The winit event
+loop translates host key/pointer/click events into Linux evdev events and injects them
+into the guest's eventq (the `inject_rx`-style path), so typing logs in at the console
+and the pointer tracks the macOS cursor 1:1 over the 1280x800 scanout. The guest kernel
+needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVDEV=y`.
+
 ## Related
 
 - [Device model](../concepts/device-model.md) — the trait these devices implement.
