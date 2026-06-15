@@ -2,6 +2,7 @@
 
 pub mod balloon;
 pub mod blk;
+pub mod gpu;
 pub mod guest_ram;
 pub mod mmio;
 pub mod net;
