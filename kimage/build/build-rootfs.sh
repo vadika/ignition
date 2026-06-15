@@ -27,6 +27,12 @@ docker run --platform linux/arm64 --name fcroot_build \
   ln -sf agetty /etc/init.d/agetty.ttyS0
   echo ttyS0 > /etc/securetty
   rc-update add agetty.ttyS0 default
+  # GUI console on tty1 (virtio-gpu fbcon + virtio-input keyboard, --gui): a login
+  # on the framebuffer VT so typing in the window reaches a shell. Harmless without
+  # --gui (tty1 just has no fbcon attached).
+  ln -sf agetty /etc/init.d/agetty.tty1
+  echo tty1 >> /etc/securetty
+  rc-update add agetty.tty1 default
   rc-update add devfs boot
   rc-update add procfs boot
   rc-update add sysfs boot
