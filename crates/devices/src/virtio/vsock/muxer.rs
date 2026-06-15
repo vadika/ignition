@@ -109,7 +109,7 @@ impl Muxer {
         let fds: Vec<RawFd> = self.ctrl_streams.keys().copied().collect();
         for fd in fds {
             let mut done = false; // remove this client after the loop?
-            let mut promote: Option<(u32, UnixStream)> = None; // (guest_port, stream)
+            let mut promote_port: Option<u32> = None; // guest_port from a parsed CONNECT
             {
                 let cs = self.ctrl_streams.get_mut(&fd).unwrap();
                 let mut tmp = [0u8; 256];
@@ -129,21 +129,23 @@ impl Muxer {
                     if let Some(port_str) = line.strip_prefix("CONNECT ")
                         && let Ok(guest_port) = port_str.trim().parse::<u32>()
                     {
-                        promote = Some((guest_port, cs.stream.try_clone().expect("dup ctrl stream")));
+                        promote_port = Some(guest_port);
                     }
                 }
             }
             if done {
-                self.ctrl_streams.remove(&fd);
-            }
-            if let Some((guest_port, stream)) = promote {
-                let host_port = self.alloc_host_port();
-                stream.set_nonblocking(true).ok();
-                let conn = Connection::new_local_init(guest_port, host_port, stream);
-                self.conns.insert((guest_port, host_port), conn);
-                // ctrl_hdr already sets src_cid=HOST, dst_cid=GUEST for the REQUEST.
-                let hdr = Self::ctrl_hdr(OP_REQUEST, guest_port, host_port, 0);
-                self.rxq.push_back(RxPacket { hdr, data: Vec::new() });
+                // Take the client out of the map; on a parsed CONNECT, move its
+                // stream straight into the new conn (no dup), else drop it.
+                let removed = self.ctrl_streams.remove(&fd);
+                if let (Some(guest_port), Some(cs)) = (promote_port, removed) {
+                    let host_port = self.alloc_host_port();
+                    cs.stream.set_nonblocking(true).ok();
+                    let conn = Connection::new_local_init(guest_port, host_port, cs.stream);
+                    self.conns.insert((guest_port, host_port), conn);
+                    // ctrl_hdr already sets src_cid=HOST, dst_cid=GUEST for the REQUEST.
+                    let hdr = Self::ctrl_hdr(OP_REQUEST, guest_port, host_port, 0);
+                    self.rxq.push_back(RxPacket { hdr, data: Vec::new() });
+                }
             }
         }
     }
