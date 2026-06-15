@@ -23,6 +23,9 @@ const TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const RESOURCE_DETACH_BACKING: u32 = 0x0107;
 
+/// ctrl_hdr flag: request carries a fence the device must signal in the response.
+const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
+
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
@@ -142,10 +145,11 @@ impl VirtioGpu {
             return resp_hdr(RESP_ERR_UNSPEC, 0, 0);
         }
         let cmd = le32(req, 0);
+        let flags = le32(req, 4);
         let fence = le64(req, 8);
         let ctx = le32(req, 16);
         let body = &req[CTRL_HDR_LEN..];
-        match cmd {
+        let mut resp = match cmd {
             GET_DISPLAY_INFO => self.display_info(fence, ctx),
             RESOURCE_CREATE_2D => self.create_2d(body, fence, ctx),
             RESOURCE_UNREF => self.unref(body, fence, ctx),
@@ -155,7 +159,15 @@ impl VirtioGpu {
             TRANSFER_TO_HOST_2D => self.transfer_2d(body, mem, fence, ctx),
             RESOURCE_FLUSH => self.flush(body, mem, fence, ctx),
             _ => resp_hdr(RESP_ERR_UNSPEC, fence, ctx),
+        };
+        // Signal the fence on a fenced request: echo VIRTIO_GPU_FLAG_FENCE + fence_id
+        // so the guest can complete the command's fence. wlroots/DRM page-flips are
+        // fenced; without this the flip never completes and the compositor renders one
+        // frame then stalls. fence_id is already echoed by resp_hdr at bytes 8..16.
+        if flags & VIRTIO_GPU_FLAG_FENCE != 0 && resp.len() >= CTRL_HDR_LEN {
+            resp[4..8].copy_from_slice(&VIRTIO_GPU_FLAG_FENCE.to_le_bytes());
         }
+        resp
     }
 
     fn transfer_2d(&mut self, body: &[u8], mem: &GuestRam, fence: u64, ctx: u32) -> Vec<u8> {
@@ -455,6 +467,26 @@ mod tests {
         let mut backing = vec![0u8; 0x4000];
         let resp = submit(&mut gpu, &mut backing, &[0u8; 4]);
         assert_eq!(resp_type(&resp), RESP_ERR_UNSPEC);
+    }
+
+    #[test]
+    fn fenced_request_echoes_fence_flag_and_id() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        // GET_DISPLAY_INFO with VIRTIO_GPU_FLAG_FENCE set + fence_id 0xABCD (from hdr()).
+        let mut req = hdr(GET_DISPLAY_INFO);
+        req[4..8].copy_from_slice(&1u32.to_le_bytes()); // flags = VIRTIO_GPU_FLAG_FENCE
+        let resp = submit(&mut gpu, &mut backing, &req);
+        assert_eq!(u32::from_le_bytes(resp[4..8].try_into().unwrap()), 1); // fence flag echoed
+        assert_eq!(u64::from_le_bytes(resp[8..16].try_into().unwrap()), 0xABCD); // fence_id
+    }
+
+    #[test]
+    fn unfenced_request_has_zero_flags() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        let resp = submit(&mut gpu, &mut backing, &hdr(GET_DISPLAY_INFO));
+        assert_eq!(u32::from_le_bytes(resp[4..8].try_into().unwrap()), 0); // no fence flag
     }
 
     #[test]
