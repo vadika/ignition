@@ -413,6 +413,9 @@ impl VirtioDevice for VirtioGpu {
         }
         let scanout_res =
             v.get("scanout_res").and_then(|x| x.as_u64()).ok_or("gpu: missing scanout_res")? as u32;
+        if scanout_res != 0 && !resources.contains_key(&scanout_res) {
+            return Err("gpu: scanout_res names a missing resource".to_string());
+        }
         self.resources = resources;
         self.scanout_res = scanout_res;
         Ok(())
@@ -765,6 +768,17 @@ mod tests {
         assert_eq!((r.format, r.width, r.height), (FORMAT_B8G8R8A8_UNORM, 8, 4));
         assert_eq!(r.backing, vec![(0x1000, 64), (0x2000, 64)]);
         assert_eq!(r.pixels.lock().unwrap().len(), 8 * 4 * 4); // rebuilt zeroed
+    }
+
+    #[test]
+    fn restore_rejects_dangling_scanout() {
+        let mut gpu = new_gpu();
+        // scanout_res names a resource that is not in the table → invalid snapshot.
+        let bad = serde_json::json!({
+            "resources": [{ "id": 1, "format": 1, "width": 8, "height": 4, "backing": [] }],
+            "scanout_res": 999
+        });
+        assert!(gpu.restore(&bad).is_err());
     }
 
     #[test]
