@@ -152,8 +152,16 @@ sudo scripts/disposable-browser.sh -n 2 my-base --store /data/vmstore
 
 ## Reset a session in place
 
-Press **`Ctrl-A r`** inside any running clone to roll it back to the warm
-homepage. Guest RAM, vCPU registers, GIC state, and virtio-device state are
+With the browser window focused, press **`Ctrl+Alt+R`** to roll the clone back to
+the warm homepage. Use **`Ctrl+Alt+C`** to mark a new reset point, **`Ctrl+Alt+S`**
+to write a disk snapshot, and **`Ctrl+Alt+X`** to close the window. These GUI chords
+exist because the macOS window holds keyboard focus and `disposable-browser.sh`
+runs each clone in the background (with `&`): backgrounding closes the clone's
+serial stdin, so the foreground-only serial `Ctrl-A` shortcuts never fire. The
+window hotkey is intercepted before the keystroke reaches the guest and dispatched
+to that window's own VM, so it works per-clone under fan-out.
+
+Guest RAM, vCPU registers, GIC state, and virtio-device state are
 all restored to the snapshot moment; the macOS window repaints the resumed
 screen. Browser history, cookies, cache, open tabs, and any downloads evaporate
 — they lived only in the tmpfs upper layer, which is part of the guest RAM that

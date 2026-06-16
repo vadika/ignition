@@ -1298,7 +1298,17 @@ fn main() {
                 Err(e) => eprintln!("\n[vcpu error: {e}]"),
             }
         });
-        display_sink::run_event_loop(rx, done, 1280, 800, kbd_handle, tab_handle, 1280, 800);
+        display_sink::run_event_loop(
+            rx,
+            done,
+            1280,
+            800,
+            kbd_handle,
+            tab_handle,
+            1280,
+            800,
+            Some(manager.clone()),
+        );
     } else {
         apply_or_exit(&sb_paths, no_sandbox);
 
@@ -2158,7 +2168,17 @@ fn run_restore(
             apply_or_exit(&sb_paths, no_sandbox);
             let _ = mgr_run.run_restored(vcpus, Some(gic_blob));
         });
-        display_sink::run_event_loop(rx, done, 1280, 800, kbd_handle, tab_handle, 1280, 800);
+        display_sink::run_event_loop(
+            rx,
+            done,
+            1280,
+            800,
+            kbd_handle,
+            tab_handle,
+            1280,
+            800,
+            Some(manager.clone()),
+        );
         Ok(())
     } else {
         apply_or_exit(&sb_paths, no_sandbox);

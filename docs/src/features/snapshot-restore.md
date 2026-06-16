@@ -147,6 +147,11 @@ Two console hotkeys let you capture a running guest's state as an in-memory
   reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
   yet, prints `reset: no checkpoint - press Ctrl-A c first`.
 
+Under `--gui` the same actions are bound to **`Ctrl+Alt+R`** (reset),
+**`Ctrl+Alt+C`** (mark reset point), and **`Ctrl+Alt+S`** (write a disk snapshot)
+in the window, since the focused window swallows the serial `Ctrl-A` chords (those
+still work on a foreground serial console).
+
 **Auto-seed on `--restore`.** When a guest is started with `boot --restore
 <dir>`, the restored snapshot is automatically installed as the initial reset
 point before the guest runs. `Ctrl-A r` therefore works immediately after a
