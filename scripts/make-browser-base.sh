@@ -52,8 +52,10 @@ echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
           echo ">> guest ready; snapshotting as '$NAME'"
           printf '\001s' >&3
           ;;
-        *"snapshot"*"done"* | *"[snapshot"*"]"*)
-          # Snapshot confirmation seen; detach.
+        *"[snapshot]"*written*)
+          # Snapshot WRITE completed (e.g. "[snapshot] full 'NAME' written to ...").
+          # Distinct from "[snapshot requested]", which prints immediately on Ctrl-A s
+          # before the write finishes — do not quit on that.
           sleep 1
           printf '\001x' >&3
           ;;
