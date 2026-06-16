@@ -23,10 +23,8 @@ The browser rootfs is designed to keep the backing ext4 image read-only
 throughout the life of every session. On the cold boot, `init=/sbin/overlay-init`
 runs before the normal init: it mounts the ext4 device read-only as the lower
 layer of an overlay filesystem, places a tmpfs as the upper layer, and
-`switch_root`s into the merged view. The design intent is that `overlay-init`
-uses a `pivot_root`-style sequence to make the merged overlay the new root, with
-`/tmp`, the browser profile directory, and any download paths living in the tmpfs
-upper layer.
+`switch_root`s into the merged view. `/tmp`, the browser profile directory, and
+any download paths all live in the tmpfs upper layer.
 
 The consequence is that **every write the guest makes — browser cache, cookies,
 history, tab state — lives in guest RAM and only in guest RAM**. The ext4 image
@@ -96,9 +94,9 @@ sudo target/debug/boot --gui --net --track-dirty --mem 1024 --name browser-base 
 
 Pass `--name browser-base` so the snapshot you take is written under that name
 (the name `disposable-browser.sh` restores by default). Wait for the Firefox
-window to paint the homepage (the design intent is that the guest prints
-`BROWSER_READY` on the serial console and the llvmpipe software renderer presents
-the first frame in the macOS window). Once it looks right, press `Ctrl-A s` to
+window to paint the homepage (the guest prints `BROWSER_READY` on the serial
+console and the llvmpipe software renderer presents the first frame in the macOS
+window). Once it looks right, press `Ctrl-A s` to
 write the snapshot, then `Ctrl-A x` to quit. (`Ctrl-A s` writes immediately under
 `--name`; there is no name prompt. Without `--name` the snapshot gets an
 auto-generated name, which `disposable-browser.sh` will not find.)
