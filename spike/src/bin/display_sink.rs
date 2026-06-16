@@ -39,6 +39,53 @@ pub fn map_keycode(kc: KeyCode) -> Option<u16> {
     })
 }
 
+/// A host-side action triggered by a GUI hotkey chord, dispatched to the
+/// `VcpuManager` instead of being forwarded to the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotAction {
+    Reset,
+    Checkpoint,
+    Snapshot,
+    Quit,
+}
+
+/// Map a Ctrl+Alt+<letter> chord to a host-side action. Returns None unless BOTH
+/// ctrl and alt are held and the key is one of the bound letters, so ordinary
+/// typing (and plain Ctrl/Alt combos the guest needs) passes through to the guest.
+fn match_hotkey(ctrl: bool, alt: bool, key: winit::keyboard::KeyCode) -> Option<HotAction> {
+    use winit::keyboard::KeyCode;
+    if !(ctrl && alt) {
+        return None;
+    }
+    match key {
+        KeyCode::KeyR => Some(HotAction::Reset),
+        KeyCode::KeyC => Some(HotAction::Checkpoint),
+        KeyCode::KeyS => Some(HotAction::Snapshot),
+        KeyCode::KeyX => Some(HotAction::Quit),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+    use winit::keyboard::KeyCode;
+    #[test]
+    fn ctrl_alt_letters_map_to_actions() {
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyR), Some(HotAction::Reset));
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyC), Some(HotAction::Checkpoint));
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyS), Some(HotAction::Snapshot));
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyX), Some(HotAction::Quit));
+    }
+    #[test]
+    fn requires_both_modifiers_and_bound_letter() {
+        assert_eq!(match_hotkey(false, true, KeyCode::KeyR), None); // no ctrl
+        assert_eq!(match_hotkey(true, false, KeyCode::KeyR), None); // no alt
+        assert_eq!(match_hotkey(false, false, KeyCode::KeyR), None); // neither
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyA), None); // unbound letter
+    }
+}
+
 /// Scale a window-physical position to a guest absolute axis coordinate, clamped.
 /// `surf_w`/`surf_h` are the physical surface size; `gw`/`gh` the guest resolution.
 pub fn scale_pos(px: f64, py: f64, surf_w: u32, surf_h: u32, gw: u32, gh: u32) -> (u32, u32) {
@@ -149,6 +196,12 @@ struct App {
     tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
     gw: u32,
     gh: u32,
+    /// Live modifier state, updated from `ModifiersChanged`, read to detect the
+    /// Ctrl+Alt+<letter> host hotkey chords before forwarding keys to the guest.
+    modifiers: winit::keyboard::ModifiersState,
+    /// The VM owning this window, so a host hotkey can request reset/checkpoint/
+    /// snapshot. `None` outside the GUI reset use-case (keys then always forward).
+    manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
 }
 
 impl App {
@@ -193,6 +246,36 @@ impl App {
         }
         let _ = buf.present();
     }
+
+    /// Carry out a host-side hotkey action against this window's VM. No-op (beyond a
+    /// log line) when no manager is wired or no reset point exists for `Reset`.
+    fn dispatch_hotkey(&self, action: HotAction, event_loop: &ActiveEventLoop) {
+        let Some(mgr) = &self.manager else {
+            return;
+        };
+        match action {
+            HotAction::Reset => {
+                if mgr.has_reset_point() {
+                    eprintln!("\n[gui] reset to checkpoint");
+                    mgr.request_reset();
+                } else {
+                    eprintln!("\n[gui] reset: no checkpoint - press Ctrl+Alt+C first");
+                }
+            }
+            HotAction::Checkpoint => {
+                eprintln!("\n[gui] reset point marked");
+                mgr.request_checkpoint();
+            }
+            HotAction::Snapshot => {
+                eprintln!("\n[gui] snapshot requested");
+                mgr.request_snapshot();
+            }
+            HotAction::Quit => {
+                eprintln!("\n[gui] closing window");
+                event_loop.exit();
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -227,9 +310,25 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 use ignition_devices::virtio::input::InputEvent;
                 use winit::keyboard::PhysicalKey;
+                // Intercept host hotkey chords BEFORE forwarding to the guest: a
+                // Ctrl+Alt+<letter> chord is swallowed (press and release) and
+                // dispatched to the VM so the guest never sees it.
+                if let PhysicalKey::Code(kc) = event.physical_key {
+                    let ctrl = self.modifiers.control_key();
+                    let alt = self.modifiers.alt_key();
+                    if let Some(action) = match_hotkey(ctrl, alt, kc) {
+                        if event.state.is_pressed() {
+                            self.dispatch_hotkey(action, event_loop);
+                        }
+                        return;
+                    }
+                }
                 if let PhysicalKey::Code(kc) = event.physical_key
                     && let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard)
                 {
@@ -306,6 +405,7 @@ pub fn run_event_loop(
     tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
     gw: u32,
     gh: u32,
+    manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
 ) {
     let event_loop = EventLoop::new().expect("winit event loop");
     event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -326,6 +426,8 @@ pub fn run_event_loop(
         tablet,
         gw,
         gh,
+        modifiers: winit::keyboard::ModifiersState::empty(),
+        manager,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("[gui] event loop exited with error: {e}");

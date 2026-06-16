@@ -1,9 +1,10 @@
 # Disposable browser
 
-ignition can run a throwaway Firefox-ESR kiosk in a microVM where every write
-lands in guest RAM, never touches the disk, and a single hotkey resets the session
-back to a warm homepage — without reloading the kernel or replaying the overlay
-boot path.
+ignition can run a throwaway Firefox ESR in a microVM where every write lands in
+guest RAM, never touches the disk, and a single hotkey resets the session back to
+a warm homepage — without reloading the kernel or replaying the overlay boot path.
+cage fullscreens the single Firefox window (so it fills the macOS window), but
+Firefox keeps its normal toolbar and address bar, so you can navigate anywhere.
 
 ## What it is
 
@@ -29,6 +30,11 @@ any download paths all live in the tmpfs upper layer.
 The consequence is that **every write the guest makes — browser cache, cookies,
 history, tab state — lives in guest RAM and only in guest RAM**. The ext4 image
 is never written.
+
+This also means the warm-base snapshot needs no filesystem sync first: there are
+no dirty disk pages to flush (the disk is read-only), and the mutable filesystem
+state lives entirely in the tmpfs upper layer, which the RAM snapshot captures
+atomically once the vCPUs are parked. The read-only lower is shared unchanged.
 
 This is what makes `Ctrl-A r` safe. The [interactive reset-to-checkpoint](snapshot-restore.md#interactive-reset-to-checkpoint)
 mechanism rolls back guest RAM, vCPU registers, GIC state, and virtio-device
@@ -58,7 +64,7 @@ scp artemis2:'~/kbuild/out/rootfs-browser.ext4' out/rootfs-browser.ext4
 
 The `HOMEPAGE` build argument sets the URL Firefox opens on first paint. The
 rootfs ships `overlay-init` at `/sbin/overlay-init`, which the cold boot
-activates via `--append "init=/sbin/overlay-init"`.
+activates via `--append "ro init=/sbin/overlay-init"`.
 
 ## Create the warm-base snapshot
 
@@ -88,8 +94,8 @@ sudo scripts/make-browser-base.sh my-base
 If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
-sudo target/debug/boot --gui --net --track-dirty --mem 1024 --name browser-base \
-     --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
+sudo target/debug/boot --gui --net --smp 2 --track-dirty --mem 1024 --name browser-base \
+     --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
 Pass `--name browser-base` so the snapshot you take is written under that name
@@ -101,7 +107,7 @@ write the snapshot, then `Ctrl-A x` to quit. (`Ctrl-A s` writes immediately unde
 `--name`; there is no name prompt. Without `--name` the snapshot gets an
 auto-generated name, which `disposable-browser.sh` will not find.)
 
-The cold boot passes `--append "init=/sbin/overlay-init"` to hand control to
+The cold boot passes `--append "ro init=/sbin/overlay-init"` to hand control to
 the overlay setup before normal init. `--track-dirty` arms write-protect dirty
 tracking so the snapshot records only the pages that changed. Restore does not
 reload the kernel or re-run the overlay pivot; it resumes from the frozen moment.
@@ -152,8 +158,16 @@ sudo scripts/disposable-browser.sh -n 2 my-base --store /data/vmstore
 
 ## Reset a session in place
 
-Press **`Ctrl-A r`** inside any running clone to roll it back to the warm
-homepage. Guest RAM, vCPU registers, GIC state, and virtio-device state are
+With the browser window focused, press **`Ctrl+Alt+R`** to roll the clone back to
+the warm homepage. Use **`Ctrl+Alt+C`** to mark a new reset point, **`Ctrl+Alt+S`**
+to write a disk snapshot, and **`Ctrl+Alt+X`** to close the window. These GUI chords
+exist because the macOS window holds keyboard focus and `disposable-browser.sh`
+runs each clone in the background (with `&`): backgrounding closes the clone's
+serial stdin, so the foreground-only serial `Ctrl-A` shortcuts never fire. The
+window hotkey is intercepted before the keystroke reaches the guest and dispatched
+to that window's own VM, so it works per-clone under fan-out.
+
+Guest RAM, vCPU registers, GIC state, and virtio-device state are
 all restored to the snapshot moment; the macOS window repaints the resumed
 screen. Browser history, cookies, cache, open tabs, and any downloads evaporate
 — they lived only in the tmpfs upper layer, which is part of the guest RAM that
@@ -171,6 +185,12 @@ guest-visible address space, though Apple Silicon memory compression and the
 CoW instance directories mean the actual resident footprint is lower in
 practice. The `rootfs-browser.ext4` disk image is shared read-only across all
 clones — only the per-clone tmpfs upper layer (in guest RAM) diverges.
+
+The warm-base is created with `--smp 2` (Firefox is happier with more than one
+core). The vCPU count is baked into the snapshot, so every restored clone gets
+those 2 cores automatically — `disposable-browser.sh` does not pass `--smp`
+because restore inherits the count from the snapshot (like `--mem`). Re-create
+the warm-base with a different `--smp` value to change it.
 
 ## Related
 

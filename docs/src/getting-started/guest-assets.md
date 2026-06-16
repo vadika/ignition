@@ -57,7 +57,8 @@ The GUI compositor (M4) also needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVD
 
 The browser rootfs additionally requires `CONFIG_OVERLAY_FS=y` and `CONFIG_TMPFS=y`.
 These are needed only for the one-time warm-base cold boot (which passes
-`--append "init=/sbin/overlay-init"` to set up the overlay root); restoring a
+`--append "ro init=/sbin/overlay-init"` to set up the overlay root over a
+read-only lower); restoring a
 browser-base snapshot does not reload the kernel or re-run the overlay pivot.
 
 ## Rebuild the GUI rootfs

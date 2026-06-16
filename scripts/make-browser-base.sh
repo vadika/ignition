@@ -8,12 +8,17 @@
 #
 # MANUAL EQUIVALENT (if you prefer to eyeball readiness yourself):
 #   sudo target/debug/boot --gui --net --track-dirty --mem 1024 \
-#        --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
+#        --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 #   ...watch the window paint the homepage, then press Ctrl-A s, name it browser-base,
 #   then Ctrl-A x.
 #
 # usage: sudo make-browser-base.sh [snapshot-name] [kernel] [rootfs]
 set -euo pipefail
+
+# vCPU count baked into the warm-base. Accept a leading `--smp N` flag (survives
+# sudo, unlike an env var) or the SMP env; default 2.
+SMP="${SMP:-2}"
+if [ "${1:-}" = "--smp" ]; then SMP="${2:?--smp needs a number}"; shift 2; fi
 
 NAME="${1:-browser-base}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,14 +36,17 @@ fifo="$(mktemp -u)"; mkfifo "$fifo"
 cleanup() { rm -f "$fifo"; [ -n "${boot_pid:-}" ] && kill "$boot_pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# Hold the FIFO open for writing on fd 3 so boot does not see EOF.
-exec 3>"$fifo"
+# Hold the FIFO open on fd 3 so boot does not see EOF. Open read-WRITE (3<>):
+# a plain write-open (3>) blocks until a reader appears, but our reader (boot,
+# launched below) opens it only after this line, so 3> would deadlock at start.
+# 3<> returns immediately on a FIFO and keeps the write side held open.
+exec 3<>"$fifo"
 
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
-"$BOOT" --gui --net --track-dirty --mem 1024 \
-  --append "init=/sbin/overlay-init" --name "$NAME" \
+"$BOOT" --gui --net --smp "$SMP" --track-dirty --mem 1024 \
+  --append "ro init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do
       echo "$line"

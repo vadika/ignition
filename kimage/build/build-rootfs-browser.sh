@@ -146,8 +146,12 @@ export MOZ_ENABLE_WAYLAND=1
 # start_pre waits until libinput can actually see the keyboard, then cage enumerates
 # it normally at startup.
 
+# No --kiosk: kiosk mode hides ALL chrome (no address bar/tabs). cage already
+# fullscreens the single window, so plain firefox-esr gives a maximized browser
+# WITH its normal toolbar and address bar. Disposability comes from the overlay
+# root + Ctrl+Alt+R reset, not from kiosk mode.
 command="/usr/bin/cage"
-command_args="-- /usr/bin/firefox-esr --kiosk __HOMEPAGE__"
+command_args="-- /usr/bin/firefox-esr __HOMEPAGE__"
 command_background=true
 pidfile="/run/cage-kiosk.pid"
 output_log="/var/log/cage.log"
@@ -186,6 +190,10 @@ CAGEEOF
   # switch_root into openrc. Every guest write lands in RAM so the disk never
   # diverges (required for Ctrl-A r reset). Passed via init= on the kernel cmdline
   # at cold boot only; restore inherits the mounted overlay from the RAM image.
+  # The lower MUST be read-only: overlayfs requires a stable lower, and a
+  # read-write lower yields inconsistent reads (EBADMSG loading shared libs).
+  # The kernel cmdline also passes ro so the root mount itself is read-only; the
+  # remount below is belt-and-suspenders.
   cat > /sbin/overlay-init <<'"'"'OVLEOF'"'"'
 #!/bin/sh
 mount -t proc proc /proc 2>/dev/null
@@ -193,6 +201,7 @@ mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs tmpfs /mnt
 mkdir -p /mnt/up /mnt/work /mnt/root /mnt/lower
 mount --bind / /mnt/lower
+mount -o remount,ro /mnt/lower 2>/dev/null || true
 mount -t overlay overlay -o lowerdir=/mnt/lower,upperdir=/mnt/up,workdir=/mnt/work /mnt/root
 exec switch_root /mnt/root /sbin/init
 OVLEOF
