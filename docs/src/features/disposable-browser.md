@@ -31,6 +31,11 @@ The consequence is that **every write the guest makes — browser cache, cookies
 history, tab state — lives in guest RAM and only in guest RAM**. The ext4 image
 is never written.
 
+This also means the warm-base snapshot needs no filesystem sync first: there are
+no dirty disk pages to flush (the disk is read-only), and the mutable filesystem
+state lives entirely in the tmpfs upper layer, which the RAM snapshot captures
+atomically once the vCPUs are parked. The read-only lower is shared unchanged.
+
 This is what makes `Ctrl-A r` safe. The [interactive reset-to-checkpoint](snapshot-restore.md#interactive-reset-to-checkpoint)
 mechanism rolls back guest RAM, vCPU registers, GIC state, and virtio-device
 state to a saved point. For that rollback to be correct, the disk must not have
@@ -59,7 +64,7 @@ scp artemis2:'~/kbuild/out/rootfs-browser.ext4' out/rootfs-browser.ext4
 
 The `HOMEPAGE` build argument sets the URL Firefox opens on first paint. The
 rootfs ships `overlay-init` at `/sbin/overlay-init`, which the cold boot
-activates via `--append "init=/sbin/overlay-init"`.
+activates via `--append "ro init=/sbin/overlay-init"`.
 
 ## Create the warm-base snapshot
 
@@ -90,7 +95,7 @@ If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
 sudo target/debug/boot --gui --net --smp 2 --track-dirty --mem 1024 --name browser-base \
-     --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
+     --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
 Pass `--name browser-base` so the snapshot you take is written under that name
@@ -102,7 +107,7 @@ write the snapshot, then `Ctrl-A x` to quit. (`Ctrl-A s` writes immediately unde
 `--name`; there is no name prompt. Without `--name` the snapshot gets an
 auto-generated name, which `disposable-browser.sh` will not find.)
 
-The cold boot passes `--append "init=/sbin/overlay-init"` to hand control to
+The cold boot passes `--append "ro init=/sbin/overlay-init"` to hand control to
 the overlay setup before normal init. `--track-dirty` arms write-protect dirty
 tracking so the snapshot records only the pages that changed. Restore does not
 reload the kernel or re-run the overlay pivot; it resumes from the frozen moment.

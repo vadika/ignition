@@ -8,7 +8,7 @@
 #
 # MANUAL EQUIVALENT (if you prefer to eyeball readiness yourself):
 #   sudo target/debug/boot --gui --net --track-dirty --mem 1024 \
-#        --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
+#        --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 #   ...watch the window paint the homepage, then press Ctrl-A s, name it browser-base,
 #   then Ctrl-A x.
 #
@@ -41,7 +41,7 @@ echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
 "$BOOT" --gui --net --smp 2 --track-dirty --mem 1024 \
-  --append "init=/sbin/overlay-init" --name "$NAME" \
+  --append "ro init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do
       echo "$line"
