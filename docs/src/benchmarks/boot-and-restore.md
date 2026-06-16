@@ -103,6 +103,13 @@ Date: 2026-06-16. Host: Apple Silicon, macOS 26. Guest: the browser rootfs
 — serial input does not reach the escape FSM under `--gui`, so the in-place reset is
 driven from the GUI window with `Ctrl+Alt+R`).
 
+> **Config note (post-measurement):** these figures were taken with `--track-dirty` at
+> 1 GiB. Based on the hot-restore finding below, the disposable browser now runs at
+> **2 GiB without `--track-dirty`** (full-copy reset). The hot-restore row reflects the
+> old dirty-only path and motivated the switch; cold boot/restore are largely unaffected
+> (RAM scales the copy slightly). A refreshed 2 GiB / full-copy table is pending a
+> re-measure.
+
 | Operation | What it is | mean | range |
 |-----------|------------|-----:|------:|
 | **Cold boot** → `BROWSER_READY` | full kernel boot + overlay `switch_root` + Firefox cold start, to a painted homepage (wall) | **7774 ms** | 7618–8084 |
@@ -121,14 +128,19 @@ set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-
   because `clonefile` + `mmap(MAP_SHARED)` does no large up-front read — the working
   set faults in lazily as the restored browser runs.
 
-- **Hot restore (in-place reset) cost scales with the dirtied working set**, because
-  the rollback synchronously copies the pages dirtied since the checkpoint (DMA-aware
-  dirty tracking + a full re-protect). Right after loading a heavy page with active
-  traffic the first reset was 1220 ms; subsequent resets with less churn fell to
-  207 → 100 ms. So in-place reset trades a working-set copy for keeping the *same*
-  process and window — no re-spawn, no 93 ms device re-setup, no window recreate, no
-  visual flicker — and for a freshly-browsed heavy page it can cost *more* up-front
-  than a flat cold restore, while for light churn it is ~100 ms.
+- **Hot restore (in-place reset) cost scaled with the dirtied working set under
+  `--track-dirty`** — the dirty-only rollback synchronously copies the pages dirtied
+  since the checkpoint, page-by-page, plus a full re-protect. Right after loading a
+  heavy page the first reset was 1220 ms; subsequent resets fell to 207 → 100 ms.
+
+- **Finding: for a browser, dirty tracking is the wrong tool.** A browser dirties most
+  of RAM, so `--track-dirty` loses on both ends: (1) the write-protect fault on *every*
+  guest write throttles the guest during browsing, and (2) the reset then copies a
+  near-full dirty set scattered page-by-page plus re-protects all of RAM — slower than a
+  single **sequential full-RAM memcpy** (the no-tracker rollback path). So the disposable
+  browser now runs **without `--track-dirty`**: faster guest, and a flat full-copy reset.
+  Dirty tracking still wins for sparse-write workloads and is what makes diff snapshots
+  cheap — it is just a poor fit for a write-heavy GUI app.
 
 - **Known cosmetic warning (non-fatal):** after an in-place reset under active traffic
   the guest may log `virtio_net … not a head`. Root-caused via instrumentation: the

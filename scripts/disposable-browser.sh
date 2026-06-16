@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch disposable Firefox-kiosk microVMs restored from a warm-base snapshot.
-# Each clone is an independent `boot --gui --net --mem 2048 --track-dirty
+# Each clone is an independent `boot --gui --net --mem 2048
 # --restore <base>` process: its own window, its own CoW instance dir (keyed by
 # pid), its own MAC/IP. Ctrl-A r inside a clone snaps it back to the warm
 # homepage; closing the window tears that clone down. The base snapshot is never
@@ -43,7 +43,7 @@ trap cleanup EXIT INT TERM
 
 echo "launching $N disposable browser(s) from base '$BASE'"
 for i in $(seq 1 "$N"); do
-  "$BOOT" --gui --net --mem 2048 --track-dirty --restore "$BASE" "$@" &
+  "$BOOT" --gui --net --mem 2048 --restore "$BASE" "$@" &
   pid=$!
   pids+=("$pid")
   echo "  browser $i: pid $pid"
