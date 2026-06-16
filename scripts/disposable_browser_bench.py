@@ -134,6 +134,9 @@ def cold_restore_phase():
         if tail is None:
             m = RE_TAIL.search(out)
             tail = m.group(1).decode(errors="replace") if m else None
+        # Restore-time is logged BEFORE the GUI event loop opens the window; linger
+        # so the window actually paints (visual confirmation). Does not affect rt.
+        time.sleep(3.0)
         kill(pid, fd)
         rt_ms.append(rt)
         print(f"  run {i+1}: Restore-time={rt} ms", flush=True)
