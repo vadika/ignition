@@ -90,15 +90,18 @@ sudo scripts/make-browser-base.sh my-base
 If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
-sudo target/debug/boot --gui --net --track-dirty --mem 1024 \
+sudo target/debug/boot --gui --net --track-dirty --mem 1024 --name browser-base \
      --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
-Wait for the Firefox window to paint the homepage (the design intent is that
-the guest prints `BROWSER_READY` on the serial console and the llvmpipe software
-renderer presents the first frame in the macOS window). Once it looks right, press
-`Ctrl-A s` to snapshot. The VMM will prompt for a name; accept the default
-`browser-base` or type another name, then press `Ctrl-A x` to quit.
+Pass `--name browser-base` so the snapshot you take is written under that name
+(the name `disposable-browser.sh` restores by default). Wait for the Firefox
+window to paint the homepage (the design intent is that the guest prints
+`BROWSER_READY` on the serial console and the llvmpipe software renderer presents
+the first frame in the macOS window). Once it looks right, press `Ctrl-A s` to
+write the snapshot, then `Ctrl-A x` to quit. (`Ctrl-A s` writes immediately under
+`--name`; there is no name prompt. Without `--name` the snapshot gets an
+auto-generated name, which `disposable-browser.sh` will not find.)
 
 The cold boot passes `--append "init=/sbin/overlay-init"` to hand control to
 the overlay setup before normal init. `--track-dirty` arms write-protect dirty
