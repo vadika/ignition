@@ -44,7 +44,6 @@ pub fn map_keycode(kc: KeyCode) -> Option<u16> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotAction {
     Reset,
-    Checkpoint,
     Snapshot,
     Quit,
 }
@@ -57,9 +56,12 @@ fn match_hotkey(ctrl: bool, alt: bool, key: winit::keyboard::KeyCode) -> Option<
     if !(ctrl && alt) {
         return None;
     }
+    // NB: no Ctrl+Alt+C (mark in-memory checkpoint). Resetting to an arbitrary
+    // mid-session checkpoint cannot restore the GIC's in-flight interrupt state
+    // in place on HVF (hv_gic_set_state mid-run breaks delivery), so it wedges the
+    // guest. Reset always targets the quiesced warm-base point, which works.
     match key {
         KeyCode::KeyR => Some(HotAction::Reset),
-        KeyCode::KeyC => Some(HotAction::Checkpoint),
         KeyCode::KeyS => Some(HotAction::Snapshot),
         KeyCode::KeyX => Some(HotAction::Quit),
         _ => None,
@@ -73,9 +75,10 @@ mod hotkey_tests {
     #[test]
     fn ctrl_alt_letters_map_to_actions() {
         assert_eq!(match_hotkey(true, true, KeyCode::KeyR), Some(HotAction::Reset));
-        assert_eq!(match_hotkey(true, true, KeyCode::KeyC), Some(HotAction::Checkpoint));
         assert_eq!(match_hotkey(true, true, KeyCode::KeyS), Some(HotAction::Snapshot));
         assert_eq!(match_hotkey(true, true, KeyCode::KeyX), Some(HotAction::Quit));
+        // Ctrl+Alt+C is intentionally unbound (no in-place mid-session checkpoint).
+        assert_eq!(match_hotkey(true, true, KeyCode::KeyC), None);
     }
     #[test]
     fn requires_both_modifiers_and_bound_letter() {
@@ -259,12 +262,8 @@ impl App {
                     eprintln!("\n[gui] reset to checkpoint");
                     mgr.request_reset();
                 } else {
-                    eprintln!("\n[gui] reset: no checkpoint - press Ctrl+Alt+C first");
+                    eprintln!("\n[gui] reset: no checkpoint (only available after --restore)");
                 }
-            }
-            HotAction::Checkpoint => {
-                eprintln!("\n[gui] reset point marked");
-                mgr.request_checkpoint();
             }
             HotAction::Snapshot => {
                 eprintln!("\n[gui] snapshot requested");

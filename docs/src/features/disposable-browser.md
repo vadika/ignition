@@ -159,11 +159,16 @@ sudo scripts/disposable-browser.sh -n 2 my-base --store /data/vmstore
 ## Reset a session in place
 
 With the browser window focused, press **`Ctrl+Alt+R`** to roll the clone back to
-the warm homepage. Use **`Ctrl+Alt+C`** to mark a new reset point, **`Ctrl+Alt+S`**
-to write a disk snapshot, and **`Ctrl+Alt+X`** to close the window. These GUI chords
-exist because the macOS window holds keyboard focus and `disposable-browser.sh`
-runs each clone in the background (with `&`): backgrounding closes the clone's
-serial stdin, so the foreground-only serial `Ctrl-A` shortcuts never fire. The
+the warm homepage, **`Ctrl+Alt+S`** to write a disk snapshot, and **`Ctrl+Alt+X`**
+to close the window. `Ctrl+Alt+R` always resets to the warm-base (the quiesced
+point auto-seeded on `--restore`) — there is deliberately no in-window "mark a
+custom checkpoint" chord, because resetting to an arbitrary mid-session point
+cannot restore the GIC's in-flight interrupt state in place on HVF and would wedge
+the guest; a disposable browser only ever needs "back to the clean homepage", which
+is exactly the warm-base. These GUI chords exist because the macOS window holds
+keyboard focus and `disposable-browser.sh` runs each clone in the background (with
+`&`): backgrounding closes the clone's serial stdin, so the foreground-only serial
+`Ctrl-A` shortcuts never fire. The
 window hotkey is intercepted before the keystroke reaches the guest and dispatched
 to that window's own VM, so it works per-clone under fan-out.
 

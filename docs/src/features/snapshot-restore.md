@@ -147,10 +147,14 @@ Two console hotkeys let you capture a running guest's state as an in-memory
   reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
   yet, prints `reset: no checkpoint - press Ctrl-A c first`.
 
-Under `--gui` the same actions are bound to **`Ctrl+Alt+R`** (reset),
-**`Ctrl+Alt+C`** (mark reset point), and **`Ctrl+Alt+S`** (write a disk snapshot)
-in the window, since the focused window swallows the serial `Ctrl-A` chords (those
-still work on a foreground serial console).
+Under `--gui` the reset and snapshot actions are bound to **`Ctrl+Alt+R`** (reset
+to the restored snapshot point) and **`Ctrl+Alt+S`** (write a disk snapshot) in the
+window, since the focused window swallows the serial `Ctrl-A` chords (those still
+work on a foreground serial console). The in-window reset only targets the
+**auto-seeded `--restore` point**, which was captured quiesced; marking a custom
+mid-session checkpoint is intentionally not offered in `--gui` (resetting to an
+arbitrary busy point cannot restore the GIC's in-flight interrupt state in place on
+HVF, so it wedges the guest).
 
 **Auto-seed on `--restore`.** When a guest is started with `boot --restore
 <dir>`, the restored snapshot is automatically installed as the initial reset
