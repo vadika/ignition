@@ -20,6 +20,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNEL="${2:-$ROOT/kimage/out/Image}"
 ROOTFS="${3:-$ROOT/kimage/out/rootfs-browser.ext4}"
 BOOT="$ROOT/target/debug/boot"
+SMP="${SMP:-2}"   # vCPU count baked into the warm-base; override e.g. SMP=1
 
 [ -x "$BOOT" ] || { echo "boot not built/signed: $BOOT" >&2; exit 1; }
 [ -f "$KERNEL" ] || { echo "kernel not found: $KERNEL" >&2; exit 1; }
@@ -40,7 +41,7 @@ exec 3<>"$fifo"
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
-"$BOOT" --gui --net --smp 2 --track-dirty --mem 1024 \
+"$BOOT" --gui --net --smp "$SMP" --track-dirty --mem 1024 \
   --append "ro init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do
