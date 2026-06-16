@@ -316,6 +316,7 @@ impl Write for FlushWriter {
 /// The known set of snapshot-able device ids (boot_timer is add_fixed: no record).
 const KNOWN_DEVICE_IDS: &[&str] = &[
     "serial", "virtio-blk", "virtio-rng", "rtc", "virtio-balloon", "vsock", "virtio-net",
+    "virtio-gpu", "virtio-keyboard", "virtio-tablet",
 ];
 
 /// Fail if a snapshot record names a device this binary cannot rebuild.
@@ -355,6 +356,9 @@ struct DeviceContext {
     /// virtio-input device handles (Some only in --gui boot), kept for the event loop.
     keyboard_mmio: Option<Arc<Mutex<VirtioMmio>>>,
     tablet_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+    /// virtio-gpu handle (Some when a GPU device was wired), used to repaint the
+    /// scanout once after a GUI restore.
+    gpu_mmio: Option<Arc<Mutex<VirtioMmio>>>,
 }
 
 impl DeviceContext {
@@ -485,17 +489,29 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
         }
     }
 
-    // virtio-gpu — present only when a display sink was provided (--gui, boot).
-    // GUI restore is M5; the device is not added in restore mode.
-    if let (Mode::Boot, Some(sink)) = (&mode, ctx.display_sink.take()) {
+    // virtio-gpu + virtio-input — wired under --gui boot (a sink was provided) or
+    // whenever a restore record exists (a GUI snapshot). In a headless restore
+    // (record present, no sink) the GPU gets a NoopSink so its state restores
+    // consistently while presented frames are discarded.
+    let want_gpu = match &mode {
+        Mode::Boot => ctx.display_sink.is_some(),
+        Mode::Restore(recs) => recs.iter().any(|r| r.id == "virtio-gpu"),
+    };
+    if want_gpu {
+        let sink = ctx
+            .display_sink
+            .take()
+            .unwrap_or_else(|| Box::new(ignition_devices::display::NoopSink));
         let mem = ctx.guest_ram();
-        place::<VirtioMmio, _>(mgr, &mode, "virtio-gpu", layout::MMIO_WINDOW,
+        if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-gpu", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new(
                 "virtio-gpu",
                 Box::new(ignition_devices::virtio::gpu::VirtioGpu::new(1280, 800, sink)),
                 mem,
                 irq,
-            ))?;
+            ))? {
+            ctx.gpu_mmio = Some(h);
+        }
         let mem_kbd = ctx.guest_ram();
         if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-keyboard", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new(
@@ -816,6 +832,7 @@ fn main() {
         display_sink: gui_sink,
         keyboard_mmio: None,
         tablet_mmio: None,
+        gpu_mmio: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
     let kbd_handle = ctx.keyboard_mmio.clone();
@@ -1663,6 +1680,7 @@ fn run_restore(
         display_sink: None,
         keyboard_mmio: None,
         tablet_mmio: None,
+        gpu_mmio: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
     let t_dev = restore_start.elapsed();
