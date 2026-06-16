@@ -49,6 +49,34 @@ docker run --platform linux/arm64 --name fcroot_gui_build \
   chmod +x /etc/local.d/network.start
   printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
   chmod +x /etc/local.d/boottime.start
+
+  # Net re-init on snapshot restore (same poller as the base rootfs): a restore
+  # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
+  # link down->up. Without this, a restored/cloned GUI guest keeps the snapshot
+  # MAC and every clone DHCPs to the SAME IP. This busybox poller sees the carrier
+  # down->up edge, rebinds virtio_net so it re-reads the new MAC, then re-DHCPs.
+  # udev (eudev) is present in this image but the poller reads /sys directly, so it
+  # behaves identically. The rebind itself flaps the carrier, so a cooldown after
+  # acting avoids a rebind loop.
+  cat > /etc/local.d/netwatch.start <<'"'"'NETEOF'"'"'
+#!/bin/sh
+( prev=1
+  while :; do
+    cur=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
+    if [ "$prev" = 0 ] && [ "$cur" = 1 ]; then
+      d=$(basename "$(readlink /sys/class/net/eth0/device)")
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+      ifdown eth0 2>/dev/null; ifup eth0
+      sleep 5          # cooldown: ignore the rebind-induced carrier flap
+      prev=1
+      continue
+    fi
+    prev=$cur
+    sleep 1
+  done ) &
+NETEOF
+  chmod +x /etc/local.d/netwatch.start
   rc-update add local boot
 
   # --- GUI layer: cage + foot + seatd over the virtio-gpu/input devices ---
