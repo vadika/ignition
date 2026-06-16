@@ -760,6 +760,7 @@ fn main() {
     let mut window_mib: u64 = 2;
     let mut reset_mode = ignition_vmm::fuzz::controller::ResetMode::Dirty;
     let mut metrics_path: Option<PathBuf> = None;
+    let mut append: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -840,6 +841,9 @@ fn main() {
             }
             "--restore" => {
                 restore_name = Some(it.next().expect("--restore needs a snapshot name").to_string());
+            }
+            "--append" => {
+                append = Some(it.next().expect("--append needs a string").to_string());
             }
             other if other.starts_with('-') => {
                 eprintln!("unknown flag: {other}");
@@ -1001,7 +1005,7 @@ fn main() {
         mem_base: layout::RAM_BASE,
         mem_size: ram_size,
         cpu_mpidrs: (0..smp).map(mpidr_for).collect(),
-        cmdline: layout::default_cmdline(),
+        cmdline: build_cmdline(append.as_deref()),
         devices: mgr.fdt_devices(),
         gic: gic.fdt_info(),
         initrd: None,
@@ -1046,7 +1050,7 @@ fn main() {
         "gic    : dist=[{:#x}, {:#x}] redist=[{:#x}, {:#x}]",
         g.dist_base, g.dist_size, g.redist_base, g.redist_size
     );
-    eprintln!("cmdline: {}", layout::default_cmdline());
+    eprintln!("cmdline: {}", build_cmdline(append.as_deref()));
     eprintln!("--- guest console (stdout) ---");
     io::stderr().flush().ok();
 
@@ -1303,6 +1307,17 @@ fn main() {
             Ok(()) => eprintln!("\n[vcpus exited cleanly]"),
             Err(e) => eprintln!("\n[vcpu error: {e}]"),
         }
+    }
+}
+
+/// The normal-boot kernel command line, optionally with extra args appended
+/// (`--append`). Used to pass e.g. `init=/sbin/overlay-init` for the overlay-root
+/// browser rootfs. Absent `--append` reproduces `layout::default_cmdline()`.
+fn build_cmdline(append: Option<&str>) -> String {
+    let base = layout::default_cmdline();
+    match append {
+        Some(extra) if !extra.is_empty() => format!("{base} {extra}"),
+        _ => base,
     }
 }
 
@@ -2243,5 +2258,17 @@ mod tests {
         assert!(super::rx_should_inject(&stop));
         stop.store(true, Ordering::Release);
         assert!(!super::rx_should_inject(&stop));
+    }
+
+    #[test]
+    fn build_cmdline_without_append_is_default() {
+        assert_eq!(build_cmdline(None), layout::default_cmdline());
+    }
+
+    #[test]
+    fn build_cmdline_appends_extra_args() {
+        let got = build_cmdline(Some("init=/sbin/overlay-init"));
+        assert!(got.starts_with(&layout::default_cmdline()));
+        assert!(got.ends_with(" init=/sbin/overlay-init"));
     }
 }
