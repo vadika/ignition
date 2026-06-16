@@ -203,13 +203,16 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             let pristine = match &mem_file {
                 Some(src) => {
                     // MAP_SHARED -> flush so the clonefile sees current RAM.
-                    unsafe { libc::msync(host_usize as *mut libc::c_void, ram_size as usize, libc::MS_SYNC); }
+                    let rc = unsafe { libc::msync(host_usize as *mut libc::c_void, ram_size as usize, libc::MS_SYNC) };
+                    if rc != 0 {
+                        eprintln!("[checkpoint] msync failed ({}); pristine may be slightly stale", std::io::Error::last_os_error());
+                    }
                     let dst = inst_dir.join("pristine.bin");
                     let _ = std::fs::remove_file(&dst);
                     match ignition_vmm::reset::PristineRam::from_clone(src, &dst, ram_size as usize) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::error!("checkpoint: clonefile pristine failed ({e}); falling back to copy");
+                            eprintln!("[checkpoint] clonefile pristine failed ({e}); falling back to copy");
                             ignition_vmm::reset::PristineRam::from_copy(live)
                         }
                     }
@@ -219,7 +222,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             let gic_blob = match gic.save_state() {
                 Ok(b) => b,
                 Err(e) => {
-                    log::error!("checkpoint: gic save_state failed: {e}");
+                    eprintln!("[checkpoint] gic save_state failed: {e}; reset point not updated");
                     if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
                     return;
                 }
@@ -272,7 +275,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             // GIC mid-run re-restore is proven only at create-time. Best-effort;
             // on rejection log and let interrupts re-settle (spec fallback).
             if let Err(e) = ignition_hvf::gic::gic_restore(&rp.gic_blob) {
-                log::warn!("reset: gic_restore rejected mid-run ({e}); continuing without GIC re-restore");
+                eprintln!("[reset] gic_restore rejected mid-run ({e}); continuing without GIC re-restore");
             }
             frozen.restore(&rp.devices);
             if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
