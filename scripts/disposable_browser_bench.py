@@ -144,63 +144,6 @@ def cold_restore_phase():
     return rt_ms, tail
 
 
-SITES = [
-    "https://en.wikipedia.org/wiki/MicroVM",
-    "https://www.mozilla.org",
-    "https://en.wikipedia.org/wiki/Hypervisor",
-    "https://example.org",
-]
-
-
-def serial_login(fd):
-    """Best-effort root login on the serial console (root has no password). Harmless
-    if a shell is already active (`root` just becomes an unknown command)."""
-    os.write(fd, b"\r")
-    time.sleep(0.4)
-    os.write(fd, b"root\r")
-    time.sleep(1.2)
-
-
-def navigate(fd, url):
-    """Tell the running (cage) Firefox to load `url` via its remote: a second
-    firefox-esr invocation with the same profile loads into the existing instance.
-    Needs the cage Wayland session env. Best-effort; logged to /tmp/ffnav.log in-guest."""
-    cmd = (b"env XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-1 "
-           b"MOZ_ENABLE_WAYLAND=1 firefox-esr --new-tab '" + url.encode() +
-           b"' >/tmp/ffnav.log 2>&1 &\r")
-    os.write(fd, cmd)
-
-
-def hot_restore_phase():
-    """One restored instance; before each in-place reset, navigate the live Firefox
-    to a real page (dirtying a realistic working set), then trigger Ctrl-A r and read
-    Reset-time. Returns reset latencies in MILLISECONDS."""
-    reset_ms = []
-    print("\n--- hot restore (navigate to a real page, then in-place Ctrl-A r reset) ---", flush=True)
-    pid, fd = spawn(RESTORE_ARGS)
-    done, _ = read_until(fd, b"Restore-time", timeout=30)
-    if done is None:
-        print("  restore did not settle; skipping hot-restore phase", flush=True)
-        kill(pid, fd)
-        return reset_ms
-    time.sleep(5.0)  # let the restore's net carrier-bounce reconnect + the desktop settle
-    for i in range(N):
-        url = SITES[i % len(SITES)]
-        serial_login(fd)
-        navigate(fd, url)
-        print(f"  reset {i+1}: navigated to {url}; loading...", flush=True)
-        time.sleep(8.0)  # page load + render -> dirty a realistic working set
-        os.write(fd, CTRL_A + b"r")          # Ctrl-A r -> Action::Reset (in-place)
-        _, out = read_until(fd, b"Reset-time", timeout=15)
-        us = first_int(RE_RESET, out)
-        ms = us / 1000.0 if us is not None else None
-        reset_ms.append(ms)
-        print(f"  reset {i+1}: Reset-time={ms:.3f} ms" if ms is not None else f"  reset {i+1}: Reset-time=MISS", flush=True)
-        time.sleep(5.0)  # post-reset net reconnect + settle before the next navigation
-    kill(pid, fd)
-    return reset_ms
-
-
 def main():
     if os.geteuid() != 0:
         print("run under sudo (needs --net vmnet)", file=sys.stderr)
@@ -216,20 +159,24 @@ def main():
     print(f"=== disposable-browser latency, n={N} ===\n", flush=True)
     ready, gboot = cold_boot_phase()
     crestore, tail = cold_restore_phase()
-    hreset = hot_restore_phase()
 
-    print("\n=== summary ===")
+    print("\n=== summary (cold boot + cold restore; all figures in ms) ===")
     print(summ("cold boot -> BROWSER_READY (wall)", ready, "ms"))
     print(summ("cold boot Guest-boot-time", gboot, "ms"))
     print(summ("cold restore Restore-time", crestore, "ms"))
-    print(summ("hot restore Reset-time (snap-back)", hreset, "ms"))
     if tail:
         print(f"\nRestore-tail (one cold-restore sample): {tail}")
-    print("\nNotes (all figures in ms): cold restore Restore-time is the host-side up-front\n"
-          "cost (clonefile + lazy mmap + state restore); lazy page-in afterward is amortized.\n"
-          "Hot restore Reset-time is the synchronous in-place snap-back AFTER navigating the\n"
-          "live Firefox to a real page (rolling back that working set) — the net reconnect\n"
-          "that follows a reset is async (~2s) and not included.")
+    print("\nNotes: cold restore Restore-time is the host-side up-front cost (clonefile +\n"
+          "lazy mmap + state restore); lazy page-in afterward is amortized.\n")
+    print("=== hot restore (in-place Ctrl+Alt+R) — measure manually ===\n"
+          "Serial input does not reach the escape FSM under --gui, so the in-place reset\n"
+          "is driven from the GUI window. To measure it with a real working set:\n"
+          "  1. sudo scripts/disposable-browser.sh 2>&1 | tee /tmp/hot.log\n"
+          "  2. In the window, navigate to a real page (e.g. en.wikipedia.org), let it load.\n"
+          "  3. Press Ctrl+Alt+R (snaps back to the warm homepage). Repeat a few times.\n"
+          "  4. grep 'Reset-time' /tmp/hot.log   # each line is the snap-back latency in ms\n"
+          "Reset-time is the synchronous in-place rollback (RAM + device restore + repaint);\n"
+          "the net reconnect after a reset is async (~2s) and not included.")
 
 
 if __name__ == "__main__":

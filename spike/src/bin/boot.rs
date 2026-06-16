@@ -299,7 +299,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
             // The synchronous in-place reset (RAM rollback + device restore + repaint)
             // is the "hot restore" snap-back; the net reconnect below is async (~2s).
-            eprintln!("[reset] Reset-time = {} us (snap-back; net reconnect async)", t_reset.elapsed().as_micros());
+            eprintln!("[reset] Reset-time = {:.3} ms (snap-back; net reconnect async)", t_reset.elapsed().as_secs_f64() * 1000.0);
             // Net: restoring the virtio-net device cursor under a live, actively-
             // receiving NIC does not cleanly resync (mergeable-buffer/feature layout,
             // the vmnet feeder's buffered frames, and device-side RX state are not
