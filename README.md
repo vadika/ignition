@@ -38,10 +38,14 @@ Validated end-to-end on Apple Silicon. Working today:
 - **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, multi-vCPU + net + GUI.
 - **Diff snapshots** — `--track-dirty` write-protect tracking (DMA-aware: device writes are tracked
   too); immutable delta chains.
-- **Interactive reset** — `Ctrl-A r` / GUI `Ctrl+Alt+R` rolls a live guest back in place to a
-  checkpoint (RAM + vCPU + GIC + virtio-device state), fast dirty-only rollback.
+- **Interactive reset** — serial `Ctrl-A r` rolls a live guest back in place to a checkpoint
+  (RAM + vCPU + GIC + virtio-device state), fast dirty-only rollback. Under `--gui` reset is a
+  **cold relaunch** instead (`Ctrl+Alt+R` exits, the launcher re-`--restore`s) — in-place rollback
+  cannot reconcile the live GIC + virtio-gpu state on HVF.
 - **Disposable browser** — a throwaway Firefox-kiosk microVM on an overlay root (immutable disk),
-  cloned per session from a warm snapshot, reset in place, fanned out N (`scripts/disposable-browser.sh`).
+  cloned per session from a warm snapshot, reset by cold relaunch, fanned out N
+  (`scripts/disposable-browser.sh`). Restore is **~130 ms vs ~7.8 s cold boot** (≈60×), flat
+  regardless of working set (`clonefile` + lazy `MAP_SHARED`).
 - **Sandbox / jailing** — the VMM self-applies a macOS Seatbelt profile at startup (on by default;
   `--no-sandbox` to disable, fail-closed).
 - **In-VMM snapshot fuzzing** — `--fuzz` per-iteration dirty-page reset loop.
