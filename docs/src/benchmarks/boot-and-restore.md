@@ -103,12 +103,11 @@ Date: 2026-06-16. Host: Apple Silicon, macOS 26. Guest: the browser rootfs
 — serial input does not reach the escape FSM under `--gui`, so the in-place reset is
 driven from the GUI window with `Ctrl+Alt+R`).
 
-> **Config note (post-measurement):** these figures were taken with `--track-dirty` at
-> 1 GiB. Based on the hot-restore finding below, the disposable browser now runs at
-> **2 GiB without `--track-dirty`** (full-copy reset). The hot-restore row reflects the
-> old dirty-only path and motivated the switch; cold boot/restore are largely unaffected
-> (RAM scales the copy slightly). A refreshed 2 GiB / full-copy table is pending a
-> re-measure.
+> **Config note:** figures taken with `--track-dirty` at 1 GiB (the browser now runs at
+> 2 GiB — see the OOM note in [the disposable browser page](../features/disposable-browser.md)).
+> A full-RAM copy without `--track-dirty` has lower *warm* hot-restore latency but reverts
+> live virtio-gpu/input state out from under the running window and **wedges the display**,
+> so dirty-only is retained for the GUI.
 
 | Operation | What it is | mean | range |
 |-----------|------------|-----:|------:|
@@ -133,14 +132,20 @@ set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-
   since the checkpoint, page-by-page, plus a full re-protect. Right after loading a
   heavy page the first reset was 1220 ms; subsequent resets fell to 207 → 100 ms.
 
-- **Finding: for a browser, dirty tracking is the wrong tool.** A browser dirties most
-  of RAM, so `--track-dirty` loses on both ends: (1) the write-protect fault on *every*
-  guest write throttles the guest during browsing, and (2) the reset then copies a
-  near-full dirty set scattered page-by-page plus re-protects all of RAM — slower than a
-  single **sequential full-RAM memcpy** (the no-tracker rollback path). So the disposable
-  browser now runs **without `--track-dirty`**: faster guest, and a flat full-copy reset.
-  Dirty tracking still wins for sparse-write workloads and is what makes diff snapshots
-  cheap — it is just a poor fit for a write-heavy GUI app.
+- **Full-copy is faster *warm* but not viable for the GUI.** A no-`--track-dirty` reset
+  is a single sequential full-RAM copy — lower warm latency than the scattered dirty-only
+  copy — but it reverts the live virtio-gpu/input ring + fence state out from under the
+  still-running window (the GUI host threads are not quiesced during the rollback), which
+  **wedges the display** (cage blocks in `virtio_gpu_queue_fenced_ctrl_buffer`). Dirty-only
+  reverts a smaller, more consistent subset and keeps the window alive, so it is retained.
+
+- **In-place reset of a live, actively-rendering GUI is fundamentally fragile on HVF.**
+  Rolling back guest RAM + vCPU state while the GIC and the virtio devices stay live leaves
+  in-flight interrupt state unreconciled — surfacing in turn as net (`not a head`), vtimer
+  (RCU stall), and GPU-fence (cage hang) wedges, because `hv_gic_set_state` cannot be
+  re-applied mid-run. A relaunch-on-reset (tear down + a fresh `--restore`, i.e. the flat
+  130 ms cold-restore path) sidesteps all of it and is the robust alternative when an
+  in-place snap-back proves unreliable under load.
 
 - **Known cosmetic warning (non-fatal):** after an in-place reset under active traffic
   the guest may log `virtio_net … not a head`. Root-caused via instrumentation: the

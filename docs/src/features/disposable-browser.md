@@ -77,8 +77,8 @@ instead of cold-booting.
 sudo scripts/make-browser-base.sh
 ```
 
-The script cold-boots the browser rootfs with `--gui --net --mem 2048` and
-`init=/sbin/overlay-init`, watches the serial console for the
+The script cold-boots the browser rootfs with `--gui --net --mem 2048
+--track-dirty` and `init=/sbin/overlay-init`, watches the serial console for the
 `BROWSER_READY` signal that the guest emits when Firefox has painted the
 homepage, sends `Ctrl-A s` to snapshot the live guest as `browser-base`, waits
 for the snapshot write to complete, then exits. No manual timing is required.
@@ -94,7 +94,7 @@ sudo scripts/make-browser-base.sh my-base
 If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
-sudo target/debug/boot --gui --net --smp 2 --mem 2048 --name browser-base \
+sudo target/debug/boot --gui --net --smp 2 --mem 2048 --track-dirty --name browser-base \
      --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
@@ -111,12 +111,10 @@ The cold boot passes `--append "ro init=/sbin/overlay-init"` to hand control to
 the overlay setup before normal init. Restore does not reload the kernel or re-run
 the overlay pivot; it resumes from the frozen moment.
 
-The browser deliberately runs **without `--track-dirty`**. Write-protect dirty
-tracking pays off only for sparse-write workloads; a browser dirties most of RAM,
-so the per-write fault overhead slows the guest, and an in-place reset then has to
-copy a near-full dirty set page-by-page. A single sequential full-RAM copy (the
-no-tracker rollback path) is both faster to run and faster at reset for this
-workload — see the [latency benchmark](../benchmarks/boot-and-restore.md).
+`--track-dirty` arms write-protect dirty tracking; the in-place reset then rolls
+back only the changed pages. (A full-RAM copy without it has lower *warm* latency
+but reverts live virtio-gpu/input state out from under the running window and
+wedges the display — dirty-only keeps the GUI responsive.)
 
 ## Run a disposable session
 
@@ -128,7 +126,7 @@ This restores one clone of `browser-base`: a GUI window opens with Firefox at
 the homepage. Under the hood it runs:
 
 ```console
-target/debug/boot --gui --net --mem 2048 --restore browser-base
+target/debug/boot --gui --net --mem 2048 --track-dirty --restore browser-base
 ```
 
 `--net` is included by default; because vmnet shared mode requires elevated
