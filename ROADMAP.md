@@ -61,7 +61,7 @@ Two tracks carry the thesis beyond parity:
 - [x] **M1 virtio-gpu 2D** — device id 16, controlq + cursorq, SG-correct `TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH`→present; the guest framebuffer console renders in the `--gui` window. No 3D/VIRGL; GPU-state snapshot is M5. `docs/superpowers/specs/2026-06-15-virtio-gpu-m1-design.md`, umbrella `docs/superpowers/specs/2026-06-15-gui-bringup-plan.md`
 - [x] **M3 virtio-input** — keyboard + absolute tablet (device id 18); winit key/pointer/click events injected into the guest eventq; typing logs in, pointer tracks 1:1. `docs/superpowers/specs/2026-06-15-virtio-input-m3-design.md`
 - [x] **M4 compositor/app** — cage (wlroots, pixman software renderer) + foot terminal, interactive over virtio-input, on a separate `rootfs-gui.ext4`. Surfaced the virtio-gpu fence-signal fix (wlroots page-flips are fenced). `docs/superpowers/specs/2026-06-15-gui-compositor-m4-design.md`
-- [ ] **M5 snapshot/clone with the GUI live** — final GUI milestone.
+- [x] **M5 snapshot/clone with the GUI live** — final GUI milestone. virtio-gpu resource-table/scanout + virtio-input config state snapshot; `boot --gui --restore <name>` reopens the window and repaints the resumed desktop (scanout re-read from restored backing, no pixel bytes stored); headless `--restore` falls back to the serial console. One warm base fans out into N independent desktops via `scripts/fanout-gui.sh N <base>` (per-pid CoW instance, own window/MAC). `docs/superpowers/specs/2026-06-16-gui-snapshot-m5-design.md`
 
 ### Snapshot / restore — *the load-bearing feature*
 - [x] Snapshot/restore to a shell — resume from saved PC, idles ~0% CPU, responsive. `docs/src/features/snapshot-restore.md`

@@ -134,6 +134,15 @@ software-rendered Linux desktop in the macOS window, driven by the virtio-input 
 render loop keeps producing frames (without it the compositor renders one frame then
 stalls). The minimal base rootfs has no compositor and uses the framebuffer console.
 
+The GUI guest also snapshots and restores: the virtio-gpu resource table + scanout
+binding and the virtio-input config state survive a snapshot, and `boot --gui --restore
+<name>` reopens the window and repaints the resumed desktop before the guest runs (the
+device re-reads the scanout from the restored backing — no pixel bytes are stored). A
+headless `--restore` (no `--gui`) restores the same guest to the serial console with
+frames discarded. Because each restore gets its own copy-on-write instance, one
+warm-base snapshot fans out into N independent desktops — see
+`scripts/fanout-gui.sh N <base>`.
+
 ## Related
 
 - [Device model](../concepts/device-model.md) — the trait these devices implement.
