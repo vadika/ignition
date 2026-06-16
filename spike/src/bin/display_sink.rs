@@ -48,6 +48,14 @@ pub enum HotAction {
     Quit,
 }
 
+/// Process exit code meaning "reset requested — relaunch me from the snapshot".
+/// `Ctrl+Alt+R` under `--gui` does a COLD reset: the process exits with this code
+/// and the launcher (`disposable-browser.sh`) re-`--restore`s the clone. In-place
+/// rollback is not used in the GUI — reverting live RAM/GIC/virtio-gpu state under
+/// the running window wedges the display (the relaunch path is the proven cold
+/// restore). Chosen distinct from common codes so the launcher can match it.
+pub const RESET_RELAUNCH_EXIT: i32 = 42;
+
 /// Map a Ctrl+Alt+<letter> chord to a host-side action. Returns None unless BOTH
 /// ctrl and alt are held and the key is one of the bound letters, so ordinary
 /// typing (and plain Ctrl/Alt combos the guest needs) passes through to the guest.
@@ -253,21 +261,20 @@ impl App {
     /// Carry out a host-side hotkey action against this window's VM. No-op (beyond a
     /// log line) when no manager is wired or no reset point exists for `Reset`.
     fn dispatch_hotkey(&self, action: HotAction, event_loop: &ActiveEventLoop) {
-        let Some(mgr) = &self.manager else {
-            return;
-        };
         match action {
             HotAction::Reset => {
-                if mgr.has_reset_point() {
-                    eprintln!("\n[gui] reset to checkpoint");
-                    mgr.request_reset();
-                } else {
-                    eprintln!("\n[gui] reset: no checkpoint (only available after --restore)");
-                }
+                // Cold reset: exit with the relaunch sentinel so the launcher
+                // re-restores this clone from the snapshot (the proven flat
+                // cold-restore path). In-place rollback under --gui wedges the
+                // display, so it is deliberately not used here.
+                eprintln!("\n[gui] reset: relaunching clone from snapshot");
+                std::process::exit(RESET_RELAUNCH_EXIT);
             }
             HotAction::Snapshot => {
-                eprintln!("\n[gui] snapshot requested");
-                mgr.request_snapshot();
+                if let Some(mgr) = &self.manager {
+                    eprintln!("\n[gui] snapshot requested");
+                    mgr.request_snapshot();
+                }
             }
             HotAction::Quit => {
                 eprintln!("\n[gui] closing window");

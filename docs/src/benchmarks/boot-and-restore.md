@@ -103,18 +103,20 @@ Date: 2026-06-16. Host: Apple Silicon, macOS 26. Guest: the browser rootfs
 — serial input does not reach the escape FSM under `--gui`, so the in-place reset is
 driven from the GUI window with `Ctrl+Alt+R`).
 
-> **Config note:** figures taken with `--track-dirty` at 1 GiB (the browser now runs at
-> 2 GiB — see the OOM note in [the disposable browser page](../features/disposable-browser.md)).
-> A full-RAM copy without `--track-dirty` has lower *warm* hot-restore latency but reverts
-> live virtio-gpu/input state out from under the running window and **wedges the display**,
-> so dirty-only is retained for the GUI.
+> **Config note:** the "hot restore" (in-place `Ctrl+Alt+R`) figures below were taken on
+> the now-superseded in-place GUI reset, with `--track-dirty` at 1 GiB. The GUI reset is
+> now a **cold reset (relaunch)** — `Ctrl+Alt+R` exits and the launcher re-`--restore`s
+> the clone, i.e. the flat ~130 ms cold-restore path — because in-place rollback wedged
+> the live display under load (see below). The browser now runs at **2 GiB without
+> `--track-dirty`**. The in-place figures are retained as the evidence for that switch.
 
 | Operation | What it is | mean | range |
 |-----------|------------|-----:|------:|
 | **Cold boot** → `BROWSER_READY` | full kernel boot + overlay `switch_root` + Firefox cold start, to a painted homepage (wall) | **7774 ms** | 7618–8084 |
 | Cold boot — `Guest-boot-time` | kernel + early init only (guest time domain) | 599 ms | 536–724 |
 | **Cold restore** — `Restore-time` | a fresh `boot --restore browser-base` process: clonefile + `mmap(MAP_SHARED)` + GIC/device/vCPU state restore, before the guest runs | **130 ms** | 127–131 |
-| **Hot restore** — `Reset-time` | in-place `Ctrl+Alt+R` rollback of a *running* clone (dirty-page revert + device restore + repaint), after browsing to a real page | **100–1220 ms** | (working-set dependent) |
+| **GUI reset (cold/relaunch)** — *current* | `Ctrl+Alt+R` exits + the launcher re-`--restore`s → ≈ cold restore + window recreate | **≈130 ms** + window | — |
+| **In-place reset** — `Reset-time` (*serial/headless; superseded for GUI*) | in-place rollback of a *running* clone (dirty-page revert + device restore + repaint), after browsing to a real page | **100–1220 ms** | (working-set dependent) |
 
 One cold-restore tail breakdown (132 ms total): `dev:93ms` (recreating the virtio
 set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-ms.
@@ -127,10 +129,16 @@ set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-
   because `clonefile` + `mmap(MAP_SHARED)` does no large up-front read — the working
   set faults in lazily as the restored browser runs.
 
-- **Hot restore (in-place reset) cost scaled with the dirtied working set under
-  `--track-dirty`** — the dirty-only rollback synchronously copies the pages dirtied
-  since the checkpoint, page-by-page, plus a full re-protect. Right after loading a
-  heavy page the first reset was 1220 ms; subsequent resets fell to 207 → 100 ms.
+- **The GUI reset is now a cold relaunch** ≈ the flat 130 ms cold-restore plus a window
+  recreate. It is reliable because a fresh `--restore` builds clean device instances and
+  the guest re-initialises — none of the live-state reconciliation that broke the in-place
+  path. The in-place figures below are the (now serial/headless-only) reset that motivated
+  this switch.
+
+- **In-place reset cost scaled with the dirtied working set under `--track-dirty`** — the
+  dirty-only rollback synchronously copies the pages dirtied since the checkpoint,
+  page-by-page, plus a full re-protect. Right after loading a heavy page the first reset
+  was 1220 ms; subsequent resets fell to 207 → 100 ms.
 
 - **Full-copy is faster *warm* but not viable for the GUI.** A no-`--track-dirty` reset
   is a single sequential full-RAM copy — lower warm latency than the scattered dirty-only
@@ -143,9 +151,9 @@ set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-
   Rolling back guest RAM + vCPU state while the GIC and the virtio devices stay live leaves
   in-flight interrupt state unreconciled — surfacing in turn as net (`not a head`), vtimer
   (RCU stall), and GPU-fence (cage hang) wedges, because `hv_gic_set_state` cannot be
-  re-applied mid-run. A relaunch-on-reset (tear down + a fresh `--restore`, i.e. the flat
-  130 ms cold-restore path) sidesteps all of it and is the robust alternative when an
-  in-place snap-back proves unreliable under load.
+  re-applied mid-run. **This is why the GUI reset is a relaunch** (tear down + a fresh
+  `--restore`, the flat 130 ms cold path) rather than an in-place rollback — it sidesteps
+  all of it. In-place reset is kept only for headless/serial guests, where it works.
 
 - **Known cosmetic warning (non-fatal):** after an in-place reset under active traffic
   the guest may log `virtio_net … not a head`. Root-caused via instrumentation: the

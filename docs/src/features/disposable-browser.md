@@ -77,8 +77,8 @@ instead of cold-booting.
 sudo scripts/make-browser-base.sh
 ```
 
-The script cold-boots the browser rootfs with `--gui --net --mem 2048
---track-dirty` and `init=/sbin/overlay-init`, watches the serial console for the
+The script cold-boots the browser rootfs with `--gui --net --mem 2048` and
+`init=/sbin/overlay-init`, watches the serial console for the
 `BROWSER_READY` signal that the guest emits when Firefox has painted the
 homepage, sends `Ctrl-A s` to snapshot the live guest as `browser-base`, waits
 for the snapshot write to complete, then exits. No manual timing is required.
@@ -94,7 +94,7 @@ sudo scripts/make-browser-base.sh my-base
 If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
-sudo target/debug/boot --gui --net --smp 2 --mem 2048 --track-dirty --name browser-base \
+sudo target/debug/boot --gui --net --smp 2 --mem 2048 --name browser-base \
      --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
@@ -109,12 +109,9 @@ auto-generated name, which `disposable-browser.sh` will not find.)
 
 The cold boot passes `--append "ro init=/sbin/overlay-init"` to hand control to
 the overlay setup before normal init. Restore does not reload the kernel or re-run
-the overlay pivot; it resumes from the frozen moment.
-
-`--track-dirty` arms write-protect dirty tracking; the in-place reset then rolls
-back only the changed pages. (A full-RAM copy without it has lower *warm* latency
-but reverts live virtio-gpu/input state out from under the running window and
-wedges the display — dirty-only keeps the GUI responsive.)
+the overlay pivot; it resumes from the frozen moment. (No `--track-dirty`: the GUI
+reset is a relaunch, not an in-place rollback, so dirty tracking would only add
+write-protect-fault overhead with no benefit.)
 
 ## Run a disposable session
 
@@ -126,7 +123,7 @@ This restores one clone of `browser-base`: a GUI window opens with Firefox at
 the homepage. Under the hood it runs:
 
 ```console
-target/debug/boot --gui --net --mem 2048 --track-dirty --restore browser-base
+target/debug/boot --gui --net --mem 2048 --restore browser-base
 ```
 
 `--net` is included by default; because vmnet shared mode requires elevated
@@ -160,36 +157,35 @@ clone count:
 sudo scripts/disposable-browser.sh -n 2 my-base --store /data/vmstore
 ```
 
-## Reset a session in place
+## Reset a session
 
-With the browser window focused, press **`Ctrl+Alt+R`** to roll the clone back to
+With the browser window focused, press **`Ctrl+Alt+R`** to reset the clone back to
 the warm homepage, **`Ctrl+Alt+S`** to write a disk snapshot, and **`Ctrl+Alt+X`**
-to close the window. `Ctrl+Alt+R` always resets to the warm-base (the quiesced
-point auto-seeded on `--restore`) — there is deliberately no in-window "mark a
-custom checkpoint" chord, because resetting to an arbitrary mid-session point
-cannot restore the GIC's in-flight interrupt state in place on HVF and would wedge
-the guest; a disposable browser only ever needs "back to the clean homepage", which
-is exactly the warm-base. These GUI chords exist because the macOS window holds
-keyboard focus and `disposable-browser.sh` runs each clone in the background (with
-`&`): backgrounding closes the clone's serial stdin, so the foreground-only serial
-`Ctrl-A` shortcuts never fire. The
-window hotkey is intercepted before the keystroke reaches the guest and dispatched
-to that window's own VM, so it works per-clone under fan-out.
+to close the window. (These are window hotkeys, intercepted before the keystroke
+reaches the guest; `disposable-browser.sh` runs each clone backgrounded, so the
+serial `Ctrl-A` chords never reach it.)
 
-Guest RAM, vCPU registers, GIC state, and virtio-device state are
-all restored to the snapshot moment; the macOS window repaints the resumed
-screen. Browser history, cookies, cache, open tabs, and any downloads evaporate
-— they lived only in the tmpfs upper layer, which is part of the guest RAM that
-just rolled back. The same microVM keeps running; there is no restart, no kernel
-reload, and no new window.
+`Ctrl+Alt+R` is a **cold reset (relaunch)**: the clone process exits with a sentinel
+code and `disposable-browser.sh` re-`--restore`s it from the snapshot — the window
+blinks and reopens at the warm homepage in roughly the cold-restore time (~hundreds
+of ms; see the [latency benchmark](../benchmarks/boot-and-restore.md)). Everything
+from the session evaporates because the restored clone starts from the immutable
+warm-base again.
 
-Because the rootfs ext4 is read-only throughout, disk and RAM are always
-consistent at the checkpoint, so the reset is always safe.
+Why relaunch rather than roll back in place: an in-place rollback of a *live,
+actively-rendering* GUI guest cannot reconcile the running GIC and virtio devices
+(net, vtimer, and especially the virtio-gpu fence pipeline) with the rolled-back
+guest state — `hv_gic_set_state` is create-time-only on HVF, so in-flight interrupt
+state wedges the display/network under load. A fresh `--restore` has none of that
+(it builds clean device instances and the guest re-initialises), so it is the robust
+reset for the GUI. The in-place reset (`Ctrl-A r` on a serial console) is retained
+for headless guests where it works.
 
 ## Memory and resource footprint
 
-`--mem 1024` (1 GiB) is the default for both `make-browser-base.sh` and
-`disposable-browser.sh`. For N clones the RAM cost is approximately N GiB of
+`--mem 2048` (2 GiB) is the default for both `make-browser-base.sh` and
+`disposable-browser.sh` — 1 GiB OOMs Firefox once the tmpfs overlay (profile,
+cache, `/tmp`) fills under real browsing. For N clones the RAM cost is approximately N GiB of
 guest-visible address space, though Apple Silicon memory compression and the
 CoW instance directories mean the actual resident footprint is lower in
 practice. The `rootfs-browser.ext4` disk image is shared read-only across all

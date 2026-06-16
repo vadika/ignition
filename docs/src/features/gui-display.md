@@ -129,15 +129,17 @@ are intercepted by the window before the key reaches the guest:
 
 | Hotkey | Action |
 |--------|--------|
-| `Ctrl+Alt+R` | Reset the live guest in place to the warm/restored checkpoint. Only available after `--restore` (the restored snapshot is auto-seeded as the reset point before the guest runs). Prints `[gui] reset to checkpoint`. |
+| `Ctrl+Alt+R` | **Cold reset (relaunch):** the process exits with a sentinel code; a launcher (e.g. `disposable-browser.sh`) re-`--restore`s it from the snapshot. The window blinks and reopens at the warm state. Prints `[gui] reset: relaunching clone from snapshot`. |
 | `Ctrl+Alt+S` | Write a disk snapshot of the current desktop state. |
 | `Ctrl+Alt+X` | Close the window and end the session. |
 
-`Ctrl+Alt+C` is intentionally not bound. Marking an arbitrary mid-session
-checkpoint in-place would require applying GIC state to a running guest
-(`hv_gic_set_state` mid-run), which cannot reliably restore in-flight interrupt
-delivery on HVF and wedges the guest. The reset target is always the
-quiesced `--restore` point, which was captured with vCPUs parked.
+`Ctrl+Alt+R` deliberately does **not** roll back in place under `--gui`. An in-place
+rollback of a live, actively-rendering desktop cannot reconcile the running GIC and
+virtio devices (net, vtimer, and the virtio-gpu fence pipeline) with the rolled-back
+guest — `hv_gic_set_state` is create-time-only on HVF, so in-flight interrupt state
+wedges the display/network under load. A fresh `--restore` (the relaunch) builds clean
+device instances and the guest re-initialises, so it is reliable. The in-place reset
+(`Ctrl-A r` on a serial console) is retained for headless guests, where it works.
 
 The serial console still uses `Ctrl-A x` (quit), `Ctrl-A s` (snapshot), `Ctrl-A
 b` (reboot), `Ctrl-A c` (mark in-memory checkpoint), and `Ctrl-A r` (roll back

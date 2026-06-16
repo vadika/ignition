@@ -7,7 +7,7 @@
 # This is a ONE-TIME step. After it, use scripts/disposable-browser.sh.
 #
 # MANUAL EQUIVALENT (if you prefer to eyeball readiness yourself):
-#   sudo target/debug/boot --gui --net --mem 2048 --track-dirty \
+#   sudo target/debug/boot --gui --net --mem 2048 \
 #        --append "ro init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 #   ...watch the window paint the homepage, then press Ctrl-A s, name it browser-base,
 #   then Ctrl-A x.
@@ -45,7 +45,7 @@ exec 3<>"$fifo"
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
-"$BOOT" --gui --net --smp "$SMP" --mem 2048 --track-dirty \
+"$BOOT" --gui --net --smp "$SMP" --mem 2048 \
   --append "ro init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do

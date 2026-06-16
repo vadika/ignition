@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Launch disposable Firefox-kiosk microVMs restored from a warm-base snapshot.
-# Each clone is an independent `boot --gui --net --mem 2048 --track-dirty
+# Each clone is an independent `boot --gui --net --mem 2048
 # --restore <base>` process: its own window, its own CoW instance dir (keyed by
-# pid), its own MAC/IP. Ctrl-A r inside a clone snaps it back to the warm
-# homepage; closing the window tears that clone down. The base snapshot is never
-# mutated.
+# pid), its own MAC/IP. Ctrl+Alt+R does a COLD reset — the clone exits with code
+# 42 and this script re-restores it from the snapshot (a fresh window at the warm
+# homepage). Ctrl+Alt+X closes the window (exit 0) and ends that clone. The base
+# snapshot is never mutated.
 #
 # usage: disposable-browser.sh [-n N] [snapshot-name] [extra boot args...]
 #   e.g. disposable-browser.sh                       # 1 clone of browser-base
@@ -33,6 +34,8 @@ BOOT="$ROOT/target/debug/boot"
   exit 1
 }
 
+RESET_EXIT=42   # boot's exit code for Ctrl+Alt+R (cold reset -> relaunch); see display_sink.rs
+
 pids=()
 cleanup() {
   for p in "${pids[@]:-}"; do
@@ -41,12 +44,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# One supervisor subshell per clone: run boot, and on the cold-reset exit code
+# re-restore it (fresh window at the warm homepage); any other exit ends the clone.
+# The subshell traps TERM/INT to kill its current boot child so Ctrl-C on the
+# launcher tears everything down (boot is the subshell's child, not a direct one).
+clone_loop() {
+  local n="$1"; shift
+  local bpid=""
+  trap 'kill "$bpid" 2>/dev/null || true; exit 0' TERM INT
+  while :; do
+    "$BOOT" --gui --net --mem 2048 --restore "$BASE" "$@" &
+    bpid=$!
+    wait "$bpid"; local rc=$?
+    if [ "$rc" -eq "$RESET_EXIT" ]; then
+      echo "  browser $n: cold reset -> relaunching"
+      continue
+    fi
+    break
+  done
+}
+
 echo "launching $N disposable browser(s) from base '$BASE'"
 for i in $(seq 1 "$N"); do
-  "$BOOT" --gui --net --mem 2048 --track-dirty --restore "$BASE" "$@" &
+  clone_loop "$i" "$@" &
   pid=$!
   pids+=("$pid")
   echo "  browser $i: pid $pid"
 done
-echo "all launched; Ctrl-A r resets a browser in place; Ctrl-C tears them all down"
+echo "all launched; Ctrl+Alt+R = cold reset (relaunch), Ctrl+Alt+X = close; Ctrl-C tears all down"
 wait

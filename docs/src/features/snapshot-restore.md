@@ -147,14 +147,15 @@ Two console hotkeys let you capture a running guest's state as an in-memory
   reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
   yet, prints `reset: no checkpoint - press Ctrl-A c first`.
 
-Under `--gui` the reset and snapshot actions are bound to **`Ctrl+Alt+R`** (reset
-to the restored snapshot point) and **`Ctrl+Alt+S`** (write a disk snapshot) in the
-window, since the focused window swallows the serial `Ctrl-A` chords (those still
-work on a foreground serial console). The in-window reset only targets the
-**auto-seeded `--restore` point**, which was captured quiesced; marking a custom
-mid-session checkpoint is intentionally not offered in `--gui` (resetting to an
-arbitrary busy point cannot restore the GIC's in-flight interrupt state in place on
-HVF, so it wedges the guest).
+The in-place reset above is the **serial/headless** path. Under `--gui` it is not
+used: **`Ctrl+Alt+R`** instead does a **cold reset** — the process exits with a
+sentinel code and the launcher re-`--restore`s the clone (a fresh window at the warm
+state). An in-place rollback of a live, actively-rendering GUI cannot reconcile the
+running GIC + virtio-gpu/net state with the rolled-back guest (`hv_gic_set_state` is
+create-time-only on HVF, so in-flight interrupt state wedges the display under load),
+whereas a fresh `--restore` builds clean devices and the guest re-initialises.
+**`Ctrl+Alt+S`** (disk snapshot) and **`Ctrl+Alt+X`** (close) are the other window
+hotkeys; the serial console keeps the full `Ctrl-A` set.
 
 **Device (DMA) writes are now tracked.** The dirty tracker covers both vCPU-fault writes
 and device-side writes to guest RAM (virtio used-ring updates, RX frame data, block-read
