@@ -120,7 +120,8 @@ def cold_boot_phase():
         kill(pid, fd)
         ready_ms.append(t * 1000 if t else None)
         gboot_ms.append(gb)
-        print(f"  run {i+1}: BROWSER_READY={(f'{t:.2f}s' if t else 'TIMEOUT')}  Guest-boot-time={gb} ms", flush=True)
+        rstr = f"{t * 1000:.0f} ms" if t else "TIMEOUT"
+        print(f"  run {i+1}: BROWSER_READY={rstr}  Guest-boot-time={gb} ms", flush=True)
     return ready_ms, gboot_ms
 
 
