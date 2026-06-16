@@ -141,7 +141,9 @@ device re-reads the scanout from the restored backing — no pixel bytes are sto
 headless `--restore` (no `--gui`) restores the same guest to the serial console with
 frames discarded. Because each restore gets its own copy-on-write instance, one
 warm-base snapshot fans out into N independent desktops — see
-`scripts/fanout-gui.sh N <base>`.
+`scripts/fanout-gui.sh N <base>`. With `--net` (under `sudo`) each clone also gets its
+own MAC and DHCP lease, since the GUI rootfs runs the `netwatch` carrier-poller that
+rebinds virtio-net on restore.
 
 ## Related
 

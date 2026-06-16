@@ -104,13 +104,28 @@ frame, so the window paints the resumed screen before the guest runs again.
 
 Because each restore clones the immutable base into its own copy-on-write
 instance dir (keyed by pid), one warm base fans out into N independent desktops,
-each with its own window and — under `--net` — its own MAC and DHCP lease:
+each with its own window:
 
 ```console
 # take one warm-base snapshot of a logged-in desktop (Ctrl-A s), then:
 scripts/fanout-gui.sh 3 warm-base
 # -> 3 boot --gui --restore processes, 3 windows, 3 isolated guests
 ```
+
+Networking fans out too. Pass `--net` (needs `sudo` for vmnet shared mode) when
+you snapshot and when you fan out, and each clone gets its **own MAC and DHCP
+lease** — verified with 3 simultaneous clones, each on a distinct IP:
+
+```console
+sudo scripts/fanout-gui.sh 3 warm-base --net
+```
+
+This works because the GUI rootfs runs the same `netwatch` carrier-poller as the
+base rootfs: every restore starts a fresh vmnet interface (new MAC) and the VMM
+bounces the virtio-net link down→up, the poller catches that edge, rebinds
+`virtio_net` so the guest re-reads the fresh MAC, then re-runs DHCP. Without the
+poller a restored guest would keep the snapshot's MAC and every clone would DHCP
+to the same address.
 
 The base snapshot is never mutated; closing a clone's window tears down only
 that guest.
