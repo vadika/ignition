@@ -55,7 +55,10 @@ clone_loop() {
   while :; do
     "$BOOT" --gui --net --mem 2048 --restore "$BASE" "$@" &
     bpid=$!
-    wait "$bpid"; local rc=$?
+    # `wait` returns boot's exit code; capture it WITHOUT tripping `set -e` (a bare
+    # non-zero `wait` would abort the subshell before we can relaunch).
+    local rc=0
+    wait "$bpid" || rc=$?
     if [ "$rc" -eq "$RESET_EXIT" ]; then
       echo "  browser $n: cold reset -> relaunching"
       continue
