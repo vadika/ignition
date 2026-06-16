@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Build a disposable-browser aarch64 rootfs: base (busybox+openrc, getty, net,
+# boot-timer) PLUS a cage Wayland kiosk running Firefox ESR. The root is an
+# overlay (tmpfs upper over the RO ext4 lower) set up by /sbin/overlay-init at
+# cold boot, so every guest write lands in RAM and the disk never diverges.
+# Rendering uses Mesa llvmpipe (software GL). Output: ~/kbuild/out/rootfs-browser.ext4.
+set -euo pipefail
+
+OUT="$HOME/kbuild/out"
+STAGE="$HOME/kbuild"
+mkdir -p "$OUT"
+TAR="$STAGE/rootfs-browser.tar"
+
+HOMEPAGE="${HOMEPAGE:-https://duckduckgo.com}"
+
+# 1. Provision the browser rootfs inside an arm64 alpine container.
+docker rm -f fcroot_browser_build >/dev/null 2>&1 || true
+docker run --platform linux/arm64 --name fcroot_browser_build \
+  -e HOMEPAGE="$HOMEPAGE" \
+  -v "$(cd "$(dirname "$0")" && pwd)/devmem.c:/devmem.c:ro" \
+  alpine:3.19 sh -euxc '
+  # --- base provisioning (kept in sync with build-rootfs.sh) ---
+  apk add --no-cache openrc util-linux ifupdown-ng socat
+
+  apk add --no-cache --virtual .build gcc musl-dev
+  gcc -O2 -static /devmem.c -o /usr/bin/devmem
+  apk del .build
+
+  ln -sf agetty /etc/init.d/agetty.ttyS0
+  echo ttyS0 > /etc/securetty
+  rc-update add agetty.ttyS0 default
+  # NOTE: no agetty on tty1 in the GUI rootfs — cage owns the framebuffer VT, and a
+  # getty there competes with cage for the keyboard (events go to the VT, not
+  # libinput). Serial (ttyS0) stays as the debug login. Alpine ALSO spawns gettys on
+  # tty1..tty6 from busybox /etc/inittab; strip those VT gettys so none grabs the
+  # keyboard from cage (ttyS0 line, if present, is kept — [0-9] does not match "S").
+  sed -i "/^tty[0-9].*getty/d" /etc/inittab
+  rc-update add devfs boot
+  rc-update add procfs boot
+  rc-update add sysfs boot
+
+  passwd -d root || true
+
+  # NOTE: the base rootfs symlinks /dev/tty -> /dev/ttyS0 for serial-console programs.
+  # The GUI rootfs MUST NOT: foot runs its app on a pty and the app opens /dev/tty as
+  # its controlling terminal; if /dev/tty is a symlink to the serial port the app gets
+  # the wrong device (the cannot-access-tty error, no echo). Leave /dev/tty as the real
+  # kernel ctty node (c 5 0) from devtmpfs so it resolves to the apps pty.
+
+  mkdir -p /etc/network /etc/local.d
+  printf "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n" > /etc/network/interfaces
+  printf "#!/bin/sh\nifup -a\n" > /etc/local.d/network.start
+  chmod +x /etc/local.d/network.start
+  printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
+  chmod +x /etc/local.d/boottime.start
+
+  # Net re-init on snapshot restore (same poller as the base rootfs): a restore
+  # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
+  # link down->up. Without this, a restored/cloned GUI guest keeps the snapshot
+  # MAC and every clone DHCPs to the SAME IP. This busybox poller sees the carrier
+  # down->up edge, rebinds virtio_net so it re-reads the new MAC, then re-DHCPs.
+  # udev (eudev) is present in this image but the poller reads /sys directly, so it
+  # behaves identically. The rebind itself flaps the carrier, so a cooldown after
+  # acting avoids a rebind loop.
+  cat > /etc/local.d/netwatch.start <<'"'"'NETEOF'"'"'
+#!/bin/sh
+( prev=1
+  while :; do
+    cur=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
+    if [ "$prev" = 0 ] && [ "$cur" = 1 ]; then
+      d=$(basename "$(readlink /sys/class/net/eth0/device)")
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
+      echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+      ifdown eth0 2>/dev/null; ifup eth0
+      sleep 5          # cooldown: ignore the rebind-induced carrier flap
+      prev=1
+      continue
+    fi
+    prev=$cur
+    sleep 1
+  done ) &
+NETEOF
+  chmod +x /etc/local.d/netwatch.start
+  rc-update add local boot
+
+  # --- GUI layer: cage + foot + seatd over the virtio-gpu/input devices ---
+  # cage/foot/seatd live in the alpine community repo; enable it.
+  echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories
+  apk update
+  # pixman software path: no mesa/GL. cage pulls wlroots/libinput/wayland/pixman/libdrm.
+  # libinput-tools: libinput list-devices / debug-events for bring-up diagnosis.
+  # xkeyboard-config: XKB layout data — without it libxkbcommon compiles an empty
+  # keymap, so cage focuses the window but keystrokes map to nothing (verified: key
+  # events reach the guest, but no characters appear until this is installed).
+  apk add --no-cache cage foot seatd font-terminus libinput-tools xkeyboard-config wev
+  apk add --no-cache firefox-esr mesa-dri-gallium mesa-gl ca-certificates font-dejavu
+
+  # Firefox kiosk policy: no first-run, no telemetry, no update checks, set homepage.
+  mkdir -p /usr/lib/firefox/distribution
+  cat > /usr/lib/firefox/distribution/policies.json <<'"'"'POLEOF'"'"'
+{
+  "policies": {
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableAppUpdate": true,
+    "DontCheckDefaultBrowser": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "Homepage": { "URL": "__HOMEPAGE__", "StartPage": "homepage" }
+  }
+}
+POLEOF
+  sed -i "s|__HOMEPAGE__|$HOMEPAGE|" /usr/lib/firefox/distribution/policies.json
+
+  # udev (eudev): wlroots libinput discovers /dev/input/event* via udev. Without it
+  # cage aborts ("libinput initialization failed, no input devices"). Run at sysinit
+  # so input + DRM nodes are enumerated before cage starts.
+  apk add --no-cache eudev
+  rc-update add udev sysinit
+  rc-update add udev-trigger sysinit
+  rc-update add udev-settle sysinit
+
+  # seat daemon for cage to open DRM + input devices.
+  rc-update add seatd default
+
+  # cage-kiosk service: launch cage(firefox) once a virtio-gpu scanout exists. Runs as
+  # root, software renderer, logs to /var/log/cage.log (read via the serial console
+  # for debugging). No-ops cleanly when booted without --gui (no /dev/dri/card0).
+  cat > /etc/init.d/cage-kiosk <<'"'"'CAGEEOF'"'"'
+#!/sbin/openrc-run
+description="cage kiosk (firefox) on the virtio-gpu framebuffer"
+
+export XDG_RUNTIME_DIR=/run/user/0
+export WLR_RENDERER=pixman
+export WLR_RENDERER_ALLOW_SOFTWARE=1
+export XKB_DEFAULT_LAYOUT=us
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+export MOZ_ENABLE_WAYLAND=1
+# NOTE: Firefox on llvmpipe may also need MOZ_WEBRENDER=1 or MOZ_ACCELERATED=0 to
+# render reliably; to be confirmed at bring-up.
+# NOTE: deliberately NOT setting WLR_LIBINPUT_NO_DEVICES — that flag makes wlroots
+# skip enumerating the already-present (cold-boot) input devices and only listen for
+# new hotplug uevents, which never fire for devices present before cage starts, so
+# cage ends up with no keyboard (no wl_keyboard -> the app never gets focus). Instead
+# start_pre waits until libinput can actually see the keyboard, then cage enumerates
+# it normally at startup.
+
+command="/usr/bin/cage"
+command_args="-- /usr/bin/firefox-esr --kiosk __HOMEPAGE__"
+command_background=true
+pidfile="/run/cage-kiosk.pid"
+output_log="/var/log/cage.log"
+error_log="/var/log/cage.log"
+
+depend() {
+    need seatd
+    after udev-settle udev-trigger udev devfs
+}
+
+start_pre() {
+    if [ ! -e /dev/dri/card0 ]; then
+        ewarn "no /dev/dri/card0 (booted without --gui); not starting cage"
+        return 1
+    fi
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod 0700 "$XDG_RUNTIME_DIR"
+    # Wait until libinput can enumerate the keyboard (udev has finished tagging
+    # /dev/input/event*). cage enumerates input once at startup; if it starts before
+    # tagging, it gets no keyboard and the app never receives focus.
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if libinput list-devices 2>/dev/null | grep -qi keyboard; then
+            break
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+}
+CAGEEOF
+  chmod +x /etc/init.d/cage-kiosk
+  rc-update add cage-kiosk default
+  sed -i "s|__HOMEPAGE__|$HOMEPAGE|" /etc/init.d/cage-kiosk
+
+  # overlay-root setup: mount tmpfs upper, overlay onto the RO ext4 lower, then
+  # switch_root into openrc. Every guest write lands in RAM so the disk never
+  # diverges (required for Ctrl-A r reset). Passed via init= on the kernel cmdline
+  # at cold boot only; restore inherits the mounted overlay from the RAM image.
+  cat > /sbin/overlay-init <<'"'"'OVLEOF'"'"'
+#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t tmpfs tmpfs /mnt
+mkdir -p /mnt/up /mnt/work /mnt/root /mnt/lower
+mount --bind / /mnt/lower
+mount -t overlay overlay -o lowerdir=/mnt/lower,upperdir=/mnt/up,workdir=/mnt/work /mnt/root
+exec switch_root /mnt/root /sbin/init
+OVLEOF
+  chmod +x /sbin/overlay-init
+
+  # Readiness sentinel for make-browser-base.sh: once the firefox process is up
+  # and settled, print a marker on the serial console so the host can snapshot.
+  cat > /etc/local.d/browser-ready.start <<'"'"'RDYEOF'"'"'
+#!/bin/sh
+# Match the real firefox binary path, not the cage command line (which contains
+# the string firefox-esr) so the marker does not fire before firefox is running.
+# The path may need adjusting at bring-up; pgrep -f /usr/lib/firefox is broad
+# enough to catch the launched process without matching cage.
+( i=0
+  while [ "$i" -lt 120 ]; do
+    if pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
+      sleep 6
+      echo BROWSER_READY > /dev/ttyS0
+      exit 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  echo BROWSER_TIMEOUT > /dev/ttyS0 ) &
+RDYEOF
+  chmod +x /etc/local.d/browser-ready.start
+'
+
+# Export the container filesystem to a tarball (host-user writable path).
+docker export fcroot_browser_build -o "$TAR"
+docker rm fcroot_browser_build >/dev/null
+
+# 2. Pack the tree into a 1536 MiB ext4 (browser tree is far larger than the GUI tree).
+docker run --rm -v "$STAGE:/work" ubuntu:22.04 bash -euxc '
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends e2fsprogs >/dev/null
+
+  rm -rf /tmp/rootfs && mkdir -p /tmp/rootfs
+  tar xf /work/rootfs-browser.tar -C /tmp/rootfs
+  rm -f /tmp/rootfs/.dockerenv
+  for d in dev proc run sys tmp mnt; do mkdir -p /tmp/rootfs/$d; done
+
+  rm -f /work/out/rootfs-browser.ext4
+  mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs-browser /work/out/rootfs-browser.ext4 1536M
+  ls -la /work/out/rootfs-browser.ext4
+'
+
+rm -f "$TAR"

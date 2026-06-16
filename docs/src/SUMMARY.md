@@ -14,6 +14,7 @@
   - [Snapshot & restore](features/snapshot-restore.md)
   - [Diff / incremental snapshots](features/diff-snapshots.md)
 - [Devices, SMP & networking](features/devices.md)
+- [Disposable browser](features/disposable-browser.md)
 - [VM internal API (MMIO)](concepts/vm-internal-api.md)
 
 # Snapshot fuzzing

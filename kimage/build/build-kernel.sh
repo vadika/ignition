@@ -49,6 +49,8 @@ docker run --rm \
       --enable DRM_FBDEV_EMULATION \
       --enable FB \
       --enable FRAMEBUFFER_CONSOLE \
+      --enable OVERLAY_FS \
+      --enable TMPFS \
       --enable VIRTIO_INPUT
 
     export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
@@ -56,6 +58,7 @@ docker run --rm \
     echo "=== requested configs after olddefconfig ==="
     grep -E "CONFIG_(VIRTIO_BALLOON|VSOCKETS|VIRTIO_VSOCKETS|VHOST|VHOST_VSOCK|DEVMEM|STRICT_DEVMEM)=" .config || true
     grep -E "CONFIG_(DRM|DRM_VIRTIO_GPU|DRM_FBDEV_EMULATION|FB|FRAMEBUFFER_CONSOLE|VIRTIO_INPUT)=" .config || true
+    grep -E "CONFIG_(OVERLAY_FS|TMPFS)=" .config || echo "OVERLAY_FS/TMPFS not set (BAD for browser rootfs)"
     grep -E "CONFIG_STRICT_DEVMEM" .config || echo "CONFIG_STRICT_DEVMEM not set (good)"
     make -j"$(nproc)" Image
 
