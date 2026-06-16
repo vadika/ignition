@@ -830,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_rejected_while_snapshot_active() {
+    fn claim_rejected_while_rendezvous_active() {
         let m = mgr(4);
         m.rendezvous_active.store(true, Ordering::Relaxed);
         assert_eq!(m.claim(1), Claim::Frozen);
