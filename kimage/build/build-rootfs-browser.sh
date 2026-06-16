@@ -202,16 +202,21 @@ OVLEOF
   # and settled, print a marker on the serial console so the host can snapshot.
   cat > /etc/local.d/browser-ready.start <<'"'"'RDYEOF'"'"'
 #!/bin/sh
+# Match the real firefox binary path, not the cage command line (which contains
+# the string firefox-esr) so the marker does not fire before firefox is running.
+# The path may need adjusting at bring-up; pgrep -f /usr/lib/firefox is broad
+# enough to catch the launched process without matching cage.
 ( i=0
   while [ "$i" -lt 120 ]; do
-    if pgrep -f firefox >/dev/null 2>&1; then
+    if pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
       sleep 6
       echo BROWSER_READY > /dev/ttyS0
       exit 0
     fi
     sleep 1
     i=$((i + 1))
-  done ) &
+  done
+  echo BROWSER_TIMEOUT > /dev/ttyS0 ) &
 RDYEOF
   chmod +x /etc/local.d/browser-ready.start
 '
