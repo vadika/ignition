@@ -1,9 +1,10 @@
 # Disposable browser
 
-ignition can run a throwaway Firefox-ESR kiosk in a microVM where every write
-lands in guest RAM, never touches the disk, and a single hotkey resets the session
-back to a warm homepage — without reloading the kernel or replaying the overlay
-boot path.
+ignition can run a throwaway Firefox ESR in a microVM where every write lands in
+guest RAM, never touches the disk, and a single hotkey resets the session back to
+a warm homepage — without reloading the kernel or replaying the overlay boot path.
+cage fullscreens the single Firefox window (so it fills the macOS window), but
+Firefox keeps its normal toolbar and address bar, so you can navigate anywhere.
 
 ## What it is
 

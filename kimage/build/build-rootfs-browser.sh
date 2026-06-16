@@ -146,8 +146,12 @@ export MOZ_ENABLE_WAYLAND=1
 # start_pre waits until libinput can actually see the keyboard, then cage enumerates
 # it normally at startup.
 
+# No --kiosk: kiosk mode hides ALL chrome (no address bar/tabs). cage already
+# fullscreens the single window, so plain firefox-esr gives a maximized browser
+# WITH its normal toolbar and address bar. Disposability comes from the overlay
+# root + Ctrl+Alt+R reset, not from kiosk mode.
 command="/usr/bin/cage"
-command_args="-- /usr/bin/firefox-esr --kiosk __HOMEPAGE__"
+command_args="-- /usr/bin/firefox-esr __HOMEPAGE__"
 command_background=true
 pidfile="/run/cage-kiosk.pid"
 output_log="/var/log/cage.log"
