@@ -278,6 +278,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             match &dirty {
                 Some(t) => {
                     let pages = t.drain();
+                    eprintln!("[reset-dbg] dirty rollback: {} pages ({} KiB)", pages.len(), pages.len() * 16);
                     ignition_vmm::reset::rollback_pages(rp.pristine.as_slice(), live, &pages, ignition_vmm::dirty::PAGE);
                     let _ = ignition_hvf::vm_protect_memory(
                         layout::RAM_BASE, ram_size,

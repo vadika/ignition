@@ -47,12 +47,22 @@ impl Virtqueue {
         if self.last_avail_idx == avail_idx {
             return None;
         }
+        // DBG: an implausible pending count (> ring size) means the device read a
+        // stale/inconsistent avail ring relative to its cursor — the prime suspect
+        // for a post-reset "not a head". Instrumentation only; behaviour unchanged.
+        let pending = avail_idx.wrapping_sub(self.last_avail_idx);
+        if pending > self.size {
+            eprintln!("[vq-dbg] avail jump: last_avail={} avail_idx={} pending={} size={}",
+                self.last_avail_idx, avail_idx, pending, self.size);
+        }
         let slot = self.last_avail_idx % self.size;
         let head = mem.read_u16(self.driver_addr + 4 + u64::from(slot) * 2)?;
         // Consume the avail entry even if it turns out malformed, so a bad index
         // can't stall the ring (it is dropped, not retried).
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
         if head >= self.size {
+            eprintln!("[vq-dbg] bad head {head} >= size {} (slot {slot}, last_avail {}, avail_idx {avail_idx})",
+                self.size, self.last_avail_idx.wrapping_sub(1));
             return None; // malformed head index; entry consumed and dropped
         }
 

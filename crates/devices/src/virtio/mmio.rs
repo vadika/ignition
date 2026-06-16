@@ -233,6 +233,9 @@ impl VirtioMmio {
     }
 
     fn set_queue_ready(&mut self, sel: usize, val: u32) {
+        if self.id == "virtio-net" {
+            eprintln!("[net-dbg] queue {sel} ready={}", val != 0);
+        }
         let Some(q) = self.queues.get_mut(sel) else {
             return;
         };
@@ -345,6 +348,9 @@ impl VirtioMmio {
     }
 
     fn reset(&mut self) {
+        if self.id == "virtio-net" {
+            eprintln!("[net-dbg] device reset (status=0) — queues cleared");
+        }
         for q in &mut self.queues {
             *q = QueueState::default();
         }
