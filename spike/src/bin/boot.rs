@@ -754,7 +754,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
-        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox) {
+        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, gui) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -1487,6 +1487,7 @@ fn run_fuzz_mode(
 /// is cloned + mmap'd, every Diff layer is overlaid in order, and the vCPU/GIC/device
 /// state of the LEAF is restored. Does NOT load a kernel, generate an FDT, or call
 /// set_initial_state — the running kernel + DTB are already in the reassembled RAM.
+#[allow(clippy::too_many_arguments)]
 fn run_restore(
     store: &Path,
     restore_name: &str,
@@ -1495,6 +1496,7 @@ fn run_restore(
     track_dirty: bool,
     vsock_uds: Option<PathBuf>,
     no_sandbox: bool,
+    gui: bool,
 ) -> io::Result<()> {
     // Host-side restore clock: chain resolution + mmap + diff overlay + GIC/device/vCPU
     // state restore, up to handing the guest to the run loop. The boot-timer device
@@ -1669,6 +1671,18 @@ fn run_restore(
         None
     };
 
+    // Under --gui, wire a WindowSink so the restored virtio-gpu presents into the
+    // event loop; without it the restore stays headless (NoopSink in setup_devices).
+    let (gui_sink, gui_rx): (
+        Option<Box<dyn ignition_devices::display::DisplaySink>>,
+        Option<std::sync::mpsc::Receiver<ignition_devices::display::Frame>>,
+    ) = if gui {
+        let (sink, rx) = display_sink::WindowSink::new();
+        (Some(Box::new(sink)), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let mut ctx = DeviceContext {
         host: host as *mut u8,
         ram_size: mem_size,
@@ -1677,12 +1691,15 @@ fn run_restore(
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
-        display_sink: None,
+        display_sink: gui_sink,
         keyboard_mmio: None,
         tablet_mmio: None,
         gpu_mmio: None,
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
+    let kbd_handle = ctx.keyboard_mmio.clone();
+    let tab_handle = ctx.tablet_mmio.clone();
+    let gpu_handle = ctx.gpu_mmio.clone();
     let t_dev = restore_start.elapsed();
 
     let serial = ctx.serial.clone().ok_or_else(|| io::Error::other("snapshot had no serial device"))?;
@@ -1916,10 +1933,38 @@ fn run_restore(
                    vsock_uds.as_ref().and_then(|u| u.parent().map(PathBuf::from))]
             .into_iter().flatten().collect(),
     };
-    apply_or_exit(&sb_paths, no_sandbox);
-
-    // 8. Run: VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
-    let run_result = manager.run_restored(snap.vcpus, Some(gic_blob));
+    // 8. Run. Under --gui the winit event loop must own the main thread (macOS), so
+    //    the VMM moves to a spawned thread and the event loop runs on main — mirroring
+    //    the fresh-boot --gui split. The restored scanout is repainted once up front so
+    //    the window shows the resumed desktop before the guest produces its next FLUSH.
+    let run_result = if gui {
+        let rx = gui_rx.expect("gui implies a receiver was created");
+        // Repaint the resumed desktop from the restored backing into the event loop.
+        if let Some(gpu) = &gpu_handle {
+            gpu.lock().unwrap().present_scanout();
+        }
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done_vmm = done.clone();
+        let mgr_run = manager.clone();
+        let vcpus = snap.vcpus;
+        std::thread::spawn(move || {
+            struct SignalOnExit(std::sync::Arc<AtomicBool>);
+            impl Drop for SignalOnExit {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _signal = SignalOnExit(done_vmm);
+            apply_or_exit(&sb_paths, no_sandbox);
+            let _ = mgr_run.run_restored(vcpus, Some(gic_blob));
+        });
+        display_sink::run_event_loop(rx, done, 1280, 800, kbd_handle, tab_handle, 1280, 800);
+        Ok(())
+    } else {
+        apply_or_exit(&sb_paths, no_sandbox);
+        // VcpuManager creates + restores the vCPU on the vCPU thread (thread-affinity).
+        manager.run_restored(snap.vcpus, Some(gic_blob))
+    };
 
     // Best-effort cleanup of the CoW instance dir (memory.bin + disk.img clones).
     // A Ctrl-A x exit calls process::exit and intentionally skips this — a leftover
