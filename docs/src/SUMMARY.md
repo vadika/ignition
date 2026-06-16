@@ -14,6 +14,8 @@
   - [Snapshot & restore](features/snapshot-restore.md)
   - [Diff / incremental snapshots](features/diff-snapshots.md)
 - [Devices, SMP & networking](features/devices.md)
+- [GUI display](features/gui-display.md)
+- [Sandbox & jailing](features/sandbox.md)
 - [Disposable browser](features/disposable-browser.md)
 - [VM internal API (MMIO)](concepts/vm-internal-api.md)
 
@@ -30,7 +32,6 @@
 - [HVF and Firecracker map](internals/hvf-firecracker-map.md)
 - [Design decisions](internals/design-decisions.md)
 - [Validation spike](internals/validation-spike.md)
-- [Seatbelt sandbox](internals/sandbox.md)
 
 # Appendix
 - [Specs & plans (agentic reference)](appendix/specs-and-plans.md)
