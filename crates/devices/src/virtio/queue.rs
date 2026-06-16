@@ -1,19 +1,6 @@
 //! Minimal split virtqueue (virtio 1.0 §2.6), processed synchronously.
 
 use super::guest_ram::GuestRam;
-use core::sync::atomic::{AtomicU64, Ordering};
-
-/// DBG counters for the post-reset `not a head` chase: incremented in the hot RX
-/// path (no logging there — see pop_avail) and read+cleared at reset time via
-/// `take_vq_anomalies`. avail-jump = device read an avail ring inconsistent with its
-/// cursor (pending > size); bad-head = avail slot pointed at head index >= size.
-pub static VQ_AVAIL_JUMP: AtomicU64 = AtomicU64::new(0);
-pub static VQ_BAD_HEAD: AtomicU64 = AtomicU64::new(0);
-
-/// Read and clear the virtqueue anomaly counters.
-pub fn take_vq_anomalies() -> (u64, u64) {
-    (VQ_AVAIL_JUMP.swap(0, Ordering::Relaxed), VQ_BAD_HEAD.swap(0, Ordering::Relaxed))
-}
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -60,20 +47,12 @@ impl Virtqueue {
         if self.last_avail_idx == avail_idx {
             return None;
         }
-        // DBG: count anomalies (implausible pending count / malformed head) without
-        // logging in this hot, net-lock-held path — eprintln here can backpressure
-        // and deadlock the reset's net-drain. Counters are logged elsewhere.
-        let pending = avail_idx.wrapping_sub(self.last_avail_idx);
-        if pending > self.size {
-            VQ_AVAIL_JUMP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
         let slot = self.last_avail_idx % self.size;
         let head = mem.read_u16(self.driver_addr + 4 + u64::from(slot) * 2)?;
         // Consume the avail entry even if it turns out malformed, so a bad index
         // can't stall the ring (it is dropped, not retried).
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
         if head >= self.size {
-            VQ_BAD_HEAD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return None; // malformed head index; entry consumed and dropped
         }
 

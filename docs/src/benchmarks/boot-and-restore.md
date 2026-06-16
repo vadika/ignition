@@ -130,11 +130,16 @@ set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-
   visual flicker — and for a freshly-browsed heavy page it can cost *more* up-front
   than a flat cold restore, while for light churn it is ~100 ms.
 
-- **Known wrinkle:** under active network traffic, a `virtio_net … not a head` warning
-  recurred once after the heaviest reset (the net reset is not yet 100% clean under
-  load). It self-recovered via the carrier-bounce rebind (later resets were clean), but
-  it points at a residual race in the in-place net reset, distinct from these latency
-  figures.
+- **Known cosmetic warning (non-fatal):** after an in-place reset under active traffic
+  the guest may log `virtio_net … not a head`. Root-caused via instrumentation: the
+  rollback is *complete* (each reset reverted 600 MB–1 GB of dirtied pages, no malformed
+  heads), so this is not corruption. The warm-base snapshot froze the net RX queue
+  mid-flight (the device had completed RX into descriptors and advanced `used.idx`
+  before the guest drained them); the in-place reset replays those completions on resume
+  — and one descriptor is no longer a chain head in the rolled-back state, so the guest
+  *drops* it (the warning) before the carrier-bounce rebind re-inits the NIC and
+  re-DHCPs. A cold restore never hits it because the guest rebinds first. It self-heals;
+  net works after. (A net-idle warm-base snapshot would remove it at the source.)
 
 ## Related
 

@@ -278,7 +278,6 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             match &dirty {
                 Some(t) => {
                     let pages = t.drain();
-                    eprintln!("[reset-dbg] dirty rollback: {} pages ({} KiB)", pages.len(), pages.len() * 16);
                     ignition_vmm::reset::rollback_pages(rp.pristine.as_slice(), live, &pages, ignition_vmm::dirty::PAGE);
                     let _ = ignition_hvf::vm_protect_memory(
                         layout::RAM_BASE, ram_size,
@@ -286,10 +285,6 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
                     );
                 }
                 None => ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live),
-            }
-            let (aj, bh) = ignition_devices::virtio::queue::take_vq_anomalies();
-            if aj != 0 || bh != 0 {
-                eprintln!("[reset-dbg] vq anomalies since last reset: avail_jump={aj} bad_head={bh}");
             }
             // Deliberately do NOT re-restore the GIC distributor/redistributor here.
             // hv_gic_set_state mid-run (after the GIC has been delivering interrupts)
