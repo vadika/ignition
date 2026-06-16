@@ -31,8 +31,11 @@ fifo="$(mktemp -u)"; mkfifo "$fifo"
 cleanup() { rm -f "$fifo"; [ -n "${boot_pid:-}" ] && kill "$boot_pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-# Hold the FIFO open for writing on fd 3 so boot does not see EOF.
-exec 3>"$fifo"
+# Hold the FIFO open on fd 3 so boot does not see EOF. Open read-WRITE (3<>):
+# a plain write-open (3>) blocks until a reader appears, but our reader (boot,
+# launched below) opens it only after this line, so 3> would deadlock at start.
+# 3<> returns immediately on a FIFO and keeps the write side held open.
+exec 3<>"$fifo"
 
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
