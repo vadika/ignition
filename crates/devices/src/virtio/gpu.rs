@@ -1,7 +1,8 @@
 //! virtio-gpu (VIRTIO_ID_GPU = 16), 2D only. controlq (0) carries display/resource
 //! commands; cursorq (1) is parsed and ack'd (software cursor). One scanout, fixed
 //! mode, B8G8R8A8. RESOURCE_FLUSH presents the scanned-out resource through a
-//! `DisplaySink`. No VIRGL/3D/blob; no snapshot of GPU state (that is M5).
+//! `DisplaySink`. No VIRGL/3D/blob. save/restore snapshots resource-table metadata
+//! and scanout binding (pixel contents are reconstructed from guest backing).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -352,6 +353,71 @@ impl VirtioDevice for VirtioGpu {
         VIRTIO_ID_GPU
     }
 
+    fn save(&self) -> serde_json::Value {
+        let resources: Vec<serde_json::Value> = self
+            .resources
+            .iter()
+            .map(|(id, r)| {
+                let backing: Vec<serde_json::Value> = r
+                    .backing
+                    .iter()
+                    .map(|&(gpa, len)| serde_json::json!({ "gpa": gpa, "len": len }))
+                    .collect();
+                serde_json::json!({
+                    "id": id,
+                    "format": r.format,
+                    "width": r.width,
+                    "height": r.height,
+                    "backing": backing,
+                })
+            })
+            .collect();
+        serde_json::json!({ "resources": resources, "scanout_res": self.scanout_res })
+    }
+
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        let arr = v
+            .get("resources")
+            .and_then(|x| x.as_array())
+            .ok_or("gpu: missing resources")?;
+        let mut resources = HashMap::new();
+        for e in arr {
+            let id = e.get("id").and_then(|x| x.as_u64()).ok_or("gpu: resource missing id")? as u32;
+            let format =
+                e.get("format").and_then(|x| x.as_u64()).ok_or("gpu: resource missing format")? as u32;
+            let width =
+                e.get("width").and_then(|x| x.as_u64()).ok_or("gpu: resource missing width")? as u32;
+            let height =
+                e.get("height").and_then(|x| x.as_u64()).ok_or("gpu: resource missing height")? as u32;
+            let size = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4))
+                .filter(|&n| n <= MAX_RESOURCE_BYTES)
+                .ok_or("gpu: restored resource size invalid")?;
+            let backing_arr =
+                e.get("backing").and_then(|x| x.as_array()).ok_or("gpu: resource missing backing")?;
+            let mut backing = Vec::with_capacity(backing_arr.len());
+            for b in backing_arr {
+                let gpa = b.get("gpa").and_then(|x| x.as_u64()).ok_or("gpu: backing missing gpa")?;
+                let len =
+                    b.get("len").and_then(|x| x.as_u64()).ok_or("gpu: backing missing len")? as u32;
+                backing.push((gpa, len));
+            }
+            resources.insert(id, Resource2D {
+                format,
+                width,
+                height,
+                backing,
+                pixels: Arc::new(Mutex::new(vec![0u8; size])),
+            });
+        }
+        let scanout_res =
+            v.get("scanout_res").and_then(|x| x.as_u64()).ok_or("gpu: missing scanout_res")? as u32;
+        self.resources = resources;
+        self.scanout_res = scanout_res;
+        Ok(())
+    }
+
     fn device_features(&self, _sel: u32) -> u32 {
         0
     }
@@ -681,6 +747,34 @@ mod tests {
         submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
         submit(&mut gpu, &mut backing, &flush_req(2));
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_restore_roundtrips_resource_table_and_scanout() {
+        let mut gpu = new_gpu();
+        let mut backing = vec![0u8; 0x4000];
+        submit(&mut gpu, &mut backing, &create_2d_req(7, 8, 4));
+        submit(&mut gpu, &mut backing, &attach_backing_req(7, &[(0x1000, 64), (0x2000, 64)]));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 7));
+        let saved = gpu.save();
+
+        let mut gpu2 = new_gpu();
+        gpu2.restore(&saved).expect("restore ok");
+        assert_eq!(gpu2.scanout_res, 7);
+        let r = gpu2.resources.get(&7).expect("resource 7 restored");
+        assert_eq!((r.format, r.width, r.height), (FORMAT_B8G8R8A8_UNORM, 8, 4));
+        assert_eq!(r.backing, vec![(0x1000, 64), (0x2000, 64)]);
+        assert_eq!(r.pixels.lock().unwrap().len(), 8 * 4 * 4); // rebuilt zeroed
+    }
+
+    #[test]
+    fn restore_rejects_absurd_resource_size() {
+        let mut gpu = new_gpu();
+        let bad = serde_json::json!({
+            "resources": [{ "id": 1, "format": 1, "width": 0x10000, "height": 0x10000, "backing": [] }],
+            "scanout_res": 0
+        });
+        assert!(gpu.restore(&bad).is_err());
     }
 
     #[test]
