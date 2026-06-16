@@ -177,6 +177,7 @@ struct ResetWiring {
     frozen: Arc<FrozenDevices>,
     dirty: Option<DirtyTracker>,
     rx_stop: Option<Arc<AtomicBool>>,
+    net_mmio: Option<Arc<Mutex<VirtioMmio>>>,
     gpu: Option<Arc<Mutex<VirtioMmio>>>,
 }
 
@@ -253,11 +254,20 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
         let frozen = w.frozen.clone();
         let dirty = w.dirty.clone();
         let rx_stop = w.rx_stop.clone();
+        let net_mmio = w.net_mmio.clone();
         let gpu = w.gpu.clone();
         manager.set_reset_handler(Box::new(move || {
             let guard = point.lock().unwrap();
             let Some(rp) = guard.as_ref() else { return; };
+            // Quiesce the vmnet RX feeder, then DRAIN it: the feeder holds the net
+            // device lock across its stop-check + inject, so acquiring that lock
+            // once is a barrier guaranteeing no inject is in-flight or can begin
+            // before we roll back RAM. Without this the feeder advances the device
+            // avail cursor past the rolled-back ring -> "virtio_net ... not a head".
             if let Some(stop) = &rx_stop { stop.store(true, Ordering::Release); }
+            if let Some(net) = &net_mmio {
+                drop(net.lock().unwrap_or_else(|p| p.into_inner()));
+            }
             let live: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(host_usize as *mut u8, ram_size as usize)
             };
@@ -272,11 +282,15 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
                 }
                 None => ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live),
             }
-            // GIC mid-run re-restore is proven only at create-time. Best-effort;
-            // on rejection log and let interrupts re-settle (spec fallback).
-            if let Err(e) = ignition_hvf::gic::gic_restore(&rp.gic_blob) {
-                eprintln!("[reset] gic_restore rejected mid-run ({e}); continuing without GIC re-restore");
-            }
+            // Deliberately do NOT re-restore the GIC distributor/redistributor here.
+            // hv_gic_set_state mid-run (after the GIC has been delivering interrupts)
+            // does not re-arm delivery: the vtimer PPI stops firing (RCU stalls) and
+            // device used-ring IRQs never arrive (the GPU fence wait hangs -> black
+            // screen). The guest does not reprogram the GIC after boot, so the live
+            // distributor/redistributor already match the checkpoint; leaving them
+            // untouched keeps interrupt delivery alive. Each vCPU still restores its
+            // own ICC (CPU-interface) state via restore_state at the reset barrier.
+            // rp.gic_blob stays captured for the disk-snapshot path; unused here.
             frozen.restore(&rp.devices);
             if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
             if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
@@ -1065,9 +1079,10 @@ fn main() {
 
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
-    // Reset-handler copies: rx_stop_snap is moved into the snapshot closure below,
-    // so capture independent clones here for install_reset_handlers.
+    // Reset-handler copies: rx_stop_snap/net_mmio_snap are moved into the snapshot
+    // closure below, so capture independent clones here for install_reset_handlers.
     let rx_stop_reset = ctx.rx_stop.clone();
+    let net_mmio_reset = ctx.net_mmio.clone();
     let gpu_handle = ctx.gpu_mmio.clone();
 
     // The "current parent" carried across Ctrl-A s invocations. None on a fresh
@@ -1241,6 +1256,7 @@ fn main() {
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
         rx_stop: rx_stop_reset,
+        net_mmio: net_mmio_reset,
         gpu: gpu_handle,
     });
 
@@ -1894,8 +1910,9 @@ fn run_restore(
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
-    // Reset-handler copy: rx_stop_snap is moved into the re-snapshot closure below.
+    // Reset-handler copies: snap clones are moved into the re-snapshot closure below.
     let rx_stop_reset = ctx.rx_stop.clone();
+    let net_mmio_reset = ctx.net_mmio.clone();
     let q_vsock = restore_start.elapsed();
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
@@ -2086,6 +2103,7 @@ fn run_restore(
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
         rx_stop: rx_stop_reset,
+        net_mmio: net_mmio_reset,
         gpu: gpu_handle.clone(),
     });
 
