@@ -23,6 +23,75 @@ pub fn rollback_pages(pristine: &[u8], live: &mut [u8], pages: &[u64], page: usi
     }
 }
 
+use std::io;
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+
+/// The immutable RAM image a `Ctrl-A r` rolls back to.
+///
+/// `Mapped` is a read-only mmap of an APFS clonefile (O(1), CoW on disk — the
+/// disposable-browser fan-out case). `Owned` is a plain heap copy, used for a
+/// fresh boot whose guest RAM has no backing file (`MAP_ANON`).
+pub enum PristineRam {
+    Mapped { ptr: *mut libc::c_void, len: usize },
+    Owned(Vec<u8>),
+}
+
+// SAFETY: `Mapped` holds a read-only, immutable mmap. The pointer is never
+// written through and the mapping outlives every reader (dropped only when the
+// ResetPoint is replaced). Sharing the slice across threads is sound.
+unsafe impl Send for PristineRam {}
+unsafe impl Sync for PristineRam {}
+
+impl PristineRam {
+    /// Clone `src` to `dst` (CoW where supported) and map `dst` read-only.
+    /// The caller is responsible for quiescing/`msync`ing `src` first.
+    pub fn from_clone(src: &Path, dst: &Path, len: usize) -> io::Result<PristineRam> {
+        crate::snapshot::clonefile_or_copy(src, dst)?;
+        let f = std::fs::OpenOptions::new().read(true).open(dst)?;
+        // SAFETY: mapping `len` bytes of a file we just created at `len`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::other("mmap of pristine.bin failed"));
+        }
+        Ok(PristineRam::Mapped { ptr, len })
+    }
+
+    /// Take an owned copy of the current live RAM (fresh-boot fallback).
+    pub fn from_copy(live: &[u8]) -> PristineRam {
+        PristineRam::Owned(live.to_vec())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            // SAFETY: `ptr`/`len` came from a successful PROT_READ mmap and the
+            // mapping is immutable for the lifetime of `self`.
+            PristineRam::Mapped { ptr, len } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const u8, *len)
+            },
+            PristineRam::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Drop for PristineRam {
+    fn drop(&mut self) {
+        if let PristineRam::Mapped { ptr, len } = self {
+            // SAFETY: unmapping exactly the region we mapped.
+            unsafe { libc::munmap(*ptr, *len) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +125,29 @@ mod tests {
         // Page 99 is past the end; must not panic and must leave RAM unchanged.
         rollback_pages(&pristine, &mut live, &[99], PG);
         assert!(live.iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn pristine_owned_round_trips_bytes() {
+        let src = vec![0x5Au8; PG * 2];
+        let p = PristineRam::from_copy(&src);
+        assert_eq!(p.as_slice(), &src[..]);
+    }
+
+    #[test]
+    fn pristine_mapped_round_trips_bytes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ignition-pristine-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("memory.bin");
+        let dst = dir.join("pristine.bin");
+        let bytes = vec![0xC3u8; PG * 3];
+        std::fs::File::create(&src).unwrap().write_all(&bytes).unwrap();
+
+        let p = PristineRam::from_clone(&src, &dst, bytes.len()).unwrap();
+        assert_eq!(p.as_slice(), &bytes[..]);
+
+        drop(p);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
