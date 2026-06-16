@@ -259,6 +259,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
         manager.set_reset_handler(Box::new(move || {
             let guard = point.lock().unwrap();
             let Some(rp) = guard.as_ref() else { return; };
+            let t_reset = std::time::Instant::now();
             // Quiesce the vmnet RX feeder, then DRAIN it: the feeder holds the net
             // device lock across its stop-check + inject, so acquiring that lock
             // once is a barrier guaranteeing no inject is in-flight or can begin
@@ -296,6 +297,9 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             // rp.gic_blob stays captured for the disk-snapshot path; unused here.
             frozen.restore(&rp.devices);
             if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
+            // The synchronous in-place reset (RAM rollback + device restore + repaint)
+            // is the "hot restore" snap-back; the net reconnect below is async (~2s).
+            eprintln!("[reset] Reset-time = {} us (snap-back; net reconnect async)", t_reset.elapsed().as_micros());
             // Net: restoring the virtio-net device cursor under a live, actively-
             // receiving NIC does not cleanly resync (mergeable-buffer/feature layout,
             // the vmnet feeder's buffered frames, and device-side RX state are not
