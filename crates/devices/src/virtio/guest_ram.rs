@@ -12,11 +12,20 @@
 //! (the virtio used/avail ring indices carry the ordering).
 
 use libc;
+use std::sync::Arc;
+
+/// Records that guest RAM `[gpa, gpa+len)` was written by the host side (a virtio
+/// device / DMA), so such writes are captured by dirty tracking exactly like a
+/// guest vCPU write fault. Implemented by the VMM's dirty tracker.
+pub trait DirtySink: Send + Sync {
+    fn mark_dirty(&self, gpa: u64, len: usize);
+}
 
 pub struct GuestRam {
     ptr: *mut u8,
     len: usize,
     base: u64,
+    dirty: Option<Arc<dyn DirtySink>>,
 }
 
 // SAFETY: `GuestRam` holds a raw pointer into a host mmap that outlives any
@@ -35,7 +44,13 @@ impl GuestRam {
     /// `ptr`/`len` describe the host mapping; `base` is the guest physical
     /// address it is mapped at.
     pub fn new(ptr: *mut u8, len: usize, base: u64) -> Self {
-        Self { ptr, len, base }
+        Self::with_dirty(ptr, len, base, None)
+    }
+
+    /// Like `new`, but every successful write is reported to `dirty` so device
+    /// (DMA) writes are captured by dirty tracking. `None` disables marking.
+    pub fn with_dirty(ptr: *mut u8, len: usize, base: u64, dirty: Option<Arc<dyn DirtySink>>) -> Self {
+        Self { ptr, len, base, dirty }
     }
 
     fn offset(&self, gpa: u64, n: usize) -> Option<usize> {
@@ -65,6 +80,9 @@ impl GuestRam {
                 // SAFETY: bounds checked by `offset`; disjoint-by-protocol (see
                 // module doc) — no other thread touches this buffer region concurrently.
                 unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off), data.len()) };
+                if let Some(d) = &self.dirty {
+                    d.mark_dirty(gpa, data.len());
+                }
                 true
             }
             None => false,
@@ -113,6 +131,43 @@ impl GuestRam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<(u64, usize)>>);
+    impl DirtySink for RecordingSink {
+        fn mark_dirty(&self, gpa: u64, len: usize) {
+            self.0.lock().unwrap().push((gpa, len));
+        }
+    }
+
+    #[test]
+    fn write_slice_marks_dirty_on_success() {
+        let mut backing = vec![0u8; 0x1000];
+        let sink = Arc::new(RecordingSink::default());
+        let m = GuestRam::with_dirty(backing.as_mut_ptr(), backing.len(), 0x4000_0000, Some(sink.clone()));
+        assert!(m.write_slice(0x4000_0020, &[1, 2, 3, 4]));
+        assert!(m.write_u32(0x4000_0040, 0xdead_beef)); // delegates to write_slice
+        let calls = sink.0.lock().unwrap().clone();
+        assert_eq!(calls, vec![(0x4000_0020, 4), (0x4000_0040, 4)]);
+    }
+
+    #[test]
+    fn failed_write_does_not_mark() {
+        let mut backing = vec![0u8; 0x100];
+        let sink = Arc::new(RecordingSink::default());
+        let m = GuestRam::with_dirty(backing.as_mut_ptr(), backing.len(), 0x4000_0000, Some(sink.clone()));
+        assert!(!m.write_u32(0x4000_00fe, 0)); // crosses the end -> rejected
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_sink_does_not_panic() {
+        let mut backing = vec![0u8; 0x100];
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0x4000_0000); // no sink
+        assert!(m.write_u32(0x4000_0010, 7));
+        assert_eq!(m.read_u32(0x4000_0010), Some(7));
+    }
 
     fn ram(backing: &mut Vec<u8>, base: u64) -> GuestRam {
         GuestRam::new(backing.as_mut_ptr(), backing.len(), base)
