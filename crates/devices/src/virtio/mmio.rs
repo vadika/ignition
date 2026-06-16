@@ -79,10 +79,6 @@ pub trait VirtioDevice: Send {
     fn restore(&mut self, _v: &serde_json::Value) -> Result<(), String> {
         Ok(())
     }
-
-    /// Re-read the scanout from guest RAM and present one frame (virtio-gpu only,
-    /// used once after restore to repaint the resumed desktop). Default: no-op.
-    fn present_scanout(&self, _mem: &GuestRam) {}
 }
 
 /// Per-queue driver-programmed state.
@@ -282,12 +278,6 @@ impl VirtioMmio {
             self.raise();
         }
         used
-    }
-
-    /// Re-read the GPU scanout from guest RAM and present one frame. No-op for
-    /// non-GPU devices. Called once after a GUI restore.
-    pub fn present_scanout(&self) {
-        self.dev.present_scanout(&self.mem);
     }
 
     /// Inject host input events into the eventq (queue 0) and raise the IRQ if any

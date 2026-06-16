@@ -2,7 +2,8 @@
 //! absolute tablet (EV_ABS x/y + buttons). eventq (queue 0) carries device->guest
 //! input events (filled via inject); statusq (queue 1) is parsed and ack'd. The
 //! config select/subsel protocol advertises the name, EV bits, and ABS axis info.
-//! No snapshot of input state (M5). Built only under --gui.
+//! Snapshot (M5): select/subsel are saved/restored; flavor is construction-time and
+//! rebuilt by device wiring. Built only under --gui.
 
 use super::guest_ram::GuestRam;
 use super::mmio::VirtioDevice;
@@ -211,6 +212,18 @@ impl VirtioDevice for VirtioInput {
     ) -> bool {
         self.fill_events(eventq, mem, events)
     }
+
+    fn save(&self) -> serde_json::Value {
+        // flavor is construction-time (rebuilt by setup_devices); only the config
+        // protocol cursor is dynamic.
+        serde_json::json!({ "select": self.select, "subsel": self.subsel })
+    }
+
+    fn restore(&mut self, v: &serde_json::Value) -> Result<(), String> {
+        self.select = v.get("select").and_then(|x| x.as_u64()).ok_or("input: missing select")? as u8;
+        self.subsel = v.get("subsel").and_then(|x| x.as_u64()).ok_or("input: missing subsel")? as u8;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +378,19 @@ mod tests {
         assert_eq!(m.read_u32(BUF + 4).unwrap(), 1);
         assert_eq!(m.read_u16(BUF + 0x40).unwrap(), EV_SYN);
         assert_eq!(m.read_u16(USED + 2), Some(2));
+    }
+
+    #[test]
+    fn save_restore_roundtrips_select_subsel() {
+        let mut kbd = VirtioInput::keyboard();
+        kbd.config_write(0, &[CFG_EV_BITS]); // select
+        kbd.config_write(1, &[EV_KEY as u8]); // subsel
+        let saved = kbd.save();
+
+        let mut kbd2 = VirtioInput::keyboard();
+        kbd2.restore(&saved).expect("restore ok");
+        assert_eq!(kbd2.select, CFG_EV_BITS);
+        assert_eq!(kbd2.subsel, EV_KEY as u8);
     }
 
     #[test]
