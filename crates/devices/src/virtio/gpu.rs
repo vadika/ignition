@@ -421,6 +421,27 @@ impl VirtioDevice for VirtioGpu {
         Ok(())
     }
 
+    fn present_scanout(&self, mem: &GuestRam) {
+        if self.scanout_res == 0 {
+            return;
+        }
+        let Some(r) = self.resources.get(&self.scanout_res) else { return };
+        {
+            let mut host = r.pixels.lock().unwrap();
+            let len = host.len();
+            read_backing(&r.backing, mem, 0, &mut host[..len]);
+        }
+        let frame = Frame {
+            scanout_id: 0,
+            width: r.width,
+            height: r.height,
+            stride: r.width * 4,
+            dirty: DirtyRect { x: 0, y: 0, w: r.width, h: r.height },
+            pixels: r.pixels.clone(),
+        };
+        self.sink.present(frame);
+    }
+
     fn device_features(&self, _sel: u32) -> u32 {
         0
     }
@@ -804,5 +825,35 @@ mod tests {
         assert!(gpu.handle_notify(1, &mut vq, &m));
         assert_eq!(m.read_u32(USED + 4), Some(0)); // used elem id = head 0
         assert_eq!(m.read_u32(USED + 8), Some(0)); // used len = 0
+    }
+
+    #[test]
+    fn present_scanout_reads_backing_and_presents() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut gpu = VirtioGpu::new(1280, 800, Box::new(CapSink(captured.clone())));
+        let mut backing = vec![0u8; 0x8000];
+        submit(&mut gpu, &mut backing, &create_2d_req(1, 4, 1)); // 4x1 = 16 bytes
+        submit(&mut gpu, &mut backing, &attach_backing_req(1, &[(BASE + 0x4000, 16)]));
+        submit(&mut gpu, &mut backing, &set_scanout_req(0, 1));
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        let pat: Vec<u8> = (0..16u8).collect();
+        m.write_slice(BASE + 0x4000, &pat);
+
+        gpu.present_scanout(&m);
+
+        let frames = captured.lock().unwrap();
+        assert_eq!(frames.len(), 1, "one frame presented");
+        assert_eq!((frames[0].width, frames[0].height), (4, 1));
+        assert_eq!(&frames[0].pixels.lock().unwrap()[..], &pat[..], "scanout re-read from backing");
+    }
+
+    #[test]
+    fn present_scanout_with_no_scanout_presents_nothing() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let gpu = VirtioGpu::new(1280, 800, Box::new(CapSink(captured.clone())));
+        let mut backing = vec![0u8; 0x1000];
+        let m = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        gpu.present_scanout(&m); // scanout_res == 0
+        assert!(captured.lock().unwrap().is_empty());
     }
 }
