@@ -13,6 +13,7 @@ use ignition_devices::bus::{Bus, BusDevice};
 use ignition_hvf::{HvfVcpu, NoIrqVcpus, VcpuExit, Vcpus};
 use crate::dirty::{DirtyTracker, PAGE};
 use crate::fuzz::controller::FuzzController;
+use crate::reset::ResetPoint;
 use crate::snapshot::VcpuCheckpoint;
 
 /// Host SIGINT/SIGTERM stop flag for fuzz mode. The fuzz path has no guest
@@ -69,17 +70,32 @@ pub struct VcpuManager {
     shutdown: AtomicBool,
     /// Set by `request_snapshot`; cleared by the leader inside `run_loop`.
     snapshot_req: AtomicBool,
-    /// True for the duration of a snapshot rendezvous; freezes CPU_ON. Read and
-    /// written only while holding the `running` lock, so it cannot race a claim.
-    snapshot_active: AtomicBool,
-    /// Per-snapshot barrier sized to the participant count, published by
-    /// `request_snapshot` and read by each vCPU thread at the rendezvous.
+    /// Set by `request_checkpoint`; cleared by the checkpoint leader.
+    checkpoint_req: AtomicBool,
+    /// Set by `request_reset`; cleared by the reset leader.
+    reset_req: AtomicBool,
+    /// True for the duration of any rendezvous (snapshot, checkpoint, or reset);
+    /// freezes CPU_ON and rejects a re-entrant request. Read and written only
+    /// while holding the `running` lock, so it cannot race a claim.
+    rendezvous_active: AtomicBool,
+    /// Per-rendezvous barrier sized to the participant count, published by
+    /// `request_*` and read by each vCPU thread at the rendezvous.
     snap_barrier: Mutex<Option<Arc<Barrier>>>,
     /// Each participating vCPU thread pushes `(mpidr, save_state())` here; the
     /// leader drains it after the barrier.
     collected: Mutex<Vec<(u64, Result<ignition_hvf::VcpuState, ignition_hvf::Error>)>>,
     /// Installed by the boot harness before `run`; invoked on the leader thread.
     snapshot_handler: Option<SnapshotHandler>,
+    /// Installed by the boot harness before `run`; invoked on the leader thread
+    /// to build and store a `ResetPoint` from the collected checkpoints.
+    checkpoint_handler: Option<CheckpointHandler>,
+    /// Installed by the boot harness before `run`; invoked on the leader thread
+    /// to roll live RAM/GIC/device state back to the current `ResetPoint`.
+    reset_handler: Option<ResetHandler>,
+    /// Shared with the handler closures and read by each vCPU at a reset barrier
+    /// to find its own checkpoint. `None` until seeded (on `--restore`) or set by
+    /// `Ctrl-A c`.
+    reset_point: Arc<Mutex<Option<ResetPoint>>>,
     /// Installed by the boot harness before `run` when `--track-dirty` is set.
     /// When present, each vCPU thread arms `set_dirty_window` before its loop,
     /// and the `DirtyFault` arm marks the page + re-grants WRITE.
@@ -90,6 +106,16 @@ pub struct VcpuManager {
 /// vCPU has saved its register state. Receives the per-vCPU checkpoints and
 /// performs the global capture (RAM + GIC + device records) and file write.
 type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>;
+
+/// Builds and stores a `ResetPoint` from the vCPU checkpoints collected at the
+/// barrier (clonefile pristine + capture gic/devices). Runs on the leader vCPU
+/// thread with all vCPUs parked.
+pub type CheckpointHandler = Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>;
+
+/// Rolls live RAM/GIC/device state back to the current `ResetPoint`. Runs on the
+/// leader vCPU thread with all vCPUs parked. Per-vCPU register restore happens
+/// afterward on each vCPU's own thread.
+pub type ResetHandler = Box<dyn Fn() + Send + Sync>;
 
 impl VcpuManager {
     /// Create a manager for `vcpu_count` cpus (MPIDRs `mpidr_for(0..vcpu_count)`).
@@ -103,10 +129,15 @@ impl VcpuManager {
             threads: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             snapshot_req: AtomicBool::new(false),
-            snapshot_active: AtomicBool::new(false),
+            checkpoint_req: AtomicBool::new(false),
+            reset_req: AtomicBool::new(false),
+            rendezvous_active: AtomicBool::new(false),
             snap_barrier: Mutex::new(None),
             collected: Mutex::new(Vec::new()),
             snapshot_handler: None,
+            checkpoint_handler: None,
+            reset_handler: None,
+            reset_point: Arc::new(Mutex::new(None)),
             dirty: None,
         })
     }
@@ -131,6 +162,33 @@ impl VcpuManager {
         me.snapshot_handler = Some(handler);
     }
 
+    /// Install a checkpoint handler. MUST be called before `run`. Invoked on the
+    /// leader vCPU thread once every vCPU has rendezvoused, to build and store a
+    /// `ResetPoint` from the collected per-vCPU checkpoints.
+    pub fn set_checkpoint_handler(self: &mut Arc<Self>, handler: CheckpointHandler) {
+        let me = Arc::get_mut(self).expect("set_checkpoint_handler must be called before run");
+        me.checkpoint_handler = Some(handler);
+    }
+
+    /// Install a reset handler. MUST be called before `run`. Invoked on the
+    /// leader vCPU thread with all vCPUs parked to roll RAM/GIC/devices back to
+    /// the current `ResetPoint`.
+    pub fn set_reset_handler(self: &mut Arc<Self>, handler: ResetHandler) {
+        let me = Arc::get_mut(self).expect("set_reset_handler must be called before run");
+        me.reset_handler = Some(handler);
+    }
+
+    /// The shared reset point. Cloned by `boot.rs` so the handler closures and
+    /// the seeding code can read/write the same `Option<ResetPoint>`.
+    pub fn reset_point(&self) -> Arc<Mutex<Option<ResetPoint>>> {
+        self.reset_point.clone()
+    }
+
+    /// True once a reset point exists (seeded on restore or set by `Ctrl-A c`).
+    pub fn has_reset_point(&self) -> bool {
+        self.reset_point.lock().unwrap().is_some()
+    }
+
     /// Request a snapshot. Freezes CPU_ON, latches the participant set, sizes the
     /// rendezvous barrier, and interrupts every registered vCPU so each exits to
     /// `Canceled` and joins the rendezvous. No-op if no handler is installed.
@@ -143,7 +201,7 @@ impl VcpuManager {
         // would clear `collected` before the in-flight leader drains it.
         {
             let _running = self.running.lock().unwrap();
-            if self.snapshot_active.swap(true, Ordering::Relaxed) {
+            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
                 return;
             }
         }
@@ -154,12 +212,66 @@ impl VcpuManager {
         if ids.is_empty() {
             // No vCPU has registered yet; nothing to snapshot. Unfreeze and bail
             // so a later snapshot still works.
-            self.snapshot_active.store(false, Ordering::Relaxed);
+            self.rendezvous_active.store(false, Ordering::Relaxed);
             return;
         }
         *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
+        for id in ids {
+            let _ = ignition_hvf::vcpu_request_exit(id);
+        }
+    }
+
+    /// Request a checkpoint. Mirrors `request_snapshot`: freezes CPU_ON, latches
+    /// the participant set, sizes the rendezvous barrier, clears `collected`, and
+    /// interrupts every registered vCPU so each saves its state at the barrier and
+    /// the leader builds a `ResetPoint`. No-op if no checkpoint handler is installed.
+    pub fn request_checkpoint(&self) {
+        if self.checkpoint_handler.is_none() {
+            return;
+        }
+        {
+            let _running = self.running.lock().unwrap();
+            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
+                return;
+            }
+        }
+        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
+        if ids.is_empty() {
+            self.rendezvous_active.store(false, Ordering::Relaxed);
+            return;
+        }
+        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        self.collected.lock().unwrap().clear();
+        self.checkpoint_req.store(true, Ordering::Release);
+        for id in ids {
+            let _ = ignition_hvf::vcpu_request_exit(id);
+        }
+    }
+
+    /// Request a reset. Freezes CPU_ON, latches the participant set, sizes the
+    /// rendezvous barrier, and interrupts every registered vCPU so the leader
+    /// rolls RAM/GIC/devices back and each vCPU then restores its own registers.
+    /// Does NOT touch `collected`. No-op if no reset handler is installed or no
+    /// reset point exists.
+    pub fn request_reset(&self) {
+        if self.reset_handler.is_none() || self.reset_point.lock().unwrap().is_none() {
+            return;
+        }
+        {
+            let _running = self.running.lock().unwrap();
+            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
+                return;
+            }
+        }
+        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
+        if ids.is_empty() {
+            self.rendezvous_active.store(false, Ordering::Relaxed);
+            return;
+        }
+        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        self.reset_req.store(true, Ordering::Release);
         for id in ids {
             let _ = ignition_hvf::vcpu_request_exit(id);
         }
@@ -177,7 +289,7 @@ impl VcpuManager {
             return Claim::Unknown;
         }
         let mut running = self.running.lock().unwrap();
-        if self.snapshot_active.load(Ordering::Relaxed) {
+        if self.rendezvous_active.load(Ordering::Relaxed) {
             return Claim::Frozen;
         }
         if running.contains(&mpidr) {
@@ -514,6 +626,50 @@ impl VcpuManager {
                         bar.wait();
                         continue;
                     }
+                    if self.checkpoint_req.load(Ordering::Acquire) {
+                        // Save our own registers (HVF thread-affinity) and meet
+                        // every other vCPU at the barrier.
+                        let st = vcpu.save_state();
+                        self.collected.lock().unwrap().push((mpidr, st));
+                        let bar = self
+                            .snap_barrier
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("snap_barrier set when checkpoint_req is set");
+                        // Barrier 1: a full happens-before edge — every push is
+                        // visible to the leader after this returns.
+                        if bar.wait().is_leader() {
+                            self.run_checkpoint_leader();
+                        }
+                        // Barrier 2: peers wait here while the leader builds the
+                        // reset point; release together and resume.
+                        bar.wait();
+                        continue;
+                    }
+                    if self.reset_req.load(Ordering::Acquire) {
+                        let bar = self
+                            .snap_barrier
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("snap_barrier set when reset_req is set");
+                        // Barrier 1: all parked before the leader touches
+                        // RAM/GIC/devices.
+                        if bar.wait().is_leader() {
+                            self.run_reset_leader();
+                        }
+                        // Barrier 2: rollback complete; each vCPU now restores its
+                        // own registers from its checkpoint in the reset point.
+                        bar.wait();
+                        if let Some(rp) = self.reset_point.lock().unwrap().as_ref()
+                            && let Some(cp) = rp.vcpus.iter().find(|c| c.mpidr == mpidr)
+                            && let Err(e) = vcpu.restore_state(&cp.state)
+                        {
+                            log::error!("reset: vcpu {mpidr:#x} restore_state failed: {e}");
+                        }
+                        continue;
+                    }
                     return Ok(());
                 }
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
@@ -563,7 +719,67 @@ impl VcpuManager {
         }
 
         self.snapshot_req.store(false, Ordering::Release);
-        self.snapshot_active.store(false, Ordering::Relaxed);
+        self.rendezvous_active.store(false, Ordering::Relaxed);
+    }
+
+    /// Runs on the single leader thread between the two rendezvous barriers, with
+    /// every other vCPU parked. Drains the collected per-vCPU states, aborts on
+    /// any save failure, else invokes the checkpoint handler (which builds and
+    /// stores the `ResetPoint`). Always clears the checkpoint flags before
+    /// returning so the second barrier resumes a clean state.
+    fn run_checkpoint_leader(self: &Arc<Self>) {
+        let mut items = std::mem::take(&mut *self.collected.lock().unwrap());
+        items.sort_by_key(|(mpidr, _)| *mpidr);
+
+        let mut checkpoints = Vec::with_capacity(items.len());
+        let mut failed = None;
+        for (mpidr, res) in items {
+            match res {
+                Ok(state) => checkpoints.push(VcpuCheckpoint { mpidr, state }),
+                Err(e) => {
+                    failed = Some((mpidr, e));
+                    break;
+                }
+            }
+        }
+
+        match failed {
+            Some((mpidr, e)) => {
+                log::error!("checkpoint aborted: vcpu {mpidr:#x} save_state failed: {e}");
+            }
+            None => {
+                if let Some(h) = &self.checkpoint_handler {
+                    // A panic in the handler must not unwind the vCPU thread.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        h(checkpoints)
+                    }));
+                    if r.is_err() {
+                        log::error!("checkpoint handler panicked; guest resumed");
+                    }
+                }
+            }
+        }
+
+        self.checkpoint_req.store(false, Ordering::Release);
+        self.rendezvous_active.store(false, Ordering::Relaxed);
+    }
+
+    /// Runs on the single leader thread at the first reset barrier, with every
+    /// other vCPU parked. Invokes the reset handler to roll RAM/GIC/devices back
+    /// to the current `ResetPoint`. Per-vCPU register restore happens afterward
+    /// on each vCPU's own thread (past the second barrier). Always clears the
+    /// reset flags before returning.
+    fn run_reset_leader(self: &Arc<Self>) {
+        if let Some(h) = &self.reset_handler {
+            // A panic in the handler must not unwind the vCPU thread.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(h));
+            if r.is_err() {
+                log::error!("reset handler panicked; guest resumed (state may be inconsistent)");
+            }
+        }
+
+        self.reset_req.store(false, Ordering::Release);
+        self.rendezvous_active.store(false, Ordering::Relaxed);
     }
 
     /// Join every spawned vCPU thread, draining the registry so threads spawned
@@ -616,7 +832,23 @@ mod tests {
     #[test]
     fn claim_rejected_while_snapshot_active() {
         let m = mgr(4);
-        m.snapshot_active.store(true, Ordering::Relaxed);
+        m.rendezvous_active.store(true, Ordering::Relaxed);
         assert_eq!(m.claim(1), Claim::Frozen);
+    }
+
+    #[test]
+    fn request_checkpoint_without_handler_is_noop() {
+        let m = mgr(4);
+        m.request_checkpoint();
+        assert!(!m.checkpoint_req.load(Ordering::Relaxed));
+        assert!(!m.rendezvous_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn request_reset_without_handler_is_noop() {
+        let m = mgr(4);
+        m.request_reset();
+        assert!(!m.reset_req.load(Ordering::Relaxed));
+        assert!(!m.rendezvous_active.load(Ordering::Relaxed));
     }
 }

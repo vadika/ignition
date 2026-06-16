@@ -27,6 +27,22 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+use crate::device_manager::DeviceRecord;
+use crate::snapshot::VcpuCheckpoint;
+
+/// An in-memory checkpoint the live guest can be rolled back to in place.
+/// One at a time; `Ctrl-A c` replaces it. Seeded automatically on `--restore`.
+pub struct ResetPoint {
+    /// Immutable RAM image (clonefile RO-mmap, or owned copy on fresh boot).
+    pub pristine: PristineRam,
+    /// Per-vCPU registers/ICC/vtimer, keyed by mpidr.
+    pub vcpus: Vec<VcpuCheckpoint>,
+    /// The hv_gic distributor/redistributor blob.
+    pub gic_blob: Vec<u8>,
+    /// Each virtio device's saved state.
+    pub devices: Vec<DeviceRecord>,
+}
+
 /// The immutable RAM image a `Ctrl-A r` rolls back to.
 ///
 /// `Mapped` is a read-only mmap of an APFS clonefile (O(1), CoW on disk — the
