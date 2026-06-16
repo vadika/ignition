@@ -15,12 +15,16 @@
 # usage: sudo make-browser-base.sh [snapshot-name] [kernel] [rootfs]
 set -euo pipefail
 
+# vCPU count baked into the warm-base. Accept a leading `--smp N` flag (survives
+# sudo, unlike an env var) or the SMP env; default 2.
+SMP="${SMP:-2}"
+if [ "${1:-}" = "--smp" ]; then SMP="${2:?--smp needs a number}"; shift 2; fi
+
 NAME="${1:-browser-base}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KERNEL="${2:-$ROOT/kimage/out/Image}"
 ROOTFS="${3:-$ROOT/kimage/out/rootfs-browser.ext4}"
 BOOT="$ROOT/target/debug/boot"
-SMP="${SMP:-2}"   # vCPU count baked into the warm-base; override e.g. SMP=1
 
 [ -x "$BOOT" ] || { echo "boot not built/signed: $BOOT" >&2; exit 1; }
 [ -f "$KERNEL" ] || { echo "kernel not found: $KERNEL" >&2; exit 1; }
