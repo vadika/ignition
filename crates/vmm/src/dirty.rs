@@ -61,9 +61,44 @@ impl DirtyTracker {
     }
 }
 
+impl ignition_devices::virtio::guest_ram::DirtySink for DirtyTracker {
+    /// Mark every PAGE granule touched by a host-side write of `len` bytes at
+    /// `gpa`. `devices` stays granule-agnostic; the 16 KiB `PAGE` split lives here.
+    fn mark_dirty(&self, gpa: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = gpa.saturating_add(len as u64 - 1);
+        let mut p = gpa & !((PAGE as u64) - 1); // align down to the granule
+        while p <= end {
+            self.mark(p);
+            p = match p.checked_add(PAGE as u64) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ignition_devices::virtio::guest_ram::DirtySink;
+
+    #[test]
+    fn mark_dirty_splits_pages() {
+        let t = DirtyTracker::new(0x4000_0000, (PAGE as u64) * 8);
+        // A write wholly inside page 0.
+        t.mark_dirty(0x4000_0000 + 16, 32);
+        // A write spanning the page-2/page-3 boundary.
+        let boundary = 0x4000_0000 + (PAGE as u64) * 3 - 8;
+        t.mark_dirty(boundary, 32);
+        // Zero-length marks nothing.
+        t.mark_dirty(0x4000_0000 + (PAGE as u64) * 5, 0);
+        let mut pages = t.drain();
+        pages.sort_unstable();
+        assert_eq!(pages, vec![0, 2, 3]);
+    }
 
     #[test]
     fn mark_and_drain_sorted_unique() {

@@ -26,7 +26,7 @@ use ignition_devices::rtc::Pl031;
 use ignition_devices::serial::Serial;
 use ignition_devices::virtio::balloon::Balloon;
 use ignition_devices::virtio::blk::VirtioBlk;
-use ignition_devices::virtio::guest_ram::GuestRam;
+use ignition_devices::virtio::guest_ram::{DirtySink, GuestRam};
 use ignition_devices::virtio::mmio::VirtioMmio;
 use ignition_devices::virtio::net::VirtioNet;
 use ignition_devices::virtio::rng::VirtioRng;
@@ -271,22 +271,19 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             let live: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(host_usize as *mut u8, ram_size as usize)
             };
-            // FULL-copy rollback, NOT dirty-only. The write-protect dirty tracker
-            // only catches GUEST writes (stage-2 faults); virtio DEVICES write guest
-            // RAM (net RX frame data + the used ring) directly through the host
-            // mapping, bypassing stage-2, so those pages are never marked dirty. A
-            // dirty-only rollback leaves them stale -> inconsistent virtqueues
-            // ("virtio_net ... not a head") and a half-reverted guest (browser tab
-            // crash). Copying the whole pristine image reverts device-written pages
-            // too. If a dirty tracker is armed (for Ctrl-A s diff snapshots), drain
-            // it and re-protect to re-arm tracking from a clean post-reset baseline.
-            ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live);
-            if let Some(t) = &dirty {
-                let _ = t.drain();
-                let _ = ignition_hvf::vm_protect_memory(
-                    layout::RAM_BASE, ram_size,
-                    (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
-                );
+            // Dirty-only rollback when a tracker is armed: device DMA writes are now
+            // marked too (GuestRam DirtySink), so the drained set is complete. Full
+            // copy only when there is no tracker.
+            match &dirty {
+                Some(t) => {
+                    let pages = t.drain();
+                    ignition_vmm::reset::rollback_pages(rp.pristine.as_slice(), live, &pages, ignition_vmm::dirty::PAGE);
+                    let _ = ignition_hvf::vm_protect_memory(
+                        layout::RAM_BASE, ram_size,
+                        (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                    );
+                }
+                None => ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live),
             }
             // Deliberately do NOT re-restore the GIC distributor/redistributor here.
             // hv_gic_set_state mid-run (after the GIC has been delivering interrupts)
@@ -540,11 +537,14 @@ struct DeviceContext {
     /// virtio-gpu handle (Some when a GPU device was wired), used to repaint the
     /// scanout once after a GUI restore.
     gpu_mmio: Option<Arc<Mutex<VirtioMmio>>>,
+    /// When set (under --track-dirty), every device GuestRam reports its writes
+    /// here so device DMA is captured by dirty tracking. None disables marking.
+    dirty: Option<std::sync::Arc<dyn DirtySink>>,
 }
 
 impl DeviceContext {
     fn guest_ram(&self) -> GuestRam {
-        GuestRam::new(self.host, self.ram_size as usize, layout::RAM_BASE)
+        GuestRam::with_dirty(self.host, self.ram_size as usize, layout::RAM_BASE, self.dirty.clone())
     }
 }
 
@@ -1006,6 +1006,24 @@ fn main() {
         None
     };
 
+    // Create the dirty tracker (the shared Arc bitmap) BEFORE the DeviceContext so
+    // every device GuestRam built in setup_devices reports its DMA writes into it
+    // (GuestRam DirtySink). The actual write-protect (vm.protect_memory) is deferred
+    // until AFTER vm.map_memory below: stage-2 protection requires the guest mapping
+    // to exist, and the DTB is written into RAM after setup_devices. The tracker and
+    // the protect step share one bitmap (DirtyTracker is Clone).
+    let dirty_tracker: Option<DirtyTracker> = if track_dirty {
+        let tracker = DirtyTracker::new(layout::RAM_BASE, ram_size);
+        eprintln!(
+            "dirty  : tracking armed ({} pages of {} bytes, RAM write-protected)",
+            tracker.page_count(),
+            ignition_vmm::dirty::PAGE
+        );
+        Some(tracker)
+    } else {
+        None
+    };
+
     let mut ctx = DeviceContext {
         host: host as *mut u8,
         ram_size,
@@ -1018,6 +1036,9 @@ fn main() {
         keyboard_mmio: None,
         tablet_mmio: None,
         gpu_mmio: None,
+        dirty: dirty_tracker
+            .as_ref()
+            .map(|t| std::sync::Arc::new(t.clone()) as std::sync::Arc<dyn DirtySink>),
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Boot).expect("device setup failed");
     let kbd_handle = ctx.keyboard_mmio.clone();
@@ -1064,26 +1085,19 @@ fn main() {
 
     // Arm dirty-page tracking: write-protect all guest RAM (drop WRITE) so the
     // first guest write to each page traps as a DirtyFault. The shared tracker
-    // bitmap is marked by every vCPU's run loop on fault and drained by the
-    // snapshot handler (wired in Task 8). vCPU windows are armed inside the
-    // VcpuManager via set_dirty_config below (vCPUs are created per-thread).
-    let dirty_tracker: Option<DirtyTracker> = if track_dirty {
+    // bitmap (created above, before setup_devices, so device DMA marks it too) is
+    // marked by every vCPU's run loop on fault and drained by the snapshot handler.
+    // vCPU windows are armed inside the VcpuManager via set_dirty_config below.
+    // This protect step MUST run after vm.map_memory above (stage-2 protection
+    // needs the guest mapping to exist).
+    if dirty_tracker.is_some() {
         vm.protect_memory(
             layout::RAM_BASE,
             ram_size,
             (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
         )
         .expect("write-protect guest RAM for dirty tracking");
-        let tracker = DirtyTracker::new(layout::RAM_BASE, ram_size);
-        eprintln!(
-            "dirty  : tracking armed ({} pages of {} bytes, RAM write-protected)",
-            tracker.page_count(),
-            ignition_vmm::dirty::PAGE
-        );
-        Some(tracker)
-    } else {
-        None
-    };
+    }
 
     // Diagnostics (stderr) so a silent boot is debuggable.
     let g = gic.fdt_info();
@@ -1922,6 +1936,10 @@ fn run_restore(
         keyboard_mmio: None,
         tablet_mmio: None,
         gpu_mmio: None,
+        // Tracker created above (before this DeviceContext), so device DMA marks it.
+        dirty: dirty_tracker
+            .as_ref()
+            .map(|t| std::sync::Arc::new(t.clone()) as std::sync::Arc<dyn DirtySink>),
     };
     setup_devices(&mut mgr, &mut ctx, Mode::Restore(&snap.devices))?;
     let kbd_handle = ctx.keyboard_mmio.clone();
