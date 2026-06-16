@@ -298,8 +298,32 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             // own ICC (CPU-interface) state via restore_state at the reset barrier.
             // rp.gic_blob stays captured for the disk-snapshot path; unused here.
             frozen.restore(&rp.devices);
-            if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
             if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
+            // Net: restoring the virtio-net device cursor under a live, actively-
+            // receiving NIC does not cleanly resync (mergeable-buffer/feature layout,
+            // the vmnet feeder's buffered frames, and device-side RX state are not
+            // captured) -> "bad gso" / "not a head" after reset. Instead reuse the
+            // proven --restore path: bounce the carrier so the guest's netwatch
+            // poller rebinds virtio_net (a full guest-side queue tear-down + re-init
+            // + re-DHCP), which discards whatever did not round-trip. Keep the RX
+            // feeder STOPPED until the link is back up so no frame is injected into
+            // torn-down queues; re-enable it shortly after link-up.
+            match &net_mmio {
+                Some(net) => {
+                    net.lock().unwrap_or_else(|p| p.into_inner()).net_set_link(false);
+                    let net = net.clone();
+                    let rx_stop = rx_stop.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        net.lock().unwrap_or_else(|p| p.into_inner()).net_set_link(true);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+                    });
+                }
+                None => {
+                    if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+                }
+            }
         }));
     }
 }
