@@ -94,7 +94,50 @@ python3 scripts/boot_vs_restore_timing.py   # launch -> running, phased
 python3 scripts/restore_test.py             # snapshot -> restore, CPU% + responsive
 ```
 
+## Disposable browser latency
+
+Date: 2026-06-16. Host: Apple Silicon, macOS 26. Guest: the browser rootfs
+(`rootfs-browser.ext4`) — overlay root, Firefox ESR under cage, **2 vCPUs, 1 GiB**,
+`--gui --net --track-dirty`. Three operations, all in **ms**, `n = 3`
+(`scripts/disposable_browser_bench.py` for the first two; hot restore measured by hand
+— serial input does not reach the escape FSM under `--gui`, so the in-place reset is
+driven from the GUI window with `Ctrl+Alt+R`).
+
+| Operation | What it is | mean | range |
+|-----------|------------|-----:|------:|
+| **Cold boot** → `BROWSER_READY` | full kernel boot + overlay `switch_root` + Firefox cold start, to a painted homepage (wall) | **7774 ms** | 7618–8084 |
+| Cold boot — `Guest-boot-time` | kernel + early init only (guest time domain) | 599 ms | 536–724 |
+| **Cold restore** — `Restore-time` | a fresh `boot --restore browser-base` process: clonefile + `mmap(MAP_SHARED)` + GIC/device/vCPU state restore, before the guest runs | **130 ms** | 127–131 |
+| **Hot restore** — `Reset-time` | in-place `Ctrl+Alt+R` rollback of a *running* clone (dirty-page revert + device restore + repaint), after browsing to a real page | **100–1220 ms** | (working-set dependent) |
+
+One cold-restore tail breakdown (132 ms total): `dev:93ms` (recreating the virtio
+set — gpu/net/blk/input — dominates) + `stdin:39ms`; everything else is sub-ms.
+
+### Interpretation
+
+- **Cold restore is ~60× faster than cold-booting to a usable browser** (130 ms vs
+  ~7.8 s). That gap *is* the disposable-browser value proposition: the warm snapshot
+  skips Firefox's ~7 s cold start. Cold restore is also remarkably flat (127–131 ms)
+  because `clonefile` + `mmap(MAP_SHARED)` does no large up-front read — the working
+  set faults in lazily as the restored browser runs.
+
+- **Hot restore (in-place reset) cost scales with the dirtied working set**, because
+  the rollback synchronously copies the pages dirtied since the checkpoint (DMA-aware
+  dirty tracking + a full re-protect). Right after loading a heavy page with active
+  traffic the first reset was 1220 ms; subsequent resets with less churn fell to
+  207 → 100 ms. So in-place reset trades a working-set copy for keeping the *same*
+  process and window — no re-spawn, no 93 ms device re-setup, no window recreate, no
+  visual flicker — and for a freshly-browsed heavy page it can cost *more* up-front
+  than a flat cold restore, while for light churn it is ~100 ms.
+
+- **Known wrinkle:** under active network traffic, a `virtio_net … not a head` warning
+  recurred once after the heaviest reset (the net reset is not yet 100% clean under
+  load). It self-recovered via the carrier-bounce rebind (later resets were clean), but
+  it points at a residual race in the in-place net reset, distinct from these latency
+  figures.
+
 ## Related
 
 - [Snapshot & restore](../features/snapshot-restore.md) — the feature these numbers measure.
+- [Disposable browser](../features/disposable-browser.md) — the workload behind the latency table above.
 - [Snapshot-fuzzing benchmark](fuzzing.md) — execs/sec as a direct readout of reset latency.
