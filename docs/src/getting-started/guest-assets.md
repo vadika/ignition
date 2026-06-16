@@ -59,7 +59,9 @@ The GUI compositor (M4) also needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVD
 
 A separate, larger rootfs (`rootfs-gui.ext4`) adds a cage (wlroots, pixman software
 renderer) Wayland kiosk running foot, plus eudev/seatd/xkeyboard-config, for the `--gui`
-window. Built by its own script so the minimal base rootfs stays untouched.
+window. It also carries the same `netwatch` carrier-poller as the base rootfs, so a
+restored or cloned GUI guest rebinds virtio-net on restore and re-DHCPs with its fresh
+MAC. Built by its own script so the minimal base rootfs stays untouched.
 
 ```bash
 cd kimage
@@ -75,7 +77,10 @@ guest falls back to the serial console.
 
 To snapshot and restore the live desktop, add `--track-dirty`, press `Ctrl-A s` to write
 a snapshot, then `boot --gui --restore <name>` to reopen it. Fan out N clones from one
-base with `scripts/fanout-gui.sh N <name>`.
+base with `scripts/fanout-gui.sh N <name>`. Add `--net` (under `sudo`) on both the
+snapshot and the fan-out for networked clones — the GUI rootfs carries the `netwatch`
+carrier-poller, so each clone rebinds virtio-net on restore and gets its own MAC + DHCP
+lease.
 
 ## Rebuild the fuzz initramfs
 
