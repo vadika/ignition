@@ -499,6 +499,22 @@ fn decode_mmio_le(buf: &[u8], len: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// Pure: the vtimer offset that makes a restored guest's CNTVCT resume at
+/// `host_counter` given the current host counter `mach_now`. Saturating so a
+/// stale (larger) host_counter can never wrap to a huge offset.
+pub fn vtimer_offset_from(mach_now: u64, host_counter: u64) -> u64 {
+    mach_now.saturating_sub(host_counter)
+}
+
+/// The shared vtimer offset to apply to EVERY vCPU on restore/reset, computed
+/// from ONE mach_absolute_time() read and the primary vCPU's captured
+/// host_counter. All vCPUs must use the same value: CNTVCT is system-wide, and
+/// per-vCPU offsets desync the cores (astronomical timekeeping jumps + RCU stalls).
+pub fn shared_vtimer_offset(primary_host_counter: u64) -> u64 {
+    let mach_now = unsafe { mach_absolute_time() };
+    vtimer_offset_from(mach_now, primary_host_counter)
+}
+
 impl HvfVcpu<'_> {
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
@@ -786,7 +802,7 @@ impl HvfVcpu<'_> {
 
     /// Restore all snapshot state onto a freshly-created vCPU. MUST run on the
     /// vCPU's own thread, before the first `run()`.
-    pub fn restore_state(&self, s: &VcpuState) -> Result<(), Error> {
+    pub fn restore_state(&self, s: &VcpuState, vtimer_offset: u64) -> Result<(), Error> {
         for (r, v) in SAVED_GP.iter().zip(&s.gp) {
             self.write_reg(*r, *v)?;
         }
@@ -810,9 +826,13 @@ impl HvfVcpu<'_> {
         // The WFI exit handler in run() is offset-aware (reads hv_vcpu_get_vtimer_offset
         // and compares CNTV_CVAL against mach - offset), so the host parks correctly
         // in this shifted domain instead of busy-looping on WaitForEventExpired.
-        let mach_now = unsafe { mach_absolute_time() };
-        let offset = mach_now.saturating_sub(s.host_counter);
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        //
+        // The offset is now computed ONCE by the caller (from a single
+        // mach_absolute_time() read and the primary vCPU's host_counter) and shared
+        // across all vCPUs: CNTVCT is architecturally system-wide, so a per-vCPU
+        // offset would desync the cores and make the guest clock jump to the far
+        // future (RCU stalls). See `shared_vtimer_offset`.
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, vtimer_offset) };
         if ret != HV_SUCCESS {
             return Err(Error::VcpuSetRegister);
         }
@@ -1159,5 +1179,16 @@ mod snapshot_tests {
         assert_eq!(back.simd.len(), 32);
         assert_eq!(back.fpcr, s.fpcr);
         assert_eq!(back.fpsr, s.fpsr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vtimer_offset_from;
+
+    #[test]
+    fn vtimer_offset_from_saturates() {
+        assert_eq!(vtimer_offset_from(1000, 400), 600);
+        assert_eq!(vtimer_offset_from(400, 1000), 0); // stale host_counter -> 0, never wraps
     }
 }

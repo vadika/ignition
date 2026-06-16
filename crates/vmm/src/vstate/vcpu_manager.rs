@@ -4,7 +4,7 @@
 // vtimers, so no userspace IRQ routing is needed here.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -74,6 +74,11 @@ pub struct VcpuManager {
     checkpoint_req: AtomicBool,
     /// Set by `request_reset`; cleared by the reset leader.
     reset_req: AtomicBool,
+    /// Shared vtimer offset for an interactive reset (Ctrl+Alt+R). Computed once
+    /// by the reset leader from the reset point's primary host_counter and read
+    /// by every vCPU after barrier 2 before its `restore_state`, so CNTVCT stays
+    /// synchronized across cores (see `run_restored`).
+    reset_vtimer_offset: AtomicU64,
     /// True for the duration of any rendezvous (snapshot, checkpoint, or reset);
     /// freezes CPU_ON and rejects a re-entrant request. Read and written only
     /// while holding the `running` lock, so it cannot race a claim.
@@ -131,6 +136,7 @@ impl VcpuManager {
             snapshot_req: AtomicBool::new(false),
             checkpoint_req: AtomicBool::new(false),
             reset_req: AtomicBool::new(false),
+            reset_vtimer_offset: AtomicU64::new(0),
             rendezvous_active: AtomicBool::new(false),
             snap_barrier: Mutex::new(None),
             collected: Mutex::new(Vec::new()),
@@ -327,11 +333,22 @@ impl VcpuManager {
                 running.insert(cp.mpidr);
             }
         }
+        // CNTVCT is system-wide: compute ONE vtimer offset (single mach read,
+        // primary's host_counter) and give every vCPU the identical value, or the
+        // cores desync and the guest clock jumps to the far future (RCU stalls).
+        let primary_hc = checkpoints
+            .iter()
+            .find(|c| c.mpidr == mpidr_for(0))
+            .or_else(|| checkpoints.first())
+            .map(|c| c.state.host_counter)
+            .unwrap_or(0);
+        let vtimer_offset = ignition_hvf::shared_vtimer_offset(primary_hc);
         for cp in checkpoints {
             let me = Arc::clone(self);
             let bar = Arc::clone(&barrier);
             let blob = Arc::clone(&gic_blob);
-            let handle = thread::spawn(move || me.run_restored_one(cp, bar, blob));
+            let handle =
+                thread::spawn(move || me.run_restored_one(cp, bar, blob, vtimer_offset));
             self.threads.lock().unwrap().push(handle);
         }
         self.join_all()
@@ -347,6 +364,7 @@ impl VcpuManager {
         cp: VcpuCheckpoint,
         barrier: Arc<Barrier>,
         gic_blob: Arc<Option<Vec<u8>>>,
+        vtimer_offset: u64,
     ) -> Result<(), ignition_hvf::Error> {
         let vcpu = HvfVcpu::new(cp.mpidr, false);
         match &vcpu {
@@ -377,7 +395,7 @@ impl VcpuManager {
         }
 
         let vcpu = vcpu.expect("not shutdown implies every vcpu was created");
-        vcpu.restore_state(&cp.state)?;
+        vcpu.restore_state(&cp.state, vtimer_offset)?;
         self.run_loop(cp.mpidr, vcpu)
     }
 
@@ -662,9 +680,10 @@ impl VcpuManager {
                         // Barrier 2: rollback complete; each vCPU now restores its
                         // own registers from its checkpoint in the reset point.
                         bar.wait();
+                        let off = self.reset_vtimer_offset.load(Ordering::Acquire);
                         if let Some(rp) = self.reset_point.lock().unwrap().as_ref()
                             && let Some(cp) = rp.vcpus.iter().find(|c| c.mpidr == mpidr)
-                            && let Err(e) = vcpu.restore_state(&cp.state)
+                            && let Err(e) = vcpu.restore_state(&cp.state, off)
                         {
                             log::error!("reset: vcpu {mpidr:#x} restore_state failed: {e}");
                         }
@@ -777,6 +796,26 @@ impl VcpuManager {
                 log::error!("reset handler panicked; guest resumed (state may be inconsistent)");
             }
         }
+
+        // Shared vtimer offset for all vCPUs (see run_restored); read by each vCPU
+        // after barrier 2 before its restore_state. The leader runs this between
+        // barrier 1 and barrier 2, so the Release store is visible (via the barrier
+        // happens-before edge and the Acquire load) to every vCPU when it restores.
+        let primary_hc = self
+            .reset_point
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rp| {
+                rp.vcpus
+                    .iter()
+                    .find(|c| c.mpidr == mpidr_for(0))
+                    .or_else(|| rp.vcpus.first())
+            })
+            .map(|c| c.state.host_counter)
+            .unwrap_or(0);
+        self.reset_vtimer_offset
+            .store(ignition_hvf::shared_vtimer_offset(primary_hc), Ordering::Release);
 
         self.reset_req.store(false, Ordering::Release);
         self.rendezvous_active.store(false, Ordering::Relaxed);

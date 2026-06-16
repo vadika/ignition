@@ -407,7 +407,8 @@ impl FuzzController {
         self.base_ram = base;
         let state = self.base_state.as_ref().expect("reset before capture");
         let t_regs = Instant::now();
-        vcpu.restore_state(state)?;
+        let off = ignition_hvf::shared_vtimer_offset(state.host_counter);
+        vcpu.restore_state(state, off)?;
         vcpu.clear_pending_advance();
         let regs_us = t_regs.elapsed().as_micros().min(u32::MAX as u128) as u32;
         self.metrics.record_reset(restore_us.saturating_add(regs_us), restore_us, regs_us);
