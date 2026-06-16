@@ -89,7 +89,7 @@ sudo scripts/make-browser-base.sh my-base
 If you prefer to watch the boot yourself and choose when to snapshot:
 
 ```console
-sudo target/debug/boot --gui --net --track-dirty --mem 1024 --name browser-base \
+sudo target/debug/boot --gui --net --smp 2 --track-dirty --mem 1024 --name browser-base \
      --append "init=/sbin/overlay-init" kimage/out/Image kimage/out/rootfs-browser.ext4
 ```
 
@@ -180,6 +180,12 @@ guest-visible address space, though Apple Silicon memory compression and the
 CoW instance directories mean the actual resident footprint is lower in
 practice. The `rootfs-browser.ext4` disk image is shared read-only across all
 clones — only the per-clone tmpfs upper layer (in guest RAM) diverges.
+
+The warm-base is created with `--smp 2` (Firefox is happier with more than one
+core). The vCPU count is baked into the snapshot, so every restored clone gets
+those 2 cores automatically — `disposable-browser.sh` does not pass `--smp`
+because restore inherits the count from the snapshot (like `--mem`). Re-create
+the warm-base with a different `--smp` value to change it.
 
 ## Related
 

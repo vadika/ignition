@@ -37,7 +37,7 @@ exec 3>"$fifo"
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
-"$BOOT" --gui --net --track-dirty --mem 1024 \
+"$BOOT" --gui --net --smp 2 --track-dirty --mem 1024 \
   --append "init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do
