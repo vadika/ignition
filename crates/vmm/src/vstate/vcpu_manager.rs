@@ -687,6 +687,14 @@ impl VcpuManager {
                         {
                             log::error!("reset: vcpu {mpidr:#x} restore_state failed: {e}");
                         }
+                        // Force the vtimer UNMASKED after reset, overriding the
+                        // checkpoint's mask. A checkpoint marked while the guest was
+                        // mid-timer-handling captures vtimer_mask=true; the rolled-back
+                        // code never reaches its re-arm, so a restored mask leaves the
+                        // vtimer dead on this core (RCU stall). Unmasking lets the timer
+                        // fire so the guest re-arms normally; harmless when it was
+                        // already unmasked (idle checkpoint).
+                        let _ = ignition_hvf::vcpu_set_vtimer_mask(vcpu.id(), false);
                         continue;
                     }
                     return Ok(());
