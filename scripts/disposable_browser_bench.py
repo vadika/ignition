@@ -143,27 +143,61 @@ def cold_restore_phase():
     return rt_ms, tail
 
 
+SITES = [
+    "https://en.wikipedia.org/wiki/MicroVM",
+    "https://www.mozilla.org",
+    "https://en.wikipedia.org/wiki/Hypervisor",
+    "https://example.org",
+]
+
+
+def serial_login(fd):
+    """Best-effort root login on the serial console (root has no password). Harmless
+    if a shell is already active (`root` just becomes an unknown command)."""
+    os.write(fd, b"\r")
+    time.sleep(0.4)
+    os.write(fd, b"root\r")
+    time.sleep(1.2)
+
+
+def navigate(fd, url):
+    """Tell the running (cage) Firefox to load `url` via its remote: a second
+    firefox-esr invocation with the same profile loads into the existing instance.
+    Needs the cage Wayland session env. Best-effort; logged to /tmp/ffnav.log in-guest."""
+    cmd = (b"env XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-1 "
+           b"MOZ_ENABLE_WAYLAND=1 firefox-esr --new-tab '" + url.encode() +
+           b"' >/tmp/ffnav.log 2>&1 &\r")
+    os.write(fd, cmd)
+
+
 def hot_restore_phase():
-    """One restored instance; trigger N in-place resets over serial (Ctrl-A r),
-    reading each Reset-time."""
-    reset_us = []
-    print("\n--- hot restore (in-place Ctrl-A r reset of the running instance) ---", flush=True)
+    """One restored instance; before each in-place reset, navigate the live Firefox
+    to a real page (dirtying a realistic working set), then trigger Ctrl-A r and read
+    Reset-time. Returns reset latencies in MILLISECONDS."""
+    reset_ms = []
+    print("\n--- hot restore (navigate to a real page, then in-place Ctrl-A r reset) ---", flush=True)
     pid, fd = spawn(RESTORE_ARGS)
     done, _ = read_until(fd, b"Restore-time", timeout=30)
     if done is None:
         print("  restore did not settle; skipping hot-restore phase", flush=True)
         kill(pid, fd)
-        return reset_us
-    time.sleep(2.0)  # let the guest settle + dirty some pages
+        return reset_ms
+    time.sleep(5.0)  # let the restore's net carrier-bounce reconnect + the desktop settle
     for i in range(N):
-        os.write(fd, CTRL_A + b"r")          # Ctrl-A r -> Action::Reset
-        t, out = read_until(fd, b"Reset-time", timeout=15)
+        url = SITES[i % len(SITES)]
+        serial_login(fd)
+        navigate(fd, url)
+        print(f"  reset {i+1}: navigated to {url}; loading...", flush=True)
+        time.sleep(8.0)  # page load + render -> dirty a realistic working set
+        os.write(fd, CTRL_A + b"r")          # Ctrl-A r -> Action::Reset (in-place)
+        _, out = read_until(fd, b"Reset-time", timeout=15)
         us = first_int(RE_RESET, out)
-        reset_us.append(us)
-        print(f"  reset {i+1}: Reset-time={us} us", flush=True)
-        time.sleep(2.5)  # let it run again (and the async net reconnect finish) before the next
+        ms = us / 1000.0 if us is not None else None
+        reset_ms.append(ms)
+        print(f"  reset {i+1}: Reset-time={ms:.3f} ms" if ms is not None else f"  reset {i+1}: Reset-time=MISS", flush=True)
+        time.sleep(5.0)  # post-reset net reconnect + settle before the next navigation
     kill(pid, fd)
-    return reset_us
+    return reset_ms
 
 
 def main():
@@ -187,13 +221,14 @@ def main():
     print(summ("cold boot -> BROWSER_READY (wall)", ready, "ms"))
     print(summ("cold boot Guest-boot-time", gboot, "ms"))
     print(summ("cold restore Restore-time", crestore, "ms"))
-    print(summ("hot restore Reset-time (snap-back)", hreset, "us"))
+    print(summ("hot restore Reset-time (snap-back)", hreset, "ms"))
     if tail:
         print(f"\nRestore-tail (one cold-restore sample): {tail}")
-    print("\nNotes: cold restore Restore-time is the host-side up-front cost (clonefile +\n"
-          "lazy mmap + state restore); lazy page-in afterward is amortized. Hot restore\n"
-          "Reset-time is the synchronous in-place snap-back only — the net reconnect that\n"
-          "follows a reset is async (~2s) and not included.")
+    print("\nNotes (all figures in ms): cold restore Restore-time is the host-side up-front\n"
+          "cost (clonefile + lazy mmap + state restore); lazy page-in afterward is amortized.\n"
+          "Hot restore Reset-time is the synchronous in-place snap-back AFTER navigating the\n"
+          "live Firefox to a real page (rolling back that working set) — the net reconnect\n"
+          "that follows a reset is async (~2s) and not included.")
 
 
 if __name__ == "__main__":
