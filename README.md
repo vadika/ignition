@@ -29,11 +29,21 @@ Validated end-to-end on Apple Silicon. Working today:
 
 - **Boot to shell** — aarch64 kernel + FDT load, in-kernel GICv3, interactive 16550 console.
 - **Device model** — uniform `DeviceManager` + `MmioDevice` trait; the full Firecracker aarch64 set.
-- **virtio** — blk, net (vmnet NAT, `--net`), rng, balloon, vsock (guest→host).
+- **virtio** — blk, net (vmnet NAT, `--net`), rng, balloon, vsock (guest→host), gpu (2D), input.
 - **PL031 RTC + boot-timer.**
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
-- **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, multi-vCPU + net.
-- **Diff snapshots** — `--track-dirty` write-protect tracking; immutable delta chains.
+- **GUI display** — `--gui` opens a software-rendered macOS window over virtio-gpu (2D) +
+  virtio-input (keyboard + tablet); a cage Wayland compositor runs a real desktop. Snapshots,
+  restores, and fans out like any guest.
+- **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, multi-vCPU + net + GUI.
+- **Diff snapshots** — `--track-dirty` write-protect tracking (DMA-aware: device writes are tracked
+  too); immutable delta chains.
+- **Interactive reset** — `Ctrl-A r` / GUI `Ctrl+Alt+R` rolls a live guest back in place to a
+  checkpoint (RAM + vCPU + GIC + virtio-device state), fast dirty-only rollback.
+- **Disposable browser** — a throwaway Firefox-kiosk microVM on an overlay root (immutable disk),
+  cloned per session from a warm snapshot, reset in place, fanned out N (`scripts/disposable-browser.sh`).
+- **Sandbox / jailing** — the VMM self-applies a macOS Seatbelt profile at startup (on by default;
+  `--no-sandbox` to disable, fail-closed).
 - **In-VMM snapshot fuzzing** — `--fuzz` per-iteration dirty-page reset loop.
 
 Full feature docs: the documentation site. Roadmap and progress: `ROADMAP.md`.
