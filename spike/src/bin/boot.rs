@@ -271,16 +271,22 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             let live: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(host_usize as *mut u8, ram_size as usize)
             };
-            match &dirty {
-                Some(t) => {
-                    let pages = t.drain();
-                    ignition_vmm::reset::rollback_pages(rp.pristine.as_slice(), live, &pages, ignition_vmm::dirty::PAGE);
-                    let _ = ignition_hvf::vm_protect_memory(
-                        layout::RAM_BASE, ram_size,
-                        (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
-                    );
-                }
-                None => ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live),
+            // FULL-copy rollback, NOT dirty-only. The write-protect dirty tracker
+            // only catches GUEST writes (stage-2 faults); virtio DEVICES write guest
+            // RAM (net RX frame data + the used ring) directly through the host
+            // mapping, bypassing stage-2, so those pages are never marked dirty. A
+            // dirty-only rollback leaves them stale -> inconsistent virtqueues
+            // ("virtio_net ... not a head") and a half-reverted guest (browser tab
+            // crash). Copying the whole pristine image reverts device-written pages
+            // too. If a dirty tracker is armed (for Ctrl-A s diff snapshots), drain
+            // it and re-protect to re-arm tracking from a clean post-reset baseline.
+            ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live);
+            if let Some(t) = &dirty {
+                let _ = t.drain();
+                let _ = ignition_hvf::vm_protect_memory(
+                    layout::RAM_BASE, ram_size,
+                    (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                );
             }
             // Deliberately do NOT re-restore the GIC distributor/redistributor here.
             // hv_gic_set_state mid-run (after the GIC has been delivering interrupts)
