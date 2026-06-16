@@ -105,6 +105,5 @@ uid drop.
 
 ## Related
 
-- [Sandbox internals](../internals/sandbox.md) — implementation notes and v2 design.
 - [Snapshot & restore](snapshot-restore.md) — snapshot store paths that the sandbox
   keeps writable.
