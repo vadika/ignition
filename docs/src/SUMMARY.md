@@ -28,6 +28,9 @@
 - [Diff snapshots](benchmarks/diff-snapshots.md)
 - [Snapshot fuzzing](benchmarks/fuzzing.md)
 
+# Writeups
+- [A disposable browser in 130 ms](writeups/disposable-browser.md)
+
 # Internals
 - [HVF and Firecracker map](internals/hvf-firecracker-map.md)
 - [Design decisions](internals/design-decisions.md)
