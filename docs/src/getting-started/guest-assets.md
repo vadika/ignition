@@ -73,6 +73,10 @@ framebuffer VT and foot renders fullscreen; type to drive the shell, move the po
 a software cursor. Without `--gui` (no `/dev/dri/card0`) the cage service no-ops and the
 guest falls back to the serial console.
 
+To snapshot and restore the live desktop, add `--track-dirty`, press `Ctrl-A s` to write
+a snapshot, then `boot --gui --restore <name>` to reopen it. Fan out N clones from one
+base with `scripts/fanout-gui.sh N <name>`.
+
 ## Rebuild the fuzz initramfs
 
 The snapshot fuzzer (`boot --fuzz`) uses a separate minimal initramfs whose

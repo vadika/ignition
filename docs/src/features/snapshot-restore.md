@@ -92,6 +92,29 @@ these were confirmed empirically by the offset/cval/cntvct sampler.
 snapshot dir write/read/magic). Workspace builds, 0 clippy. Live snapshot→restore and
 clone verified by the two driver scripts above.
 
+## GUI snapshot, restore & fan-out
+
+A `--gui` guest (the cage + foot desktop over virtio-gpu/virtio-input) snapshots
+and restores like any other: `Ctrl-A s` writes a snapshot of the live desktop,
+and `boot --gui --restore <name>` reopens a window with the desktop resuming
+where it left off. The virtio-gpu resource table and scanout binding plus the
+virtio-input config cursor are serialized; pixels are not — on restore the
+device re-reads the scanout from the restored guest-RAM backing and presents one
+frame, so the window paints the resumed screen before the guest runs again.
+
+Because each restore clones the immutable base into its own copy-on-write
+instance dir (keyed by pid), one warm base fans out into N independent desktops,
+each with its own window and — under `--net` — its own MAC and DHCP lease:
+
+```console
+# take one warm-base snapshot of a logged-in desktop (Ctrl-A s), then:
+scripts/fanout-gui.sh 3 warm-base
+# -> 3 boot --gui --restore processes, 3 windows, 3 isolated guests
+```
+
+The base snapshot is never mutated; closing a clone's window tears down only
+that guest.
+
 ## Related
 
 - [The clone primitive](../concepts/clone-primitive.md) — the mechanism behind this feature.
