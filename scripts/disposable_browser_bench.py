@@ -30,11 +30,11 @@ BASE = "browser-base"
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
 COLD_BOOT_ARGS = [
-    "--gui", "--net", "--smp", "2", "--mem", "1024", "--track-dirty",
+    "--gui", "--net", "--smp", "2", "--mem", "2048", "--track-dirty",
     "--append", "ro init=/sbin/overlay-init", KERNEL, ROOTFS,
 ]
 RESTORE_ARGS = [
-    "--gui", "--net", "--mem", "1024", "--track-dirty",
+    "--gui", "--net", "--mem", "2048", "--track-dirty",
     "--store", STORE, "--restore", BASE,
 ]
 
