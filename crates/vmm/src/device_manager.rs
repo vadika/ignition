@@ -190,11 +190,85 @@ impl FrozenDevices {
             })
             .collect()
     }
+
+    /// Push each saved record's state back into the matching live device,
+    /// matched by MMIO base. Best-effort: a device that rejects its state is
+    /// logged and skipped (used by the in-place reset path, vCPUs parked).
+    pub fn restore(&self, records: &[DeviceRecord]) {
+        for rec in records {
+            let Some(r) = self.records.iter().find(|r| r.base == rec.base) else {
+                log::warn!("reset: no live device at base {:#x} for record {}", rec.base, rec.id);
+                continue;
+            };
+            if let Err(e) = r.dev.lock().unwrap().restore(&rec.state) {
+                log::warn!("reset: device {} restore failed: {e}", rec.id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Minimal fake MmioDevice for unit-testing FrozenDevices::save / restore.
+    // ---------------------------------------------------------------------------
+    struct FakeDev {
+        id: &'static str,
+        value: serde_json::Value,
+    }
+
+    impl ignition_devices::bus::BusDevice for FakeDev {}
+
+    impl ignition_devices::device::MmioDevice for FakeDev {
+        fn fdt_kind(&self) -> FdtKind { FdtKind::Ns16550a }
+        fn snapshot_id(&self) -> &str { self.id }
+        fn save(&self) -> serde_json::Value { self.value.clone() }
+        fn restore(&mut self, v: &serde_json::Value) -> Result<(), DeviceMgrError> {
+            self.value = v.clone();
+            Ok(())
+        }
+    }
+
+    fn make_frozen(id: &'static str, base: u64, value: serde_json::Value) -> FrozenDevices {
+        let dev: Arc<Mutex<dyn MmioDevice>> =
+            Arc::new(Mutex::new(FakeDev { id, value }));
+        FrozenDevices {
+            bus: Arc::new(Bus::new()),
+            records: vec![Record {
+                id: id.to_string(),
+                base,
+                size: 0x1000,
+                spi: 0,
+                fdt_kind: FdtKind::Ns16550a,
+                dev,
+            }],
+        }
+    }
+
+    #[test]
+    fn frozen_restore_reverts_live_device_state() {
+        let frozen = make_frozen("serial", 0x900_0000, serde_json::json!({"scratch": 1}));
+        let saved = frozen.save();
+
+        // Mutate the live device away from the saved state via restore().
+        frozen.restore(&[DeviceRecord {
+            id: "serial".into(),
+            base: 0x900_0000,
+            size: 0x1000,
+            spi: 0,
+            fdt_kind: FdtKind::Ns16550a,
+            state: serde_json::json!({"scratch": 99}),
+        }]);
+        assert_eq!(frozen.save()[0].state, serde_json::json!({"scratch": 99}),
+            "sanity: mutation applied");
+
+        // Roll back to saved.
+        frozen.restore(&saved);
+        let now = frozen.save();
+        assert_eq!(now, saved, "device state must match the captured records after restore");
+    }
 
     #[test]
     fn alloc_is_sequential_and_bounds_checked() {

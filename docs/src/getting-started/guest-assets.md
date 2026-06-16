@@ -80,7 +80,10 @@ a snapshot, then `boot --gui --restore <name>` to reopen it. Fan out N clones fr
 base with `scripts/fanout-gui.sh N <name>`. Add `--net` (under `sudo`) on both the
 snapshot and the fan-out for networked clones — the GUI rootfs carries the `netwatch`
 carrier-poller, so each clone rebinds virtio-net on restore and gets its own MAC + DHCP
-lease.
+lease. For in-memory reset without writing a new snapshot, `Ctrl-A c` marks the current
+running desktop as a reset point and `Ctrl-A r` rolls it back in place (distinct from the
+`Ctrl-A s` disk snapshot); this requires that the rootfs not diverge between checkpoint
+and reset — mount it read-only with tmpfs for all writable state.
 
 ## Rebuild the fuzz initramfs
 

@@ -130,6 +130,54 @@ to the same address.
 The base snapshot is never mutated; closing a clone's window tears down only
 that guest.
 
+## Interactive reset-to-checkpoint
+
+Two console hotkeys let you capture a running guest's state as an in-memory
+"reset point" and roll the live guest back to it without tearing the VM down:
+
+- **`Ctrl-A c`** — mark the current moment as the reset point. The VMM captures
+  guest RAM (via an O(1) APFS `clonefile` copy), vCPU registers, GIC state, and
+  virtio-device state, then prints `[reset point marked]` and lets the guest
+  continue.
+- **`Ctrl-A r`** — roll the running guest back IN PLACE to that reset point:
+  guest RAM is restored (only the pages that changed when `--track-dirty` is
+  armed, or a full copy without it — both produce a correct result), vCPU
+  registers, GIC state, and virtio-device state are all applied, and under
+  `--gui` the rolled-back screen is repainted. The guest then resumes from the
+  reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
+  yet, prints `reset: no checkpoint - press Ctrl-A c first`.
+
+**Auto-seed on `--restore`.** When a guest is started with `boot --restore
+<dir>`, the restored snapshot is automatically installed as the initial reset
+point before the guest runs. `Ctrl-A r` therefore works immediately after a
+restore — no `Ctrl-A c` needed. A fresh cold boot has no reset point until you
+press `Ctrl-A c`.
+
+**Distinct from `Ctrl-A s`.** `Ctrl-A s` writes a named snapshot directory to
+disk (a full, persistent snapshot usable for future restores and fan-out clones).
+`Ctrl-A c`/`Ctrl-A r` operate entirely in memory and on the live guest; no
+directory is written.
+
+**GIC mid-run re-restore.** Applying GIC state to a running guest (`hv_gic_set_state`
+while the VM is live) is best-effort: all vCPUs are parked before the call and
+the state is applied atomically from their perspective. If HVF rejects the call
+mid-run the reset logs `[reset] gic_restore rejected mid-run ...` and continues;
+any in-flight interrupts re-settle within a tick or two. This is the designed
+fallback — the guest remains functional.
+
+> **Disk non-divergence is required for correctness.** Reset rolls back guest
+> RAM, vCPU registers, GIC state, and virtio-device state, but the disk is
+> NOT rewound. If the guest has written to a read-write rootfs between the
+> checkpoint and the reset, the rolled-back guest RAM (page cache, ext4
+> journal, inode cache) will describe a disk that has moved on, causing
+> filesystem corruption.
+>
+> The intended usage mounts the rootfs **read-only** and places all writable
+> state (`/tmp`, browser profile, downloads, etc.) on a **tmpfs** overlay that
+> lives in guest RAM. That RAM rolls back cleanly with `Ctrl-A r`, and the
+> immutable rootfs never diverges. **A read-write rootfs that is written between
+> `Ctrl-A c` and `Ctrl-A r` will corrupt the filesystem.**
+
 ## Related
 
 - [The clone primitive](../concepts/clone-primitive.md) — the mechanism behind this feature.

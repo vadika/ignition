@@ -33,7 +33,7 @@ use ignition_devices::virtio::rng::VirtioRng;
 use ignition_devices::virtio::vsock::VsockDevice;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ignition_hvf::gic::HvfGicV3;
-use ignition_vmm::device_manager::{DeviceManager, DeviceRecord};
+use ignition_vmm::device_manager::{DeviceManager, DeviceRecord, FrozenDevices};
 use ignition_vmm::dirty::DirtyTracker;
 use ignition_vmm::fuzz::controller::FuzzController;
 use ignition_vmm::fuzz::controller::ResetMode;
@@ -68,6 +68,10 @@ enum Action {
     Snapshot,
     /// Ctrl-A b: toggle the memory-balloon target.
     Balloon,
+    /// Ctrl-A c: mark a reset point (checkpoint current state).
+    Checkpoint,
+    /// Ctrl-A r: roll back to the current reset point.
+    Reset,
 }
 
 /// Advance the escape state machine by one input byte. The caller forwards
@@ -90,6 +94,8 @@ fn step(state: &mut EscState, byte: u8) -> Action {
                 b'x' => Action::Quit,
                 b's' => Action::Snapshot,
                 b'b' => Action::Balloon,
+                b'c' => Action::Checkpoint,
+                b'r' => Action::Reset,
                 // Ctrl-A Ctrl-A sends a single literal Ctrl-A to the guest.
                 CTRL_A => Action::Forward([CTRL_A, 0], 1),
                 // Ctrl-A was not an escape: send it literally, then this byte.
@@ -159,6 +165,125 @@ impl Drop for TermiosGuard {
     }
 }
 
+/// Resources the checkpoint/reset handlers capture. `mem_file` is `Some` in
+/// restore mode (instance memory.bin -> clonefile pristine) and `None` for a
+/// fresh boot (MAP_ANON -> owned copy).
+struct ResetWiring {
+    host_usize: usize,
+    ram_size: u64,
+    mem_file: Option<PathBuf>,
+    inst_dir: PathBuf,
+    gic: Arc<HvfGicV3>,
+    frozen: Arc<FrozenDevices>,
+    dirty: Option<DirtyTracker>,
+    rx_stop: Option<Arc<AtomicBool>>,
+    gpu: Option<Arc<Mutex<VirtioMmio>>>,
+}
+
+fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
+    let point = manager.reset_point();
+
+    // --- checkpoint: capture current RAM + gic + devices into a new ResetPoint ---
+    {
+        let point = point.clone();
+        let host_usize = w.host_usize;
+        let ram_size = w.ram_size;
+        let mem_file = w.mem_file.clone();
+        let inst_dir = w.inst_dir.clone();
+        let gic = w.gic.clone();
+        let frozen = w.frozen.clone();
+        let dirty = w.dirty.clone();
+        let rx_stop = w.rx_stop.clone();
+        manager.set_checkpoint_handler(Box::new(move |checkpoints| {
+            // vCPUs parked. Quiesce the vmnet RX feeder during the RAM clone.
+            if let Some(stop) = &rx_stop { stop.store(true, Ordering::Release); }
+            let live: &[u8] = unsafe {
+                std::slice::from_raw_parts(host_usize as *const u8, ram_size as usize)
+            };
+            let pristine = match &mem_file {
+                Some(src) => {
+                    // MAP_SHARED -> flush so the clonefile sees current RAM.
+                    let rc = unsafe { libc::msync(host_usize as *mut libc::c_void, ram_size as usize, libc::MS_SYNC) };
+                    if rc != 0 {
+                        eprintln!("[checkpoint] msync failed ({}); pristine may be slightly stale", std::io::Error::last_os_error());
+                    }
+                    let dst = inst_dir.join("pristine.bin");
+                    let _ = std::fs::remove_file(&dst);
+                    match ignition_vmm::reset::PristineRam::from_clone(src, &dst, ram_size as usize) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[checkpoint] clonefile pristine failed ({e}); falling back to copy");
+                            ignition_vmm::reset::PristineRam::from_copy(live)
+                        }
+                    }
+                }
+                None => ignition_vmm::reset::PristineRam::from_copy(live),
+            };
+            let gic_blob = match gic.save_state() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[checkpoint] gic save_state failed: {e}; reset point not updated");
+                    if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+                    return;
+                }
+            };
+            let devices = frozen.save();
+            // Discard dirty pages accumulated up to now and re-arm, so the next
+            // reset rolls back only changes AFTER this checkpoint. (Interleaving a
+            // Ctrl-A s diff-snapshot between checkpoint and reset is out of scope.)
+            if let Some(t) = &dirty {
+                let _ = t.drain();
+                let _ = ignition_hvf::vm_protect_memory(
+                    layout::RAM_BASE, ram_size,
+                    (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                );
+            }
+            *point.lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
+                pristine, vcpus: checkpoints, gic_blob, devices,
+            });
+            if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+        }));
+    }
+
+    // --- reset: roll live RAM/GIC/devices back to the current ResetPoint ---
+    {
+        let point = point.clone();
+        let host_usize = w.host_usize;
+        let ram_size = w.ram_size;
+        let frozen = w.frozen.clone();
+        let dirty = w.dirty.clone();
+        let rx_stop = w.rx_stop.clone();
+        let gpu = w.gpu.clone();
+        manager.set_reset_handler(Box::new(move || {
+            let guard = point.lock().unwrap();
+            let Some(rp) = guard.as_ref() else { return; };
+            if let Some(stop) = &rx_stop { stop.store(true, Ordering::Release); }
+            let live: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_usize as *mut u8, ram_size as usize)
+            };
+            match &dirty {
+                Some(t) => {
+                    let pages = t.drain();
+                    ignition_vmm::reset::rollback_pages(rp.pristine.as_slice(), live, &pages, ignition_vmm::dirty::PAGE);
+                    let _ = ignition_hvf::vm_protect_memory(
+                        layout::RAM_BASE, ram_size,
+                        (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                    );
+                }
+                None => ignition_vmm::reset::rollback_full(rp.pristine.as_slice(), live),
+            }
+            // GIC mid-run re-restore is proven only at create-time. Best-effort;
+            // on rejection log and let interrupts re-settle (spec fallback).
+            if let Err(e) = ignition_hvf::gic::gic_restore(&rp.gic_blob) {
+                eprintln!("[reset] gic_restore rejected mid-run ({e}); continuing without GIC re-restore");
+            }
+            frozen.restore(&rp.devices);
+            if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+            if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
+        }));
+    }
+}
+
 /// Spawn a thread that reads host stdin one byte at a time, runs the escape
 /// state machine, and feeds forwarded bytes into the serial's RX FIFO. On
 /// Ctrl-A x it restores the terminal and exits the process. On Ctrl-A s it
@@ -209,6 +334,18 @@ fn spawn_stdin_reader(
                 Action::Snapshot => {
                     eprintln!("\n[snapshot requested]");
                     manager.request_snapshot();
+                }
+                Action::Checkpoint => {
+                    eprintln!("\n[reset point marked]");
+                    manager.request_checkpoint();
+                }
+                Action::Reset => {
+                    if manager.has_reset_point() {
+                        eprintln!("\n[reset to checkpoint]");
+                        manager.request_reset();
+                    } else {
+                        eprintln!("\nreset: no checkpoint - press Ctrl-A c first");
+                    }
                 }
                 Action::Balloon => {
                     const BALLOON_PAGES: u32 = 64 * 256; // 64 MiB in 4 KiB pages
@@ -924,6 +1061,10 @@ fn main() {
 
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
+    // Reset-handler copies: rx_stop_snap is moved into the snapshot closure below,
+    // so capture independent clones here for install_reset_handlers.
+    let rx_stop_reset = ctx.rx_stop.clone();
+    let gpu_handle = ctx.gpu_mmio.clone();
 
     // The "current parent" carried across Ctrl-A s invocations. None on a fresh
     // boot, so the first snapshot is a Full root even with tracking armed (nothing
@@ -1084,12 +1225,27 @@ fn main() {
         });
     }
 
+    // Install the checkpoint/reset handlers (Ctrl-A c / Ctrl-A r) BEFORE `manager`
+    // is cloned (set_*_handler requires sole Arc ownership, like the snapshot/dirty
+    // setup above). Fresh boot seeds no reset point: the user marks one with Ctrl-A c.
+    install_reset_handlers(&mut manager, ResetWiring {
+        host_usize: host as usize,
+        ram_size,
+        mem_file: None,
+        inst_dir: std::env::temp_dir(),
+        gic: gic.clone(),
+        frozen: frozen.clone(),
+        dirty: dirty_tracker.clone(),
+        rx_stop: rx_stop_reset,
+        gpu: gpu_handle,
+    });
+
     // Raw terminal + host stdin reader for the interactive console. The guard
     // restores the terminal on drop (guest-initiated exit); the reader restores
     // it before process::exit on Ctrl-A x.
     let termios = TermiosGuard::new();
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
-    eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b), {smp} vCPU(s) ---");
+    eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b, checkpoint: Ctrl-A c, reset: Ctrl-A r), {smp} vCPU(s) ---");
     eprintln!("--- snapshots will be saved as '{write_name}' under {} ---", store.display());
 
     // Jail the VMM before running guest code. Reads of kernel/rootfs are already
@@ -1713,6 +1869,8 @@ fn run_restore(
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
     let net_mmio_snap = ctx.net_mmio.clone();
+    // Reset-handler copy: rx_stop_snap is moved into the re-snapshot closure below.
+    let rx_stop_reset = ctx.rx_stop.clone();
     let q_vsock = restore_start.elapsed();
     let frozen = Arc::new(mgr.freeze());
     let bus = frozen.bus();
@@ -1879,9 +2037,36 @@ fn run_restore(
     }
     let q_dirty = restore_start.elapsed();
 
+    // Seed the reset point: the restored snapshot IS the default Ctrl-A r target.
+    {
+        let pristine_dst = inst_dir.join("pristine.bin");
+        let _ = fs::remove_file(&pristine_dst);
+        let pristine = ignition_vmm::reset::PristineRam::from_clone(&inst_mem, &pristine_dst, mem_size as usize)
+            .map_err(|e| io::Error::other(format!("seed pristine clonefile: {e}")))?;
+        *manager.reset_point().lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
+            pristine,
+            vcpus: snap.vcpus.clone(),
+            gic_blob: gic_blob.clone(),
+            devices: snap.devices.clone(),
+        });
+    }
+    // Install checkpoint/reset handlers BEFORE `manager` is cloned (spawn_stdin_reader /
+    // the GUI VMM thread), because set_*_handler requires sole Arc ownership.
+    install_reset_handlers(&mut manager, ResetWiring {
+        host_usize: host as usize,
+        ram_size: mem_size,
+        mem_file: Some(inst_mem.clone()),
+        inst_dir: inst_dir.clone(),
+        gic: gic.clone(),
+        frozen: frozen.clone(),
+        dirty: dirty_tracker.clone(),
+        rx_stop: rx_stop_reset,
+        gpu: gpu_handle.clone(),
+    });
+
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
     let q_stdin = restore_start.elapsed();
-    eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b) ---");
+    eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b, checkpoint: Ctrl-A c, reset: Ctrl-A r) ---");
 
     // Net restore: present the link as DOWN, then raise it after resume so the
     // guest's carrier-watch sees a down->up edge and re-inits (new MAC + DHCP).
@@ -2020,6 +2205,20 @@ mod tests {
         let mut s = EscState::Normal;
         assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
         assert!(matches!(step(&mut s, b's'), Action::Snapshot));
+    }
+
+    #[test]
+    fn ctrl_a_c_is_checkpoint() {
+        let mut s = EscState::Normal;
+        assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
+        assert!(matches!(step(&mut s, b'c'), Action::Checkpoint));
+    }
+
+    #[test]
+    fn ctrl_a_r_is_reset() {
+        let mut s = EscState::Normal;
+        assert!(matches!(step(&mut s, CTRL_A), Action::Pending));
+        assert!(matches!(step(&mut s, b'r'), Action::Reset));
     }
 
     #[test]

@@ -143,7 +143,11 @@ frames discarded. Because each restore gets its own copy-on-write instance, one
 warm-base snapshot fans out into N independent desktops — see
 `scripts/fanout-gui.sh N <base>`. With `--net` (under `sudo`) each clone also gets its
 own MAC and DHCP lease, since the GUI rootfs runs the `netwatch` carrier-poller that
-rebinds virtio-net on restore.
+rebinds virtio-net on restore. The GUI guest also supports in-place
+reset-to-checkpoint: `Ctrl-A c` marks the current desktop moment in memory and
+`Ctrl-A r` rolls the live window back to it, repainting the screen — see
+[Snapshot & restore](snapshot-restore.md) for the full behaviour and the
+read-only-disk requirement that makes it safe.
 
 ## Related
 
