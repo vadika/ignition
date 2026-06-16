@@ -152,15 +152,37 @@ devices — the browser snaps back to its clean homepage.
 - **Snapshot vs checkpoint confusion.** `Ctrl-A s` = disk snapshot (named lineage,
   unchanged). `Ctrl-A c` = in-memory reset point. Distinct keys, distinct messages.
 
+## Correctness requirement — the disk must not diverge
+
+Snapshot/restore stays consistent only because it restores **both** RAM and disk
+to the same instant. Reset rolls back RAM + vCPU + GIC + virtio-device *state*
+but **does not rewind the disk**. If the guest writes to the disk between
+checkpoint and reset, the rolled-back guest RAM (page cache, ext4 journal, inode
+cache) then describes a disk that has moved on — metadata mismatch, journal
+replay errors, filesystem corruption.
+
+Therefore reset is sound **only if the disk does not diverge between checkpoint
+and reset.** The disposable-browser rootfs (sub-project B) guarantees this by
+mounting the rootfs **read-only** and putting all writable state (browser
+profile, `/tmp`, `/var`, downloads) on **tmpfs in guest RAM**, which rolls back
+with RAM. With an immutable disk, RAM rollback alone is fully consistent and
+fast — no disk machinery in the reset path.
+
+This is a documented constraint of the reset feature, surfaced loudly in the
+docs and enforced by the sub-project-B rootfs. Rolling the disk back too (for a
+general writable-disk guest) is deliberately out of scope (see below).
+
 ## Out of scope (YAGNI)
 
 - Multiple named in-memory checkpoints / a checkpoint stack (one point, replaced).
 - Persisting the reset point to disk (that is `Ctrl-A s`).
 - Cross-host / migration.
-- Disk (virtio-blk) rollback to the checkpoint — RAM + vCPU + GIC + virtio device
-  *state* only; the CoW disk instance is not rewound (browsers are RAM-state
-  machines; a rewound disk is a later concern). **Stated explicitly so a tester
-  knows downloaded files on disk survive a reset.**
+- Disk (virtio-blk) rollback to the checkpoint. Reset assumes an immutable /
+  non-diverging disk (see the correctness requirement above); a guest that writes
+  to its rootfs between checkpoint and reset is unsupported. General disk rollback
+  (clonefile disk at checkpoint, copy-back on reset with virtio-blk quiesced) is a
+  later concern, not built here. Browser state is ephemeral by design — it lives
+  in RAM/tmpfs and rolls back with the machine.
 
 ## Testing
 
@@ -177,6 +199,11 @@ devices — the browser snaps back to its clean homepage.
      back to the pre-typing state, still interactive.
   2. `--smp 2`: same, exercising multi-vCPU register restore.
   3. `--net`: link/IP survive or re-settle after reset.
+  - **Disk consistency:** the live GUI rootfs used for these eyeballs must not
+    write to its rootfs across a reset (read-only mount, or no post-checkpoint
+    disk writes), per the correctness requirement. A reset that rolls back RAM
+    against a diverged disk is expected to corrupt the guest FS — that is the
+    constraint, not a bug to chase.
   4. Fresh boot (no `--restore`): `Ctrl-A r` → "press Ctrl-A c first"; `Ctrl-A c`
      then `Ctrl-A r` → rolls back to the marked moment.
   5. GIC sanity: after reset, timers/interrupts still fire (guest not wedged).
