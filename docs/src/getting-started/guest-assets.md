@@ -55,6 +55,11 @@ For the GUI (virtio-gpu) milestone, the kernel config also needs `CONFIG_DRM=y`,
 `CONFIG_FRAMEBUFFER_CONSOLE=y` so `/dev/dri/card0` + `/dev/fb0` appear and fbcon binds.
 The GUI compositor (M4) also needs `CONFIG_VIRTIO_INPUT=y` and `CONFIG_INPUT_EVDEV=y`.
 
+The browser rootfs additionally requires `CONFIG_OVERLAY_FS=y` and `CONFIG_TMPFS=y`.
+These are needed only for the one-time warm-base cold boot (which passes
+`--append "init=/sbin/overlay-init"` to set up the overlay root); restoring a
+browser-base snapshot does not reload the kernel or re-run the overlay pivot.
+
 ## Rebuild the GUI rootfs
 
 A separate, larger rootfs (`rootfs-gui.ext4`) adds a cage (wlroots, pixman software
@@ -84,6 +89,24 @@ lease. For in-memory reset without writing a new snapshot, `Ctrl-A c` marks the 
 running desktop as a reset point and `Ctrl-A r` rolls it back in place (distinct from the
 `Ctrl-A s` disk snapshot); this requires that the rootfs not diverge between checkpoint
 and reset — mount it read-only with tmpfs for all writable state.
+
+## Rebuild the browser rootfs
+
+A third rootfs (`rootfs-browser.ext4`) adds Firefox ESR in a kiosk configuration
+plus `/sbin/overlay-init`, which the cold boot uses to mount the ext4 image
+read-only as the lower overlay layer and a tmpfs as the upper layer before
+handing off to init. The homepage URL is set at build time via `HOMEPAGE`; the
+default is DuckDuckGo.
+
+```bash
+cd kimage
+scp build/build-rootfs-browser.sh build/devmem.c artemis2:~/kbuild/
+ssh artemis2 'cd ~/kbuild && chmod +x build-rootfs-browser.sh && HOMEPAGE=https://duckduckgo.com ./build-rootfs-browser.sh'
+scp artemis2:'~/kbuild/out/rootfs-browser.ext4' out/rootfs-browser.ext4
+```
+
+See [Disposable browser](../features/disposable-browser.md) for warm-base
+creation and session management.
 
 ## Rebuild the fuzz initramfs
 
