@@ -156,6 +156,17 @@ mid-session checkpoint is intentionally not offered in `--gui` (resetting to an
 arbitrary busy point cannot restore the GIC's in-flight interrupt state in place on
 HVF, so it wedges the guest).
 
+**Device (DMA) writes are now tracked.** The dirty tracker covers both vCPU-fault writes
+and device-side writes to guest RAM (virtio used-ring updates, RX frame data, block-read
+data, etc.). A `DirtySink` hook at the device-facing `GuestRam` write path marks the same
+write-protect bitmap as the page-fault handler, so the two paths share a single consistent
+dirty set. As a result, `Ctrl-A r` is once again a fast dirty-only rollback — only the
+pages that actually changed since the checkpoint are copied back, regardless of whether
+they were written by a vCPU or a device. Without `--track-dirty` the reset falls back to
+a full RAM copy as before. Diff snapshots (`Ctrl-A s` with `--track-dirty`) also benefit:
+device-written pages are no longer omitted from the delta, so incremental snapshots are
+correct even when the guest was doing active DMA between the base and the diff.
+
 **Auto-seed on `--restore`.** When a guest is started with `boot --restore
 <dir>`, the restored snapshot is automatically installed as the initial reset
 point before the guest runs. `Ctrl-A r` therefore works immediately after a
