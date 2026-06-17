@@ -41,6 +41,9 @@ trap cleanup EXIT INT TERM
 
 echo "fanning out $N GUI clone(s) from base '$BASE'"
 for i in $(seq 1 "$N"); do
+  # No --vsock-uds here, so vmid (post-restore CRNG reseed) does NOT engage for
+  # these clones; they share the base snapshot RNG state until the kernel reseeds.
+  # This is a plain demo fan-out; disposable-browser.sh wires --vsock-uds per clone.
   "$BOOT" --gui --restore "$BASE" "$@" &
   pid=$!
   pids+=("$pid")

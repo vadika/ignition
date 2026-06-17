@@ -104,7 +104,8 @@ live and the vsock reactor — spawned earlier at ~`boot.rs:1960` — is bound):
 2. Open a `UnixStream` to the control UDS, send `CONNECT 9000\n`, await `OK 9000\n`
    (the existing hybrid control protocol; `crates/devices/src/virtio/vsock/muxer.rs:108`).
 3. Write the framed message (below) as the connection payload.
-4. **Retry** the CONNECT with bounded backoff (10 attempts × 20 ms) until the guest daemon
+4. **Retry** the CONNECT with bounded backoff (30 attempts × 100 ms ≈ 3 s; the restored
+   socat listener needs the guest scheduler to reschedule it after vCPU resume) until the guest daemon
    accepts — covers the few ms before the guest reschedules `vmidd` after vCPU resume.
 5. On total failure: **WARN and continue, non-fatal.** The vCPUs are already running; the
    guest still receives `virtio-rng` entropy over time. This mirrors the loud-but-continue
@@ -140,7 +141,7 @@ boot --restore <name>
   manager.run_restored(...)  -> vCPUs live       # boot.rs ~2256
   reseed_guest():                                # NEW, immediately after
     seed = getentropy(32)
-    retry up to 10x/20ms:
+    retry up to 30x/100ms:
       connect control UDS; send "CONNECT 9000\n"; await "OK 9000\n"
       write  "VMID" | 0x01 | seed                # 37 bytes
     on success -> done; on exhaustion -> WARN, continue
