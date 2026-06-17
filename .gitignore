@@ -6,17 +6,10 @@ target/
 .DS_Store
 
 # runtime snapshot output
-/snapshot/
-/snapshot.tmp/
-/snapshot2/
-/snapshot_smp/
-/vmnetsnap/
 # snapshot stores (--store dir, default ./vmstore; restore_test uses ./vmstore-test,
 # diff_snapshot_test uses ./vmstore-difftest, diff_snapshot_bench uses ./vmstore-bench)
 /vmstore/
-/vmstore-test/
-/vmstore-difftest/
-/vmstore-bench/
+/vmstore-*
 # snapshot artifacts (any --store/--snap-dir name) — never source files
 memory.bin
 gic.bin

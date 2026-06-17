@@ -13,6 +13,7 @@
 - [The clone primitive](concepts/clone-primitive.md)
   - [Snapshot & restore](features/snapshot-restore.md)
   - [Diff / incremental snapshots](features/diff-snapshots.md)
+  - [Per-clone RNG reseed (vmid)](features/vmid.md)
 - [Devices, SMP & networking](features/devices.md)
 - [GUI display](features/gui-display.md)
 - [Sandbox & jailing](features/sandbox.md)

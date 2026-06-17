@@ -104,13 +104,15 @@ Ordered so the clone primitive gets proven and hardened before it gets dressed u
   protocol (`CONNECT <port>` → `OK <host_port>`); host control socket `{uds}`, guest
   RESPONSE establishes the conn, bidirectional streaming reuses E1's `Connection`.
   `docs/superpowers/specs/2026-06-15-virtio-vsock-e2-design.md`, `scripts/vsock_e2_test.py`.
-- [ ] **vmid — per-clone CRNG reseed on restore** — clones fanned out from one base resume
-  with identical kernel CRNG state, so siblings can emit identical random output until the
-  next kernel reseed. On every `--restore` the host pushes a fresh 32-byte seed over the
-  existing vsock control channel; a small guest daemon (`vmidd`) force-reseeds via
-  `RNDADDENTROPY` + `RNDRESEEDCRNG`. Pure userspace — no ACPI/`vmgenid` driver (this VMM emits
-  FDT). **Correctness gate for the MCP agent-sandbox track** (fork-per-conversation with
-  shared crypto state). `docs/superpowers/specs/2026-06-17-vmid-design.md`
+- [x] **vmid — per-clone CRNG reseed on restore** — on every `--restore` the host pushes a
+  fresh 32-byte seed over the existing vsock control channel; the guest (`socat VSOCK-LISTEN`
+  → `/usr/bin/vmid-reseed`) force-reseeds via `RNDADDENTROPY` + `RNDRESEEDCRNG`. Pure
+  userspace — no ACPI/`vmgenid` driver (this VMM emits FDT). Correctness insurance for the
+  MCP agent-sandbox track. Verified live (`scripts/vmid_live_proof.py`): mechanism works
+  (push delivered, reseeded clones diverge). **Finding:** the shared-CRNG bug does not
+  reproduce observably on HVF aarch64 — no arch RNG and interrupt-timing entropy reseeds the
+  CRNG sub-millisecond after resume, so the window vmid closes is tiny on this platform.
+  `docs/src/features/vmid.md`, `docs/superpowers/specs/2026-06-17-vmid-design.md`
 
 ---
 
