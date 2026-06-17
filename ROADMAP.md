@@ -55,8 +55,9 @@ Two tracks carry the thesis beyond parity:
   daemon (Homebrew, root LaunchDaemon); the VMM is an unprivileged unix-socket client
   (4-byte-BE frame protocol, VMM-generated MAC). `--net-direct` keeps the in-process sudo
   path. `scripts/install-socket-vmnet.sh`,
-  `docs/superpowers/specs/2026-06-18-sudo-free-net-socket-vmnet-design.md`. Phase 2
-  (in-process shim hardening) still planned.
+  `docs/superpowers/specs/2026-06-18-sudo-free-net-socket-vmnet-design.md`. **Verified
+  live**: `--net` boot gets a DHCP lease + pings out with no sudo; two concurrent guests
+  get distinct IPs (192.168.105.3/.4). Phase 2 (in-process shim hardening) still planned.
 - [x] virtio-rng — `getentropy`-backed
 - [x] virtio-balloon — on-demand reclaim (`Ctrl-A b`). `docs/superpowers/specs/2026-06-13-virtio-balloon-design.md`
 - [x] virtio-vsock **E1** (guest→host streams over a host UDS). `docs/superpowers/specs/2026-06-13-virtio-vsock-e1-design.md`
