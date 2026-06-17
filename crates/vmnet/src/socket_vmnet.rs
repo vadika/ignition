@@ -30,7 +30,7 @@ pub struct SocketVmnetBackend {
 
 impl SocketVmnetBackend {
     /// Connect to the socket_vmnet daemon. Returns the backend + the RX frame
-    /// receiver (wired to the existing RX feeder exactly like VmnetBackend).
+    /// receiver (the caller wires it to the virtio-net RX feeder).
     pub fn start(socket_path: &Path) -> std::io::Result<(SocketVmnetBackend, Receiver<Vec<u8>>)> {
         let mac = generate_mac()?;
         let stream = UnixStream::connect(socket_path).map_err(|e| {

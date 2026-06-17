@@ -875,8 +875,9 @@ dependencies = [
 name = "ignition-vmnet"
 version = "0.0.0"
 dependencies = [
- "cc",
  "ignition-devices",
+ "log",
+ "tempfile",
 ]
 
 [[package]]
