@@ -14,12 +14,14 @@ TAR="$STAGE/rootfs-gui.tar"
 docker rm -f fcroot_gui_build >/dev/null 2>&1 || true
 docker run --platform linux/arm64 --name fcroot_gui_build \
   -v "$(cd "$(dirname "$0")" && pwd)/devmem.c:/devmem.c:ro" \
+  -v "$(cd "$(dirname "$0")" && pwd)/vmid-reseed.c:/vmid-reseed.c:ro" \
   alpine:3.19 sh -euxc '
   # --- base provisioning (kept in sync with build-rootfs.sh) ---
   apk add --no-cache openrc util-linux ifupdown-ng socat
 
-  apk add --no-cache --virtual .build gcc musl-dev
+  apk add --no-cache --virtual .build gcc musl-dev linux-headers
   gcc -O2 -static /devmem.c -o /usr/bin/devmem
+  gcc -O2 -static /vmid-reseed.c -o /usr/bin/vmid-reseed
   apk del .build
 
   ln -sf agetty /etc/init.d/agetty.ttyS0
@@ -49,6 +51,9 @@ docker run --platform linux/arm64 --name fcroot_gui_build \
   chmod +x /etc/local.d/network.start
   printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
   chmod +x /etc/local.d/boottime.start
+  # vmid: host-pushed CRNG reseed on snapshot restore (see build-rootfs.sh).
+  printf "#!/bin/sh\nsocat VSOCK-LISTEN:9000,fork EXEC:/usr/bin/vmid-reseed &\n" > /etc/local.d/vmid.start
+  chmod +x /etc/local.d/vmid.start
 
   # Net re-init on snapshot restore (same poller as the base rootfs): a restore
   # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
