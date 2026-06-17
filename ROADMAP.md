@@ -51,13 +51,14 @@ Two tracks carry the thesis beyond parity:
 ### Devices (full Firecracker aarch64 set)
 - [x] virtio-blk — rootfs from a disk image
 - [x] virtio-net — vmnet NAT backend (`--net`; needs `sudo`/entitlement). `docs/src/features/devices.md`
-- [x] **Sudo-free networking via socket_vmnet** — `--net` defaults to the socket_vmnet
+- [x] **Networking via socket_vmnet (no sudo)** — `--net` connects to the socket_vmnet
   daemon (Homebrew, root LaunchDaemon); the VMM is an unprivileged unix-socket client
-  (4-byte-BE frame protocol, VMM-generated MAC). `--net-direct` keeps the in-process sudo
-  path. `scripts/install-socket-vmnet.sh`,
+  (4-byte-BE frame protocol, VMM-generated MAC). `scripts/install-socket-vmnet.sh`,
   `docs/superpowers/specs/2026-06-18-sudo-free-net-socket-vmnet-design.md`. **Verified
   live**: `--net` boot gets a DHCP lease + pings out with no sudo; two concurrent guests
-  get distinct IPs (192.168.105.3/.4). Phase 2 (in-process shim hardening) still planned.
+  get distinct IPs (192.168.105.3/.4). The original in-process vmnet shim was **removed**
+  (phase 2 = delete, not harden — socket_vmnet is the sole backend; no zero-install sudo
+  fallback).
 - [x] virtio-rng — `getentropy`-backed
 - [x] virtio-balloon — on-demand reclaim (`Ctrl-A b`). `docs/superpowers/specs/2026-06-13-virtio-balloon-design.md`
 - [x] virtio-vsock **E1** (guest→host streams over a host UDS). `docs/superpowers/specs/2026-06-13-virtio-vsock-e1-design.md`

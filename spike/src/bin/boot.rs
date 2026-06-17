@@ -525,7 +525,6 @@ struct DeviceContext {
     disk: Option<PathBuf>,      // boot: original rootfs; restore: private instance copy
     vsock_uds: Option<PathBuf>,
     net: bool,                  // boot-only; never set on restore
-    net_direct: bool,
     net_socket: Option<PathBuf>,
     // outputs
     serial: Option<Arc<Mutex<Serial<FlushWriter>>>>,
@@ -635,18 +634,9 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
     };
     if want_net {
         let mem = ctx.guest_ram();
-        let (backend, rx): (Box<dyn ignition_devices::virtio::net::NetBackend>, std::sync::mpsc::Receiver<Vec<u8>>) =
-            if ctx.net_direct {
-                let (b, rx) = ignition_vmnet::VmnetBackend::start().map_err(|e| {
-                    io::Error::other(format!("vmnet direct start failed (need sudo for --net-direct): {e}"))
-                })?;
-                (Box::new(b), rx)
-            } else {
-                let path = ctx.net_socket.clone().unwrap_or_else(default_socket_path);
-                // start() already returns an io::Error carrying the install hint.
-                let (b, rx) = ignition_vmnet::SocketVmnetBackend::start(&path)?;
-                (Box::new(b), rx)
-            };
+        let path = ctx.net_socket.clone().unwrap_or_else(default_socket_path);
+        // start() already returns an io::Error carrying the socket_vmnet install hint.
+        let (backend, rx) = ignition_vmnet::SocketVmnetBackend::start(&path)?;
         let net_dev = VirtioNet::new(backend);
         if let Some(h) = place(mgr, &mode, "virtio-net", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new("virtio-net", Box::new(net_dev), mem, irq))? {
@@ -802,7 +792,6 @@ fn main() {
     let mut smp: u64 = 1;
     let mut mem_mib: Option<u64> = None; // None -> per-mode default (512 MiB boot, 96 MiB fuzz)
     let mut net = false;
-    let mut net_direct = false;
     let mut net_socket: Option<PathBuf> = None;
     let mut vsock_uds: Option<PathBuf> = None;
     let mut store: PathBuf = PathBuf::from("./vmstore");
@@ -901,9 +890,6 @@ fn main() {
             "--track-dirty" => {
                 track_dirty = true;
             }
-            "--net-direct" => {
-                net_direct = true;
-            }
             "--net-socket" => {
                 net_socket = Some(PathBuf::from(it.next().expect("--net-socket needs a path")));
             }
@@ -967,7 +953,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
-        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, no_reseed, gui, net_direct, net_socket) {
+        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, no_reseed, gui, net_socket) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -978,7 +964,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--net-direct] [--net-socket <path>] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] [--no-reseed] [--gui] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--net-socket <path>] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] [--no-reseed] [--gui] <kernel-Image> [rootfs-disk]", args[0]);
         eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] [--no-sandbox] <kernel-Image>", args[0]);
         process::exit(2);
     }
@@ -1058,7 +1044,6 @@ fn main() {
         disk: disk_path.as_ref().map(PathBuf::from),
         vsock_uds: vsock_uds.clone(),
         net,
-        net_direct,
         net_socket: net_socket.clone(),
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
@@ -1866,7 +1851,6 @@ fn run_restore(
     no_sandbox: bool,
     no_reseed: bool,
     gui: bool,
-    net_direct: bool,
     net_socket: Option<PathBuf>,
 ) -> io::Result<()> {
     // Host-side restore clock: chain resolution + mmap + diff overlay + GIC/device/vCPU
@@ -2060,7 +2044,6 @@ fn run_restore(
         disk: disk.clone(),
         vsock_uds: vsock_uds.clone(),
         net: false, // snapshots never contain net; setup_devices will re-wire if record exists
-        net_direct,
         net_socket: net_socket.clone(),
         serial: None, balloon_target: None, balloon: None, vsock_mmio: None, net_mmio: None,
         rx_stop: None,
