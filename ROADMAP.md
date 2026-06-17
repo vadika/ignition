@@ -5,7 +5,7 @@ modeled on AWS Firecracker. This file tracks what is built, what is next, and th
 research questions that motivate the project. It is the living index; per-feature
 detail lives in `docs/superpowers/specs/` (design) and the documentation book under `docs/src/` (outcomes).
 
-_Last updated: 2026-06-17._
+_Last updated: 2026-06-18._
 
 **Legend:** `[x]` shipped · `[~]` in progress · `[ ]` planned · `[-]` deferred / out of scope
 
@@ -51,6 +51,12 @@ Two tracks carry the thesis beyond parity:
 ### Devices (full Firecracker aarch64 set)
 - [x] virtio-blk — rootfs from a disk image
 - [x] virtio-net — vmnet NAT backend (`--net`; needs `sudo`/entitlement). `docs/src/features/devices.md`
+- [x] **Sudo-free networking via socket_vmnet** — `--net` defaults to the socket_vmnet
+  daemon (Homebrew, root LaunchDaemon); the VMM is an unprivileged unix-socket client
+  (4-byte-BE frame protocol, VMM-generated MAC). `--net-direct` keeps the in-process sudo
+  path. `scripts/install-socket-vmnet.sh`,
+  `docs/superpowers/specs/2026-06-18-sudo-free-net-socket-vmnet-design.md`. Phase 2
+  (in-process shim hardening) still planned.
 - [x] virtio-rng — `getentropy`-backed
 - [x] virtio-balloon — on-demand reclaim (`Ctrl-A b`). `docs/superpowers/specs/2026-06-13-virtio-balloon-design.md`
 - [x] virtio-vsock **E1** (guest→host streams over a host UDS). `docs/superpowers/specs/2026-06-13-virtio-vsock-e1-design.md`
@@ -242,7 +248,7 @@ real and strong today; the VMM *process* is not yet jailed.
 
 ## Deferred / out of scope
 
-- [-] **Userspace net backend (gvproxy/passt)** — would drop the vmnet `sudo`/restricted-entitlement requirement, but networking stays vmnet-as-is by decision. (vmnet without root needs the restricted, Apple-provisioned `com.apple.vm.networking` entitlement — not grantable by ad-hoc codesign.)
+- [-] **Userspace net backend (gvproxy/passt)** — would drop the vmnet `sudo`/restricted-entitlement requirement, but networking stays vmnet-as-is by decision. (vmnet without root needs the restricted, Apple-provisioned `com.apple.vm.networking` entitlement — not grantable by ad-hoc codesign.) (Sudo is now avoidable via socket_vmnet — see Shipped. This item remains only for a fully userspace backend with no daemon.)
 - [-] **CPU hotplug** (`CPU_OFF`, sysfs online/offline) — out of scope; SMP is fixed at boot.
 - [-] **io_uring block engine** — dropped by design; sync engine only.
 - [-] **x86_64 / ACPI** — aarch64-only port.
