@@ -173,11 +173,16 @@ and impersonate an interface that already has consumers, so adoption cost ≈ 0.
 fails in surprising ways inside tools you don't control. Ship one bridge, prove adoption,
 then add the next.
 
-- [ ] **MCP server for agent sandboxes** *(first — closest to strengths, hottest demand)* —
-  an `execute`-style tool that clones a warm snapshot per call. Any MCP-capable agent
+- [x] **MCP server for agent sandboxes** *(first — closest to strengths, hottest demand)* —
+  a persistent-session tool that clones a warm snapshot per session. Any MCP-capable agent
   (Claude Code, Codex, Gemini CLI) gets fast disposable sandboxes with zero ignition-specific
   code. Where clone-from-warm is *most visibly* better than cold-boot competitors, and where
   the honest "your agent's code on your machine" threat model fits.
+  Shipped: `ignition-mcp` crate (open\_session / run / write\_file / reset / close), persistent
+  sessions, Python `ign-exec` guest agent, `build-rootfs-tools.sh` + `make-tools-base.sh`
+  tools-base rootfs. **Verified live on HVF** (`scripts/mcp_live_test.py`): open → run
+  (`python3` → 4) → filesystem persists across runs → write_file → reset clears state → close,
+  all green. `docs/src/features/mcp-server.md`
 - [ ] **Firecracker REST control API** *(second — broadest inherited ecosystem)* —
   machine-config API on the vstate/device seam so `firecracker-go-sdk`, flintlock, and
   existing orchestration target Macs **unmodified**. Converts "novel research VMM" into
