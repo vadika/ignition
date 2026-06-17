@@ -18,6 +18,7 @@
 - [GUI display](features/gui-display.md)
 - [Sandbox & jailing](features/sandbox.md)
 - [Disposable browser](features/disposable-browser.md)
+- [MCP server for agents](features/mcp-server.md)
 - [VM internal API (MMIO)](concepts/vm-internal-api.md)
 
 # Snapshot fuzzing
