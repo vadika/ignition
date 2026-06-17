@@ -16,13 +16,11 @@ const MAX_FRAME: usize = 65_536;
 
 /// A random locally-administered unicast MAC (`02:..`). Fresh per call, so every
 /// boot and restore gets a distinct MAC -> distinct DHCP lease.
-pub fn generate_mac() -> [u8; 6] {
+pub fn generate_mac() -> std::io::Result<[u8; 6]> {
     let mut b = [0u8; 6];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[0] = (b[0] & 0xFE) | 0x02; // clear multicast bit, set locally-administered
-    b
+    Ok(b)
 }
 
 pub struct SocketVmnetBackend {
@@ -34,6 +32,7 @@ impl SocketVmnetBackend {
     /// Connect to the socket_vmnet daemon. Returns the backend + the RX frame
     /// receiver (wired to the existing RX feeder exactly like VmnetBackend).
     pub fn start(socket_path: &Path) -> std::io::Result<(SocketVmnetBackend, Receiver<Vec<u8>>)> {
+        let mac = generate_mac()?;
         let stream = UnixStream::connect(socket_path).map_err(|e| {
             std::io::Error::other(format!(
                 "--net needs socket_vmnet at {} ({e}). Run scripts/install-socket-vmnet.sh, \
@@ -44,7 +43,7 @@ impl SocketVmnetBackend {
         let reader = stream.try_clone()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || reader_loop(reader, tx));
-        Ok((SocketVmnetBackend { write: Mutex::new(stream), mac: generate_mac() }, rx))
+        Ok((SocketVmnetBackend { write: Mutex::new(stream), mac }, rx))
     }
 }
 
@@ -81,6 +80,16 @@ impl NetBackend for SocketVmnetBackend {
     }
 }
 
+impl Drop for SocketVmnetBackend {
+    /// Shut the socket down so the reader thread's `read_exact` returns (it holds
+    /// a cloned fd; merely dropping the write half would not unblock it).
+    fn drop(&mut self) {
+        if let Ok(s) = self.write.lock() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,8 +100,8 @@ mod tests {
 
     #[test]
     fn mac_is_unicast_laa_and_random() {
-        let a = generate_mac();
-        let b = generate_mac();
+        let a = generate_mac().unwrap();
+        let b = generate_mac().unwrap();
         // bit0 (0x01) = 0 -> unicast; bit1 (0x02) = 1 -> locally administered.
         assert_eq!(a[0] & 0x03, 0x02);
         assert_ne!(a, b);
@@ -122,5 +131,23 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(got, b"world!");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn drop_shuts_down_socket_so_reader_can_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sv2.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // After the client backend drops, our read must see EOF (0 bytes),
+            // proving the socket was shut down (not left dangling).
+            let mut buf = [0u8; 16];
+            s.read(&mut buf)
+        });
+        let (backend, _rx) = SocketVmnetBackend::start(&path).unwrap();
+        drop(backend);
+        let n = server.join().unwrap().unwrap();
+        assert_eq!(n, 0); // EOF
     }
 }
