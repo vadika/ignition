@@ -23,6 +23,17 @@ pub trait NetBackend: Send {
     fn mac(&self) -> [u8; 6];
 }
 
+/// Lets the VMM pick a backend at runtime (`Box<dyn NetBackend>`) while keeping
+/// `VirtioNet<B: NetBackend>` generic.
+impl NetBackend for Box<dyn NetBackend> {
+    fn write_frame(&self, frame: &[u8]) -> std::io::Result<()> {
+        (**self).write_frame(frame)
+    }
+    fn mac(&self) -> [u8; 6] {
+        (**self).mac()
+    }
+}
+
 pub struct VirtioNet<B: NetBackend> {
     backend: B,
     mac: [u8; 6],
@@ -262,6 +273,21 @@ mod tests {
         net.set_link(true);
         net.config_read(6, &mut st);
         assert_eq!(st[0] & 1, 1);
+    }
+
+    #[test]
+    fn box_dyn_netbackend_delegates() {
+        struct Dummy;
+        impl NetBackend for Dummy {
+            fn write_frame(&self, _frame: &[u8]) -> std::io::Result<()> { Ok(()) }
+            fn mac(&self) -> [u8; 6] { [0x02, 1, 2, 3, 4, 5] }
+        }
+        let b: Box<dyn NetBackend> = Box::new(Dummy);
+        assert_eq!(b.mac(), [0x02, 1, 2, 3, 4, 5]);
+        assert!(b.write_frame(b"x").is_ok());
+        // Box<dyn NetBackend> must itself satisfy NetBackend (used by VirtioNet<B>).
+        fn takes_backend<B: NetBackend>(_: B) {}
+        takes_backend(b);
     }
 
     #[test]
