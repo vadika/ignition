@@ -20,13 +20,13 @@ run(session_id, command, timeout_s?=30, cwd?, stdin?)
   -> { stdout, stderr, exit_code, timed_out }
 
 write_file(session_id, path, content_base64)
-  -> { bytes_written }
+  -> "ok"
 
 reset(session_id)
-  -> {}
+  -> "ok"
 
 close(session_id)
-  -> {}
+  -> "ok"
 ```
 
 `open_session` clones the warm base, boots it, waits until the guest exec agent
