@@ -1,4 +1,8 @@
-//! vmnet.framework shared/NAT backend (via the C shim). Needs sudo.
+//! Guest networking backends. `VmnetBackend` calls vmnet.framework in-process
+//! (needs sudo); `SocketVmnetBackend` talks to the socket_vmnet daemon (no sudo).
+
+mod socket_vmnet;
+pub use socket_vmnet::{generate_mac, SocketVmnetBackend};
 
 use std::os::raw::c_void;
 use std::sync::mpsc::{Receiver, Sender};
