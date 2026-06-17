@@ -200,6 +200,31 @@ vmid never blocks restore completion and never aborts the VMM.
 No new `SandboxPaths`. The host uses the already-permitted control UDS (the vsock reactor
 already binds and accepts on it) and `getentropy` (allowed). No change to `build_profile`.
 
+## Live verification (2026-06-17)
+
+Run end-to-end on M-series HVF (plain rootfs, vsock only, no `--net`) via
+`scripts/vmid_live_proof.py`: cold-boot + snapshot a base, then restore clones.
+
+**Verified working:** each reseeded clone restores in ~1 ms, the host prints
+`vmid: pushed fresh CRNG seed to guest (vsock port 9000)`, and two reseeded clones
+produce different `/dev/urandom` output. The full path — host `getentropy` →
+vsock control `CONNECT 9000`/`OK` → 37-byte frame → guest socat → `vmid-reseed`
+`RNDADDENTROPY`+`RNDRESEEDCRNG` — works on real hardware.
+
+**Finding — the shared-CRNG bug does not reproduce observably on this platform,
+even with virtio-rng disabled (`IGN_NO_RNG=1`).** The guest CPU exposes no arch RNG
+(no `rng` in `/proc/cpuinfo` Features, so no `RNDR`), and `random: crng init done`
+fires at t=0 from the fixed FDT `rng-seed` — so the CRNG state is genuinely
+identical across clones at the instant of resume. But the kernel mixes
+interrupt-timing entropy (`add_interrupt_randomness`) and reseeds within the first
+scheduling quantum after resume, before any serial-shell read can run, so two
+`--no-reseed` siblings still diverge. The window vmid closes is real but
+sub-millisecond here. vmid remains correct, cheap insurance — and matters more for
+guests that draw randomness in early userspace before interrupts flow, for
+deterministic-replay scenarios, and on platforms/configs without continuous
+interrupt-entropy mixing. Its practical necessity on bare HVF aarch64 with this
+kernel is, by this measurement, low.
+
 ## Files
 
 - Create: `kimage/build/vmidd.c` (guest daemon).
