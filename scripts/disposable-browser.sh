@@ -53,7 +53,9 @@ clone_loop() {
   local bpid=""
   trap 'kill "$bpid" 2>/dev/null || true; exit 0' TERM INT
   while :; do
-    "$BOOT" --gui --net --mem 2048 --restore "$BASE" "$@" &
+    # Per-clone vsock control socket: lets the VMM push a fresh CRNG seed to
+    # this clone after restore (vmid), so sibling clones do not share RNG state.
+    "$BOOT" --gui --net --mem 2048 --vsock-uds "/tmp/ign-vmid-$n-$$" --restore "$BASE" "$@" &
     bpid=$!
     # `wait` returns boot's exit code; capture it WITHOUT tripping `set -e` (a bare
     # non-zero `wait` would abort the subshell before we can relaunch).
