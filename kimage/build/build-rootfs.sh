@@ -12,6 +12,7 @@ TAR="$STAGE/rootfs.tar"
 docker rm -f fcroot_build >/dev/null 2>&1 || true
 docker run --platform linux/arm64 --name fcroot_build \
   -v "$(cd "$(dirname "$0")" && pwd)/devmem.c:/devmem.c:ro" \
+  -v "$(cd "$(dirname "$0")" && pwd)/vmid-reseed.c:/vmid-reseed.c:ro" \
   alpine:3.19 sh -euxc '
   # socat provides a userspace AF_VSOCK client (VSOCK-CONNECT) for testing the
   # virtio-vsock device end to end (alpine 3.19 ships socat 1.8 with VSOCK support).
@@ -19,8 +20,9 @@ docker run --platform linux/arm64 --name fcroot_build \
 
   # devmem: alpine busybox has no devmem applet, so compile a tiny static one
   # (musl) for the boot-timer MMIO poke. Toolchain is removed afterwards.
-  apk add --no-cache --virtual .build gcc musl-dev
+  apk add --no-cache --virtual .build gcc musl-dev linux-headers
   gcc -O2 -static /devmem.c -o /usr/bin/devmem
+  gcc -O2 -static /vmid-reseed.c -o /usr/bin/vmid-reseed
   apk del .build
 
   # serial console on ttyS0 (Firecracker default)
@@ -60,6 +62,12 @@ docker run --platform linux/arm64 --name fcroot_build \
   # Uses /usr/bin/devmem (compiled above) + kernel CONFIG_DEVMEM=y, STRICT_DEVMEM=n.
   printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
   chmod +x /etc/local.d/boottime.start
+  # vmid: a host-pushed CRNG reseed on snapshot restore. socat accepts the
+  # control-channel connection on AF_VSOCK port 9000 and pipes the 37-byte seed
+  # frame to vmid-reseed, which mixes it into the kernel pool and forces a reseed.
+  # Backgrounded so the local service returns; fork handles one accept per restore.
+  printf "#!/bin/sh\nsocat VSOCK-LISTEN:9000,fork EXEC:/usr/bin/vmid-reseed &\n" > /etc/local.d/vmid.start
+  chmod +x /etc/local.d/vmid.start
 
   # Net re-init on snapshot restore: a restore starts a fresh vmnet interface
   # (new MAC) and the VMM bounces the virtio-net link down->up. This busybox

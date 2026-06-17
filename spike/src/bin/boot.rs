@@ -795,6 +795,7 @@ fn main() {
     let mut name: Option<String> = None;
     let mut force = false;
     let mut no_sandbox = false;
+    let mut no_reseed = false;
     let mut gui = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
@@ -877,6 +878,9 @@ fn main() {
             "--no-sandbox" => {
                 no_sandbox = true;
             }
+            "--no-reseed" => {
+                no_reseed = true;
+            }
             "--gui" => {
                 gui = true;
             }
@@ -943,7 +947,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
-        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, gui) {
+        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, no_reseed, gui) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -954,7 +958,7 @@ fn main() {
     }
 
     if positionals.is_empty() {
-        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] [--gui] <kernel-Image> [rootfs-disk]", args[0]);
+        eprintln!("usage: {} [--smp N] [--mem MiB] [--net] [--vsock-uds <path>] [--store <dir>] [--name <name>] [--force] [--track-dirty] [--restore <name>] [--no-sandbox] [--no-reseed] [--gui] <kernel-Image> [rootfs-disk]", args[0]);
         eprintln!("   or: {} --fuzz --initramfs <cpio> [--solutions <dir>] [--seed <path>] [--replay <file>] [--window-mib N] [--reset full|dirty] [--mem MiB] [--no-sandbox] <kernel-Image>", args[0]);
         process::exit(2);
     }
@@ -1726,6 +1730,94 @@ fn run_fuzz_mode(
     Ok(())
 }
 
+/// Dedicated guest vsock port the vmid reseed listener (socat) binds.
+const VMID_PORT: u32 = 9000;
+
+/// Fill `buf` with host CSPRNG bytes. `getentropy` fills fully or fails; on the
+/// unexpected failure path, fall back to /dev/urandom.
+fn host_random(buf: &mut [u8]) {
+    let rc = unsafe { libc::getentropy(buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if rc != 0 {
+        use std::io::Read;
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(buf);
+        }
+    }
+}
+
+/// Build the 37-byte vmid frame: magic "VMID" | version 0x01 | 32-byte seed.
+fn build_reseed_msg(seed: &[u8; 32]) -> [u8; 37] {
+    let mut msg = [0u8; 37];
+    msg[..4].copy_from_slice(b"VMID");
+    msg[4] = 0x01;
+    msg[5..].copy_from_slice(seed);
+    msg
+}
+
+/// One attempt: open the control UDS, CONNECT to the guest vmid port, await the
+/// `OK <host_port>` ack, then write the seed frame. Returns true on a clean push.
+fn try_push(uds: &Path, msg: &[u8]) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut s = match UnixStream::connect(uds) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    s.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    s.set_write_timeout(Some(Duration::from_millis(300))).ok();
+    if s.write_all(format!("CONNECT {VMID_PORT}\n").as_bytes()).is_err() {
+        return false;
+    }
+    // The muxer emits "OK <host_port>\n" once the guest listener RESPONDs.
+    let mut ack = Vec::new();
+    let mut tmp = [0u8; 64];
+    loop {
+        match s.read(&mut tmp) {
+            Ok(0) => return false,
+            Ok(n) => {
+                ack.extend_from_slice(&tmp[..n]);
+                if ack.contains(&b'\n') {
+                    break;
+                }
+                if ack.len() > 128 {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    if !ack.starts_with(b"OK ") {
+        return false;
+    }
+    // Drop on return closes the stream -> EOF, which the helper reads as end-of-frame.
+    s.write_all(msg).is_ok()
+}
+
+/// Best-effort: push a fresh CRNG seed to the guest after restore so sibling
+/// clones diverge. Retries until the in-guest listener answers (it resumes only
+/// once the restored vCPUs run and the scheduler reschedules socat), then WARNs.
+fn reseed_guest(uds: &Path) {
+    use std::time::Duration;
+
+    let mut seed = [0u8; 32];
+    host_random(&mut seed);
+    let msg = build_reseed_msg(&seed);
+
+    for _ in 0..30 {
+        if try_push(uds, &msg) {
+            eprintln!("vmid: pushed fresh CRNG seed to guest (vsock port {VMID_PORT})");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "WARN: vmid reseed push failed (guest listener never answered); clone \
+         shares restored CRNG state until the kernel reseeds"
+    );
+}
+
 /// Restore a (possibly diff-chained) base snapshot from
 /// `<store>/snapshots/<restore_name>/` and resume the guest. `restore_name` is the
 /// LEAF of the chain; the chain is resolved root..leaf, the root's whole-RAM image
@@ -1741,6 +1833,7 @@ fn run_restore(
     track_dirty: bool,
     vsock_uds: Option<PathBuf>,
     no_sandbox: bool,
+    no_reseed: bool,
     gui: bool,
 ) -> io::Result<()> {
     // Host-side restore clock: chain resolution + mmap + diff overlay + GIC/device/vCPU
@@ -1958,6 +2051,14 @@ fn run_restore(
         .ok_or_else(|| io::Error::other("snapshot had no balloon device"))?;
     if let Some(vsock_mmio) = ctx.vsock_mmio.clone() {
         spawn_vsock_reactor(vsock_mmio, ctx.vsock_uds.clone());
+        // vmid: push a fresh CRNG seed to the restored guest so sibling clones do
+        // not share RNG state. Best-effort, on its own thread because the run loop
+        // below blocks (headless) or the event loop takes the main thread (gui).
+        if !no_reseed
+            && let Some(uds) = ctx.vsock_uds.clone()
+        {
+            std::thread::spawn(move || reseed_guest(&uds));
+        }
     }
     let net_mmio_restore = ctx.net_mmio.clone();
     let rx_stop_snap = ctx.rx_stop.clone();
@@ -2268,6 +2369,27 @@ fn run_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmid_msg_framing() {
+        let seed = [0xABu8; 32];
+        let msg = build_reseed_msg(&seed);
+        assert_eq!(msg.len(), 37);
+        assert_eq!(&msg[..4], b"VMID");
+        assert_eq!(msg[4], 0x01);
+        assert_eq!(&msg[5..], &seed[..]);
+    }
+
+    #[test]
+    fn vmid_seed_is_random() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        host_random(&mut a);
+        host_random(&mut b);
+        // Two CSPRNG draws colliding (or being all-zero) has probability ~2^-256.
+        assert_ne!(a, b);
+        assert_ne!(a, [0u8; 32]);
+    }
 
     #[test]
     fn plain_byte_forwards_one() {
