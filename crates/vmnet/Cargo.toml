@@ -2,7 +2,7 @@
 name = "ignition-vmnet"
 version = "0.0.0"
 edition = "2024"
-description = "vmnet.framework shared-mode backend via a C shim"
+description = "Guest networking backends: vmnet.framework (in-process, needs sudo) and socket_vmnet (daemon client, no sudo)"
 license = "Apache-2.0"
 
 [lib]
@@ -15,6 +15,10 @@ path = "src/bin/vmnet-smoke.rs"
 
 [dependencies]
 ignition_devices = { package = "ignition-devices", path = "../devices" }
+log = "0.4"
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+tempfile = "3"
