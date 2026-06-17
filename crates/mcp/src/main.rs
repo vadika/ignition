@@ -1,59 +1,50 @@
 //! ignition-mcp: stdio MCP server exposing ignition microVM sandboxes.
 
-#[allow(dead_code)]
 mod session;
-#[allow(dead_code)]
+mod tools;
 mod vsock_client;
 
-use rmcp::{
-    ServerHandler, ServiceExt,
-    handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
-    transport::stdio,
-};
+use std::path::PathBuf;
+use std::time::Duration;
 
-#[derive(Clone)]
-struct Mcp {
-    tool_router: ToolRouter<Self>,
-}
+use rmcp::{ServiceExt, transport::stdio};
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct PingRequest {
-    #[schemars(description = "text to echo back")]
-    text: String,
-}
+use session::SessionConfig;
+use tools::Mcp;
 
-#[tool_router]
-impl Mcp {
-    fn new() -> Self {
-        Self { tool_router: Self::tool_router() }
-    }
-
-    #[tool(description = "Health check; echoes the supplied text")]
-    async fn ping(&self, Parameters(PingRequest { text }): Parameters<PingRequest>) -> String {
-        format!("pong: {text}")
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for Mcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some(
-                "ignition microVM sandboxes: open_session, run, write_file, reset, close.".into(),
-            ),
-            ..Default::default()
-        }
-    }
+fn env_path(key: &str, default: &str) -> PathBuf {
+    std::env::var(key).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(default))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let service = Mcp::new().serve(stdio()).await?;
+    let cfg = SessionConfig {
+        boot_bin: env_path("IGN_MCP_BOOT", "target/debug/boot"),
+        kernel: env_path("IGN_MCP_KERNEL", "kimage/out/Image"),
+        rootfs: env_path("IGN_MCP_ROOTFS", "kimage/out/rootfs-tools.ext4"),
+        store: env_path("IGN_MCP_STORE", "mcp-store"),
+        base: std::env::var("IGN_MCP_BASE").unwrap_or_else(|_| "tools-base".into()),
+        uds_dir: std::env::temp_dir(),
+        max_sessions: std::env::var("IGN_MCP_MAX_SESSIONS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(8),
+        idle: Duration::from_secs(std::env::var("IGN_MCP_IDLE_SECS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(600)),
+        net: std::env::var("IGN_MCP_NET").is_ok(),
+    };
+
+    let server = Mcp::new(cfg);
+
+    let mgr = server.manager();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            mgr.lock().await.reap_idle();
+        }
+    });
+
+    let service = server.clone().serve(stdio()).await?;
     service.waiting().await?;
+    server.manager().lock().await.shutdown();
     Ok(())
 }

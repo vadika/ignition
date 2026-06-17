@@ -37,14 +37,14 @@ impl std::fmt::Display for SessionError {
 
 /// Spawns a `boot --restore` child for a session. Abstracted so tests can fake it.
 pub trait Spawner {
-    fn spawn(&self, cfg: &SessionConfig, uds: &PathBuf) -> Result<Child, String>;
+    fn spawn(&self, cfg: &SessionConfig, uds: &std::path::Path) -> Result<Child, String>;
 }
 
 /// Real spawner: `boot --restore <base> --store <store> --vsock-uds <uds> [--net] <kernel> <rootfs>`.
 pub struct BootSpawner;
 
 impl Spawner for BootSpawner {
-    fn spawn(&self, cfg: &SessionConfig, uds: &PathBuf) -> Result<Child, String> {
+    fn spawn(&self, cfg: &SessionConfig, uds: &std::path::Path) -> Result<Child, String> {
         let mut c = std::process::Command::new(&cfg.boot_bin);
         c.arg("--mem").arg("1024")
             .arg("--restore").arg(&cfg.base)
@@ -84,10 +84,6 @@ impl SessionManager {
         Self { cfg, sessions: HashMap::new(), next: 0 }
     }
 
-    pub fn config(&self) -> &SessionConfig {
-        &self.cfg
-    }
-
     pub fn get_uds(&mut self, id: &str) -> Result<PathBuf, SessionError> {
         let s = self.sessions.get_mut(id).ok_or_else(|| SessionError::Unknown(id.to_string()))?;
         s.last_used = Instant::now();
@@ -122,7 +118,15 @@ impl SessionManager {
             let _ = s.child.wait();
             s.uds.clone()
         };
-        let child = spawner.spawn(&self.cfg, &uds).map_err(SessionError::Spawn)?;
+        let child = match spawner.spawn(&self.cfg, &uds) {
+            Ok(c) => c,
+            Err(e) => {
+                // Failed reset: drop the dead session rather than leave a zombie.
+                self.sessions.remove(id);
+                let _ = std::fs::remove_file(&uds);
+                return Err(SessionError::Spawn(e));
+            }
+        };
         let s = self.sessions.get_mut(id).unwrap();
         s.child = child;
         s.last_used = Instant::now();
@@ -169,7 +173,7 @@ struct FakeSpawner;
 
 #[cfg(test)]
 impl Spawner for FakeSpawner {
-    fn spawn(&self, _cfg: &SessionConfig, _uds: &PathBuf) -> Result<Child, String> {
+    fn spawn(&self, _cfg: &SessionConfig, _uds: &std::path::Path) -> Result<Child, String> {
         // A trivially-spawnable, immediately-exiting child stands in for boot.
         std::process::Command::new("/bin/sh").arg("-c").arg("exit 0")
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
