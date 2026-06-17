@@ -1,5 +1,8 @@
 //! ignition-mcp: stdio MCP server exposing ignition microVM sandboxes.
 
+#[allow(dead_code)]
+mod vsock_client;
+
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::router::tool::ToolRouter,
