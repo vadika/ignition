@@ -132,11 +132,10 @@ async fn handle(shared: Shared, method: Method, path: String, body: &[u8]) -> Re
 
         (Method::PATCH, "/vm") => {
             let u: VmUpdate = match parse(body) { Ok(u) => u, Err(r) => return r };
-            let action = match vm.vm_update(&u.state) { Ok(a) => a, Err(m) => return fault(m) };
-            let sock = vm.settings.control_sock.clone();
-            match control(&sock, action, None).await {
-                Ok(()) => { vm.state = if action == "pause" { State::Paused } else { State::Running };
-                            empty(StatusCode::NO_CONTENT) }
+            // Advisory pause: just record the requested state. The guest keeps
+            // running; snapshot/create does its own atomic stop-the-world capture.
+            match vm.vm_update(&u.state) {
+                Ok(new_state) => { vm.state = new_state; empty(StatusCode::NO_CONTENT) }
                 Err(m) => fault(m),
             }
         }
@@ -146,15 +145,10 @@ async fn handle(shared: Shared, method: Method, path: String, body: &[u8]) -> Re
             let s: SnapshotCreate = match parse(body) { Ok(s) => s, Err(r) => return r };
             let name = sanitize_name(&s.snapshot_path);
             let sock = vm.settings.control_sock.clone();
-            // Pause is a holding rendezvous that blocks the snapshot rendezvous, so
-            // briefly resume, snapshot, then re-pause. boot's request_resume and
-            // request_snapshot are synchronous (each blocks until its rendezvous
-            // fully clears), so these three sequential control calls cannot race on
-            // the shared rendezvous slot. The VM ends paused, as the client expects.
-            if let Err(m) = control(&sock, "resume", None).await { return fault(m); }
-            let snap = control(&sock, "snapshot", Some(&name)).await;
-            if let Err(m) = control(&sock, "pause", None).await { return fault(m); }
-            match snap {
+            // Pause is advisory, so the guest is running; the snapshot control
+            // command runs its own atomic stop-the-world rendezvous (synchronous:
+            // boot replies only once the snapshot is written). VM stays Paused.
+            match control(&sock, "snapshot", Some(&name)).await {
                 Ok(()) => { vm.paths.insert(s.snapshot_path, name); empty(StatusCode::NO_CONTENT) }
                 Err(m) => fault(m),
             }

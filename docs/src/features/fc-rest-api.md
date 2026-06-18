@@ -53,28 +53,25 @@ poll-connects the control socket until `boot` answers, and marks the VM
 `Running`.
 
 The control socket is line-JSON: one `{"action":"...","name":"..."}` request per
-line, one `{"ok":true}` reply per line. `PATCH /vm` and the snapshot routes drive
-the VM by writing those lines, which call `boot`'s `VcpuManager.request_pause` /
-`request_resume` / `request_snapshot` — the same methods the interactive serial
-`Ctrl-A` FSM uses. One transport (REST), one driver underneath.
+line, one `{"ok":true}` reply per line. The snapshot routes drive the VM by writing
+those lines, which call `boot`'s `VcpuManager.request_snapshot` — the same method
+the interactive serial `Ctrl-A` FSM uses. One transport (REST), one driver
+underneath.
 
 ## Snapshot while paused
 
-`PATCH /vm {Paused}` is a real stop-the-world pause: every vCPU parks on a holding
-rendezvous. That is the state a client expects to snapshot from, but it is also a
-problem, because the pause holds the rendezvous slot that `request_snapshot` needs.
+Pause is **advisory** — REST state only. `PATCH /vm {Paused}` / `{Resumed}` just
+records the requested state; the guest keeps running and no control command is
+sent. There is no holding rendezvous to freeze the vCPUs.
 
-So `PUT /snapshot/create` transparently does resume → snapshot → pause:
-
-1. `resume` — clears the holding rendezvous.
-2. `snapshot` — runs the stop-the-world snapshot.
-3. `pause` — re-parks the vCPUs.
-
-`boot`'s resume and snapshot control commands are synchronous (each blocks until
-its rendezvous fully clears before the reply line is written), so the three
-sequential control calls cannot race on the shared rendezvous slot. The VM ends
-paused, exactly as the client left it. The snapshot's name in the ignition store
-is the sanitized basename of the client's `snapshot_path` (see below).
+A real freeze is unnecessary because `PUT /snapshot/create` issues one atomic
+stop-the-world snapshot rendezvous on its own: every vCPU exits to the snapshot
+barrier, saves its registers, and the leader writes the snapshot before any vCPU
+resumes. `boot`'s snapshot control command is synchronous (`boot` writes the reply
+line only once the snapshot is on disk), so the 204 means the snapshot is written.
+The VM stays in the `Paused` REST state, exactly as the client left it. The
+snapshot's name in the ignition store is the sanitized basename of the client's
+`snapshot_path` (see below).
 
 ## Honest limitations
 
@@ -83,6 +80,9 @@ are deliberate and bounded:
 
 - **One microVM per API socket.** This matches Firecracker: one process is one VM.
   Run multiple servers on multiple sockets for multiple VMs.
+- **Pause is advisory** — a busy guest is not frozen. `PATCH /vm {Paused}` only
+  records REST state; snapshot consistency comes from the atomic snapshot
+  rendezvous, not from pause (fine for a sandbox idle between calls).
 - **`snapshot_path` / `mem_file_path` are opaque handles, not real files.** The
   server maps a sanitized basename of `snapshot_path` to an ignition store name
   and records the mapping (`path -> store name`); the actual snapshot lives in the

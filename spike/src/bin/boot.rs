@@ -389,9 +389,9 @@ fn spawn_stdin_reader(
 
 /// Parse one control line and run the matching VcpuManager request. Returns the
 /// JSON response line. Unknown actions and malformed JSON return an error reply.
-/// The `{"ok":true}` reply is synchronous for `snapshot` and `resume` (they block
-/// until their rendezvous completes); for `checkpoint`, `reset`, and `pause` it is
-/// a receipt-of-request, returned as soon as the request is broadcast.
+/// The `{"ok":true}` reply is synchronous for `snapshot` (it blocks until its
+/// rendezvous completes); for `checkpoint` and `reset` it is a receipt-of-request,
+/// returned as soon as the request is broadcast.
 fn dispatch_control(
     line: &str,
     manager: &ignition_vmm::vstate::vcpu_manager::VcpuManager,
@@ -411,8 +411,6 @@ fn dispatch_control(
         }
         Some("checkpoint") => { manager.request_checkpoint(); "{\"ok\":true}".to_string() }
         Some("reset") => { manager.request_reset(); "{\"ok\":true}".to_string() }
-        Some("pause") => { manager.request_pause(); "{\"ok\":true}".to_string() }
-        Some("resume") => { manager.request_resume(); "{\"ok\":true}".to_string() }
         other => format!("{{\"ok\":false,\"error\":\"unknown action: {other:?}\"}}"),
     }
 }
@@ -2582,9 +2580,15 @@ mod control_tests {
         let m = mgr();
         // These ack unconditionally (receipt-of-request); snapshot is excluded
         // because it now reports whether it actually ran (see snapshot_takes_name).
-        for a in ["checkpoint", "reset", "pause", "resume"] {
+        for a in ["checkpoint", "reset"] {
             let r = dispatch_control(&format!("{{\"action\":\"{a}\"}}"), &m);
             assert_eq!(r, "{\"ok\":true}", "action {a}");
+        }
+        // Advisory pause: pause/resume are no longer control actions (REST-state
+        // only), so they now fall through to the unknown-action error.
+        for a in ["pause", "resume"] {
+            let r = dispatch_control(&format!("{{\"action\":\"{a}\"}}"), &m);
+            assert!(r.contains("unknown action"), "action {a}: {r}");
         }
     }
     #[test]

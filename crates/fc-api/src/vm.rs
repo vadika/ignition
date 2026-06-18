@@ -55,11 +55,13 @@ impl VmState {
         else { Err("operation not allowed post-boot".into()) }
     }
 
-    /// PATCH /vm transition check. Returns the control action to send on success.
-    pub fn vm_update(&self, target: &str) -> Result<&'static str, String> {
+    /// PATCH /vm transition check. Returns the new state on success. Pause is
+    /// advisory (REST-state only): the guest is not frozen; snapshot/create runs
+    /// its own atomic stop-the-world rendezvous, so a real freeze is unnecessary.
+    pub fn vm_update(&self, target: &str) -> Result<State, String> {
         match (self.state, target) {
-            (State::Running, "Paused") => Ok("pause"),
-            (State::Paused, "Resumed") => Ok("resume"),
+            (State::Running, "Paused") => Ok(State::Paused),
+            (State::Paused, "Resumed") => Ok(State::Running),
             (State::Paused, "Paused") => Err("vm already paused".into()),
             (State::Running, "Resumed") => Err("vm already running".into()),
             _ => Err(format!("cannot set state {target} from {}", self.state.as_str())),
@@ -96,8 +98,8 @@ mod tests {
     }
     #[test]
     fn pause_resume_transitions() {
-        assert_eq!(st(State::Running).vm_update("Paused").unwrap(), "pause");
-        assert_eq!(st(State::Paused).vm_update("Resumed").unwrap(), "resume");
+        assert_eq!(st(State::Running).vm_update("Paused").unwrap(), State::Paused);
+        assert_eq!(st(State::Paused).vm_update("Resumed").unwrap(), State::Running);
         assert!(st(State::Paused).vm_update("Paused").is_err());
         assert!(st(State::Running).vm_update("Resumed").is_err());
     }

@@ -2,8 +2,9 @@
 """Integration test for ignition-fc-api with a MOCK boot (no HVF).
 
 Stub boot binds --control-sock, ACKs control lines, records actions. We drive the
-FC sequence over the api-sock and assert status codes + that resume/snapshot/pause
-reached the stub. Stdlib only.
+FC sequence over the api-sock and assert status codes + that snapshot reached the
+stub. Pause/resume are advisory (REST-state only) and never hit the control socket.
+Stdlib only.
 """
 import http.client, json, os, socket, stat, subprocess, sys, tempfile, time
 
@@ -65,7 +66,9 @@ def main():
         assert req(api, "PUT", "/snapshot/create", {"snapshot_path":"/s/snap1"})[0] == 204
         assert req(api, "PATCH", "/vm", {"state":"Resumed"})[0] == 204
         actions = open(os.path.join(store, "control.sock.actions")).read()
-        assert '"pause"' in actions and '"snapshot"' in actions and '"resume"' in actions, actions
+        # Pause/resume are advisory (REST-state only) and never reach the control
+        # socket; only the snapshot/create capture sends a control line.
+        assert '"snapshot"' in actions, actions
         assert '"name":"snap1"' in actions, actions
         print("fc_api_mock_test PASS")
         ok = True
