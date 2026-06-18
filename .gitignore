@@ -19,3 +19,9 @@ manifest.json
 
 # mdBook generated site
 docs/book/
+
+# snapshot stores + python scratch (fan-out demo, live proofs)
+mcp-store/
+vmid-store/
+__pycache__/
+*.pyc
