@@ -78,6 +78,11 @@ pub struct VcpuManager {
     checkpoint_req: AtomicBool,
     /// Set by `request_reset`; cleared by the reset leader.
     reset_req: AtomicBool,
+    /// Set by `request_pause`; cleared by the pause leader at barrier 2.
+    pause_req: AtomicBool,
+    /// Holding gate: `true` while paused. Each vCPU blocks on the condvar after
+    /// the pause barrier until `request_resume` flips it false and notifies.
+    pause_gate: (Mutex<bool>, std::sync::Condvar),
     /// Shared vtimer offset for an interactive reset (Ctrl+Alt+R). Computed once
     /// by the reset leader from the reset point's primary host_counter and read
     /// by every vCPU after barrier 2 before its `restore_state`, so CNTVCT stays
@@ -141,6 +146,8 @@ impl VcpuManager {
             snapshot_name: Mutex::new(None),
             checkpoint_req: AtomicBool::new(false),
             reset_req: AtomicBool::new(false),
+            pause_req: AtomicBool::new(false),
+            pause_gate: (Mutex::new(false), std::sync::Condvar::new()),
             reset_vtimer_offset: AtomicU64::new(0),
             rendezvous_active: AtomicBool::new(false),
             snap_barrier: Mutex::new(None),
@@ -246,6 +253,13 @@ impl VcpuManager {
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
         Self::broadcast_exit(ids);
+        // Block until the snapshot is written (the leader clears rendezvous_active
+        // at the end of run_collect_leader). Makes the call synchronous so a
+        // follow-up pause/resume cannot race the in-flight snapshot.
+        // ponytail: spin-wait — a snapshot completes well under a frame; not worth a condvar.
+        while self.rendezvous_active.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
     }
 
     /// Request a checkpoint. Mirrors `request_snapshot`: freezes CPU_ON, latches
@@ -274,6 +288,35 @@ impl VcpuManager {
         let Some(ids) = self.begin_rendezvous() else { return };
         self.reset_req.store(true, Ordering::Release);
         Self::broadcast_exit(ids);
+    }
+
+    /// Pause all vCPUs: latch the gate, then run a holding rendezvous so every
+    /// vCPU parks at the pause barrier and blocks until `request_resume`. No-op
+    /// if a rendezvous is already active or no vCPU has registered (the gate is
+    /// rolled back so a later pause works).
+    pub fn request_pause(&self) {
+        *self.pause_gate.0.lock().unwrap() = true;
+        let Some(ids) = self.begin_rendezvous() else {
+            *self.pause_gate.0.lock().unwrap() = false;
+            return;
+        };
+        self.pause_req.store(true, Ordering::Release);
+        Self::broadcast_exit(ids);
+    }
+
+    /// Resume from a pause: clear the gate, wake every parked vCPU, and block
+    /// until the pause rendezvous has fully drained (`rendezvous_active` false),
+    /// so a snapshot issued immediately after resume sees a free rendezvous slot.
+    /// Harmless if not paused (no waiters; the loop exits at once).
+    pub fn request_resume(&self) {
+        *self.pause_gate.0.lock().unwrap() = false;
+        self.pause_gate.1.notify_all();
+        // ponytail: spin-wait, not a condvar — resume drains in microseconds
+        // (vCPUs hit barrier 2 and the leader clears the flag). A blocking
+        // primitive here would be more machinery than the wait is worth.
+        while self.rendezvous_active.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
     }
 
     /// Try to claim `mpidr` for a bring-up. Idempotent guard against unknown or
@@ -685,6 +728,30 @@ impl VcpuManager {
                         let _ = ignition_hvf::vcpu_set_vtimer_mask(vcpu.id(), false);
                         continue;
                     }
+                    if self.pause_req.load(Ordering::Acquire) {
+                        let bar = self
+                            .snap_barrier
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("snap_barrier set when pause_req is set");
+                        // Barrier 1: every vCPU parked before we hold.
+                        bar.wait();
+                        // Hold on the gate until request_resume; condvar park => ~0% CPU.
+                        {
+                            let (lock, cv) = &self.pause_gate;
+                            let mut held = lock.lock().unwrap();
+                            while *held {
+                                held = cv.wait(held).unwrap();
+                            }
+                        }
+                        // Barrier 2: release together; one vCPU clears the rendezvous.
+                        if bar.wait().is_leader() {
+                            self.pause_req.store(false, Ordering::Release);
+                            self.rendezvous_active.store(false, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                     return Ok(());
                 }
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
@@ -860,5 +927,22 @@ mod tests {
         m.request_reset();
         assert!(!m.reset_req.load(Ordering::Relaxed));
         assert!(!m.rendezvous_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn request_pause_without_vcpus_rolls_back_gate() {
+        let mgr = mgr(1);
+        // No vCPU registered: begin_rendezvous bails, and the gate must not stay latched.
+        mgr.request_pause();
+        assert!(!*mgr.pause_gate.0.lock().unwrap());
+        assert!(!mgr.pause_req.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn request_resume_clears_gate() {
+        let mgr = mgr(1);
+        *mgr.pause_gate.0.lock().unwrap() = true;
+        mgr.request_resume();
+        assert!(!*mgr.pause_gate.0.lock().unwrap());
     }
 }
