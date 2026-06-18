@@ -191,11 +191,19 @@ then add the next.
   tools-base rootfs. **Verified live on HVF** (`scripts/mcp_live_test.py`): open → run
   (`python3` → 4) → filesystem persists across runs → write_file → reset clears state → close,
   all green. `docs/src/features/mcp-server.md`
-- [ ] **Firecracker REST control API** *(second — broadest inherited ecosystem)* —
-  machine-config API on the vstate/device seam so `firecracker-go-sdk`, flintlock, and
-  existing orchestration target Macs **unmodified**. Converts "novel research VMM" into
-  "Firecracker on Apple Silicon that snapshots faster." (Also the clearest differentiator
-  vs libkrun.)
+- [x] **Firecracker REST control API** *(second — broadest inherited ecosystem)* —
+  a Firecracker-compatible REST server over a unix socket so `firecracker-go-sdk`,
+  flintlock, and existing orchestration target Macs **unmodified**. Converts "novel
+  research VMM" into "Firecracker on Apple Silicon that snapshots faster." (Also the
+  clearest differentiator vs libkrun.)
+  Shipped: `ignition-fc-api` crate — the launch + snapshot route subset (machine-config,
+  boot-source, drives, network-interfaces, `InstanceStart`, `PATCH /vm` pause/resume,
+  `snapshot/create`, `snapshot/load`). Translate-and-spawn: the server accumulates config,
+  then maps it to `boot` flags and spawns a headless child driven over a `--control-sock`
+  (the same `request_pause`/`resume`/`snapshot` methods as the serial FSM). One VM per API
+  socket. **Mock-tested** (`scripts/fc_api_mock_test.py`, CI-safe stub boot) and
+  **live-tested on HVF** (`scripts/fc_api_live_test.py`: start → pause → snapshot → resume,
+  then clone-from-snapshot in a second server). `docs/src/features/fc-rest-api.md`
 - [ ] **OCI / containerd shim** *(heavier, later)* — present as a `runtimeClass`-style
   runtime so `nerdctl` / Buildkit / CI runners get microVM-per-container with no workflow
   change (the path Kata took to adoption).
@@ -266,7 +274,7 @@ real and strong today; the VMM *process* is not yet jailed.
 | Snapshot/restore (multi-vCPU, net) | ✅ | ✅ | |
 | Lazy/CoW restore (immutable base) | ✅ `clonefile`+`MAP_SHARED` | ✅ `mmap MAP_PRIVATE` / UFFD | macOS has no `userfaultfd` |
 | Diff snapshots (dirty tracking) | ✅ `hv_vm_protect` write-fault | ✅ `KVM_GET_DIRTY_LOG` | no `KVM_GET_DIRTY_LOG` equivalent |
-| REST API | ❌ adoption track | ✅ | inherits FC's tool ecosystem |
+| REST API | ✅ `ignition-fc-api` (launch + snapshot subset) | ✅ | inherits FC's tool ecosystem |
 | Jailer / seccomp | 🟡 Seatbelt v1 (targeted-deny) | ✅ | full deny-default + uid drop = v2 |
 | MMDS, rate limiters, CPU templates, metrics | ❌ planned | ✅ | |
 | Nested virt (EL2) | ❌ research | n/a | HVF M3+/macOS 15+ bonus |

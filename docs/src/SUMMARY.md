@@ -20,6 +20,7 @@
 - [Disposable browser](features/disposable-browser.md)
 - [MCP server for agents](features/mcp-server.md)
   - [Fan-out demo](features/fanout-demo.md)
+- [Firecracker REST API](features/fc-rest-api.md)
 - [VM internal API (MMIO)](concepts/vm-internal-api.md)
 
 # Snapshot fuzzing
