@@ -60,12 +60,12 @@ unsafe impl Send for PristineRam {}
 unsafe impl Sync for PristineRam {}
 
 impl PristineRam {
-    /// Clone `src` to `dst` (CoW where supported) and map `dst` read-only.
-    /// The caller is responsible for quiescing/`msync`ing `src` first.
-    pub fn from_clone(src: &Path, dst: &Path, len: usize) -> io::Result<PristineRam> {
-        crate::snapshot::clonefile_or_copy(src, dst)?;
-        let f = std::fs::OpenOptions::new().read(true).open(dst)?;
-        // SAFETY: mapping `len` bytes of a file we just created at `len`.
+    /// Map an existing file read-only (no clone). Used to point the reset
+    /// pristine at the immutable base memory.bin directly — zero copy, and it
+    /// shares the base's warm page cache.
+    pub fn map_file_ro(path: &Path, len: usize) -> io::Result<PristineRam> {
+        let f = std::fs::OpenOptions::new().read(true).open(path)?;
+        // SAFETY: mapping `len` bytes of a file expected to be at least `len`.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -77,7 +77,7 @@ impl PristineRam {
             )
         };
         if ptr == libc::MAP_FAILED {
-            return Err(io::Error::other("mmap of pristine.bin failed"));
+            return Err(io::Error::other("mmap of pristine file failed"));
         }
         Ok(PristineRam::Mapped { ptr, len })
     }
@@ -151,16 +151,15 @@ mod tests {
     }
 
     #[test]
-    fn pristine_mapped_round_trips_bytes() {
+    fn map_file_ro_round_trips_bytes() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("ignition-pristine-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ignition-mapro-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("memory.bin");
-        let dst = dir.join("pristine.bin");
-        let bytes = vec![0xC3u8; PG * 3];
+        let bytes = vec![0x7Eu8; PG * 3];
         std::fs::File::create(&src).unwrap().write_all(&bytes).unwrap();
 
-        let p = PristineRam::from_clone(&src, &dst, bytes.len()).unwrap();
+        let p = PristineRam::map_file_ro(&src, bytes.len()).unwrap();
         assert_eq!(p.as_slice(), &bytes[..]);
 
         drop(p);

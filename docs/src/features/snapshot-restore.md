@@ -102,15 +102,25 @@ virtio-input config cursor are serialized; pixels are not — on restore the
 device re-reads the scanout from the restored guest-RAM backing and presents one
 frame, so the window paints the resumed screen before the guest runs again.
 
-Because each restore clones the immutable base into its own copy-on-write
-instance dir (keyed by pid), one warm base fans out into N independent desktops,
-each with its own window:
+Because each restore `mmap`s the shared, immutable base `memory.bin` with
+`MAP_PRIVATE`, guest writes copy-on-write to anonymous pages: the base is never
+modified and N concurrent restores share one cache-warm vnode. There is no
+per-instance memory clone (the disk still clones per instance for virtio-blk;
+see [VM identity & isolation](vmid.md)). One warm base fans out into N
+independent desktops, each with its own window:
 
 ```console
 # take one warm-base snapshot of a logged-in desktop (Ctrl-A s), then:
 scripts/fanout-gui.sh 3 warm-base
 # -> 3 boot --gui --restore processes, 3 windows, 3 isolated guests
 ```
+
+On a fan-out / sandbox workload the `MAP_PRIVATE`-over-base model wins twice.
+Restore start latency dropped from ~245 ms to ~66 ms p50 (about 4x), and the
+first memory-heavy workload after restore dropped from ~740 ms to ~330 ms p50
+(about 2x): every restore shares the warm base page cache instead of faulting
+from a cold per-instance clone vnode. Steady-state (warm) execution is
+unchanged.
 
 Networking fans out too. Pass `--net` (needs `sudo` for vmnet shared mode) when
 you snapshot and when you fan out, and each clone gets its **own MAC and DHCP
@@ -136,7 +146,7 @@ Two console hotkeys let you capture a running guest's state as an in-memory
 "reset point" and roll the live guest back to it without tearing the VM down:
 
 - **`Ctrl-A c`** — mark the current moment as the reset point. The VMM captures
-  guest RAM (via an O(1) APFS `clonefile` copy), vCPU registers, GIC state, and
+  guest RAM (an owned heap copy of live RAM), vCPU registers, GIC state, and
   virtio-device state, then prints `[reset point marked]` and lets the guest
   continue.
 - **`Ctrl-A r`** — roll the running guest back IN PLACE to that reset point:
@@ -146,6 +156,12 @@ Two console hotkeys let you capture a running guest's state as an in-memory
   `--gui` the rolled-back screen is repainted. The guest then resumes from the
   reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
   yet, prints `reset: no checkpoint - press Ctrl-A c first`.
+
+Reset/checkpoint parity is preserved under the `MAP_PRIVATE`-over-base model.
+In-place reset rolls back by byte-copy from a pristine that is a read-only
+`mmap` of the base file (full snapshot) or an owned heap copy of live RAM (diff
+chain); checkpoint takes an owned heap copy of live RAM. Disk snapshot and
+re-snapshot read the live RAM slice and are unchanged.
 
 The in-place reset above is the **serial/headless** path. Under `--gui` it is not
 used: **`Ctrl+Alt+R`** instead does a **cold reset** — the process exits with a

@@ -138,6 +138,8 @@ def main():
     ap.add_argument("--kernel", default=os.path.join(root, "kimage/out/Image"))
     ap.add_argument("--rootfs", default=os.path.join(root, "kimage/out/rootfs-tools.ext4"))
     ap.add_argument("--mem", type=int, default=1024)
+    ap.add_argument("--prefetch", action="store_true",
+                    help="hot mode: read the base memory.bin once before launching, to warm the page cache")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--deadline", type=float, default=30.0)
     ap.add_argument("--json", action="store_true")
@@ -157,6 +159,15 @@ def main():
     modes = ["cold", "hot"] if args.mode == "both" else [args.mode]
     summaries = []
     for m in modes:
+        if m == "hot" and args.prefetch:
+            base_mem = os.path.join(args.store, "snapshots", args.base, "memory.bin")
+            t = time.monotonic()
+            with open(base_mem, "rb", buffering=0) as f:
+                while f.read(8 << 20):  # read the base once to warm the page cache
+                    pass
+            if not args.json:
+                print(f"prefetched {base_mem} in {round((time.monotonic()-t)*1000)} ms",
+                      file=sys.stderr)
         if not args.json:
             print(f"running {args.count} {m} sandboxes (concurrency {args.concurrency}) ...",
                   file=sys.stderr)
