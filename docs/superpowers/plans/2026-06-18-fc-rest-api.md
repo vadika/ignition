@@ -1052,9 +1052,16 @@ async fn handle(shared: Shared, method: Method, path: String, body: &[u8]) -> Re
             if let Err(m) = vm.ensure_paused_for_snapshot() { return fault(m); }
             let s: SnapshotCreate = match parse(body) { Ok(s) => s, Err(r) => return r };
             let name = sanitize_name(&s.snapshot_path);
-            // Snapshot is an atomic stop-the-world; do it directly. The VM stays paused.
             let sock = vm.settings.control_sock.clone();
-            match control(&sock, "snapshot", Some(&name)).await {
+            // Pause is a holding rendezvous that blocks the snapshot rendezvous, so
+            // briefly resume, snapshot, then re-pause. boot's request_resume and
+            // request_snapshot are synchronous (each blocks until its rendezvous
+            // fully clears), so these three sequential control calls cannot race on
+            // the shared rendezvous slot. The VM ends paused, as the client expects.
+            if let Err(m) = control(&sock, "resume", None).await { return fault(m); }
+            let snap = control(&sock, "snapshot", Some(&name)).await;
+            if let Err(m) = control(&sock, "pause", None).await { return fault(m); }
+            match snap {
                 Ok(()) => { vm.paths.insert(s.snapshot_path, name); empty(StatusCode::NO_CONTENT) }
                 Err(m) => fault(m),
             }
