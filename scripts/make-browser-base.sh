@@ -43,9 +43,17 @@ trap cleanup EXIT INT TERM
 exec 3<>"$fifo"
 
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
+# NET=1 (default) attaches socket_vmnet so the homepage loads during warm-up.
+# NET=0 builds a net-free base: required for the disposable-browser app (zero-setup,
+# no socket_vmnet daemon) and more correct for the quiescent-snapshot rule (no live
+# TLS at snapshot) -- pair it with a rootfs built HOMEPAGE=about:blank (see
+# build-rootfs-browser.sh) so Firefox idles with no pending connections; each cloned
+# child then gets gvproxy NAT + an injected URL.
+NET="${NET:-1}"
+NET_FLAG="--net"; [ "$NET" = 0 ] && NET_FLAG=""
 # Boot reads stdin from the FIFO; its serial output goes through a reader that
 # watches for BROWSER_READY (snapshot trigger) or BROWSER_TIMEOUT (abort).
-"$BOOT" --gui --net --smp "$SMP" --mem 2048 \
+"$BOOT" --gui $NET_FLAG --smp "$SMP" --mem 2048 \
   --append "ro init=/sbin/overlay-init" --name "$NAME" \
   "$KERNEL" "$ROOTFS" <"$fifo" 2>&1 | (
     while IFS= read -r line; do
