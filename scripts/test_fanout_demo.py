@@ -76,13 +76,24 @@ class TestParseVerdict(unittest.TestCase):
     def test_verdict_pass(self):
         forks = [
             {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
+            {"bootid": "y", "rand": "b", "file_readback": "b", "exit": 0, "error": None},
+        ]
+        v = fd.verdict(forks)
+        self.assertTrue(v["randoms_distinct"])
+        self.assertTrue(v["cow_isolated"])
+        self.assertTrue(v["identities_distinct"])
+        self.assertTrue(v["ok"])
+
+    def test_identities_distinct_is_informational(self):
+        # Identical bootids no longer fail the verdict; identities_distinct is
+        # just supplementary evidence and is False here.
+        forks = [
+            {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
             {"bootid": "x", "rand": "b", "file_readback": "b", "exit": 0, "error": None},
         ]
         v = fd.verdict(forks)
-        self.assertTrue(v["lineage_shared"])
-        self.assertTrue(v["randoms_distinct"])
-        self.assertTrue(v["cow_isolated"])
         self.assertTrue(v["ok"])
+        self.assertFalse(v["identities_distinct"])
 
     def test_verdict_fails_on_dup_random(self):
         forks = [

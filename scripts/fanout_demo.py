@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fan-out demo driver: fork N clones from one base snapshot in parallel, run an
-identical workload in each over vsock ign-exec, and show shared lineage plus
-CRNG/filesystem divergence. Stdlib only."""
+identical workload in each over vsock ign-exec, and show CRNG divergence,
+copy-on-write filesystem isolation, and fork speed. Stdlib only."""
 import argparse
 import json
 import os
@@ -16,12 +16,13 @@ EXEC_PORT = 7000
 MAX_FRAME = 64 * 1024 * 1024
 
 
-def vsock_exec(uds_path, cmd, timeout, deadline):
-    """E2 handshake + one framed exec request against the guest ign-exec agent.
+def vsock_connect(uds_path, deadline):
+    """Connect to the guest ign-exec agent and complete the CONNECT/OK handshake.
 
     Retries connect() until `deadline` seconds elapse (the control UDS appears
-    only once boot wires up vsock). Returns the parsed response dict; raises on
-    protocol/timeout failure."""
+    only once boot wires up vsock). Returns a live socket with a generous
+    timeout set; raises on protocol/timeout failure. This is the spawn ->
+    guest-ready latency, i.e. the real fork cost."""
     end = time.monotonic() + deadline
     s = None
     while True:
@@ -38,7 +39,7 @@ def vsock_exec(uds_path, cmd, timeout, deadline):
             time.sleep(0.05)
     # Connect succeeded; the per-attempt connect timeout above is too tight to
     # govern the rest of the handshake. Give the framed exchange its own budget.
-    s.settimeout(timeout)
+    s.settimeout(max(1.0, end - time.monotonic()))
     try:
         s.sendall(f"CONNECT {EXEC_PORT}\n".encode())
         line = b""
@@ -51,15 +52,33 @@ def vsock_exec(uds_path, cmd, timeout, deadline):
                 raise IOError("vsock: oversized ack line")
         if not line.startswith(b"OK "):
             raise IOError(f"vsock: expected OK, got {line!r}")
+    except Exception:
+        s.close()
+        raise
+    return s
+
+
+def vsock_run(sock, cmd, timeout):
+    """Frame one exec request on an already-handshaken socket, read the framed
+    response, and close the socket. Returns the parsed response dict."""
+    sock.settimeout(timeout)
+    try:
         req = json.dumps({"cmd": cmd, "timeout": timeout}).encode()
-        s.sendall(struct.pack("<I", len(req)) + req)
-        hdr = _recvn(s, 4)
+        sock.sendall(struct.pack("<I", len(req)) + req)
+        hdr = _recvn(sock, 4)
         n = struct.unpack("<I", hdr)[0]
         if n > MAX_FRAME:
             raise IOError("vsock: response frame too large")
-        return json.loads(_recvn(s, n))
+        return json.loads(_recvn(sock, n))
     finally:
-        s.close()
+        sock.close()
+
+
+def vsock_exec(uds_path, cmd, timeout, deadline):
+    """Connect + handshake + one framed exec request against the guest ign-exec
+    agent. Thin wrapper over vsock_connect + vsock_run."""
+    sock = vsock_connect(uds_path, deadline)
+    return vsock_run(sock, cmd, timeout)
 
 
 def _recvn(s, n):
@@ -101,19 +120,25 @@ def parse_workload(stdout):
 
 
 def verdict(forks):
-    """Compute the pass/fail verdict over collected per-fork records."""
+    """Compute the pass/fail verdict over collected per-fork records.
+
+    Pass gate: all forks present and exit 0, AND randoms_distinct (every `rand`
+    unique), AND cow_isolated (every fork's file_readback == its own rand).
+    identities_distinct (all bootids unique) is informational only: post-restore
+    each clone lazily derives boot_id from its vmid-reseeded CRNG, so distinct
+    bootids are bonus evidence of identity divergence, not a lineage marker."""
     good = [f for f in forks if f and not f.get("error") and f.get("exit") == 0]
     all_ok = len(good) == len(forks) and len(forks) > 0
-    bootids = {f["bootid"] for f in good}
+    bootids = [f["bootid"] for f in good]
     rands = [f["rand"] for f in good]
-    lineage = all_ok and len(bootids) == 1
     distinct = all_ok and len(set(rands)) == len(rands)
     cow = all_ok and all(f["rand"] == f["file_readback"] for f in good)
+    identities = all_ok and len(set(bootids)) == len(bootids)
     return {
-        "lineage_shared": lineage,
         "randoms_distinct": distinct,
         "cow_isolated": cow,
-        "ok": bool(all_ok and lineage and distinct and cow),
+        "identities_distinct": identities,
+        "ok": bool(all_ok and distinct and cow),
     }
 
 
@@ -138,11 +163,12 @@ def fork_one(i, args, run_tok, results):
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         rec["_proc"] = proc
+        sock = vsock_connect(uds, deadline=args.deadline)
+        # restore_ms: spawn -> guest vsock-ready latency (the fork cost)
+        rec["restore_ms"] = round((time.monotonic() - t0) * 1000)
         te0 = time.monotonic()
-        resp = vsock_exec(uds, WORKLOAD, timeout=args.timeout, deadline=args.deadline)
+        resp = vsock_run(sock, WORKLOAD, timeout=args.timeout)
         rec["exec_ms"] = round((time.monotonic() - te0) * 1000)
-        # restore_ms approximated as connect-ready latency (spawn -> first exec response minus exec)
-        rec["restore_ms"] = round((te0 - t0) * 1000)
         rec["exit"] = resp.get("exit")
         if resp.get("timed_out") or resp.get("exit") != 0:
             rec["error"] = f"exec exit={resp.get('exit')} timed_out={resp.get('timed_out')}"
@@ -175,19 +201,21 @@ def _render_table(results, wall_ms, v):
     def short(x):
         return (x[:6] + "…") if x and len(x) > 7 else (x or "-")
     print(f"{'fork':<5}{'restore_ms':<12}{'exec_ms':<9}"
-          f"{'bootid':<10}{'rand':<12}{'file_readback':<14}status")
+          f"{'bootid(distinct)':<18}{'rand':<12}{'file_readback':<14}status")
     for r in sorted([r for r in results if r], key=lambda r: r["i"]):
         status = "ok" if not r["error"] else f"ERR {r['error']}"
         print(f"{r['i']:<5}{str(r['restore_ms'] or '-'):<12}"
-              f"{str(r['exec_ms'] or '-'):<9}{short(r['bootid']):<10}"
+              f"{str(r['exec_ms'] or '-'):<9}{short(r['bootid']):<18}"
               f"{short(r['rand']):<12}{short(r['file_readback']):<14}{status}")
     rms = sorted(r["restore_ms"] for r in results if r and r["restore_ms"] is not None)
     p = lambda q: rms[min(len(rms) - 1, int(q * len(rms)))] if rms else "-"
     print(f"\naggregate: {len(results)} forks, wall-clock {wall_ms} ms, "
           f"restore p50/p95 {p(0.5)}/{p(0.95)} ms")
-    print(f"verdict: lineage shared={v['lineage_shared']}  "
+    print(f"verdict: identities distinct={v['identities_distinct']}  "
           f"randoms distinct={v['randoms_distinct']}  "
           f"cow isolated={v['cow_isolated']}  => {'PASS' if v['ok'] else 'FAIL'}")
+    print(f"fork cost: {p(0.5)} ms/clone restore, {wall_ms} ms wall-clock "
+          f"for {len(results)} clones (cold boot is ~645 ms)")
 
 
 def main():
@@ -209,10 +237,7 @@ def main():
         if not os.path.exists(path):
             print(f"missing {label}: {path}", file=sys.stderr)
             return 2
-    def _is_base(f):
-        return (f == args.base or f.startswith(args.base + ".")
-                or f.startswith(args.base + "-"))
-    if not os.path.isdir(args.store) or not any(_is_base(f) for f in os.listdir(args.store)):
+    if not os.path.exists(os.path.join(args.store, "snapshots", args.base)):
         print(f"snapshot '{args.base}' not found in {args.store}; "
               f"run scripts/make-tools-base.sh first", file=sys.stderr)
         return 2
