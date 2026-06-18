@@ -15,10 +15,6 @@ pub const OP_RW: u16 = 5;
 pub const OP_CREDIT_UPDATE: u16 = 6;
 pub const OP_CREDIT_REQUEST: u16 = 7;
 
-// shutdown flags
-pub const SHUTDOWN_F_RECV: u32 = 1;
-pub const SHUTDOWN_F_SEND: u32 = 2;
-
 /// A 44-byte vsock header. Field offsets per the virtio spec.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VsockHeader {

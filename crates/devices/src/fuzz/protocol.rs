@@ -11,8 +11,6 @@ pub mod reg {
     pub const INPUT_LEN: u64 = 0x04;
     /// W: ASan/abort reason class on a CRASH doorbell (guest writes).
     pub const CRASH_CODE: u64 = 0x08;
-    /// R: VMM->guest handshake (optional in M0).
-    pub const STATUS: u64 = 0x0c;
 }
 
 /// Doorbell command codes (guest -> VMM).
@@ -44,7 +42,7 @@ mod tests {
 
     #[test]
     fn register_offsets_are_distinct_and_within_control_region() {
-        let offsets = [reg::DOORBELL, reg::INPUT_LEN, reg::CRASH_CODE, reg::STATUS];
+        let offsets = [reg::DOORBELL, reg::INPUT_LEN, reg::CRASH_CODE];
         for (i, a) in offsets.iter().enumerate() {
             assert!(*a + 4 <= CONTROL_SIZE, "register {a:#x} must fit in control region");
             for b in &offsets[i + 1..] {

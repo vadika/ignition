@@ -261,11 +261,6 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
-pub enum InterruptType {
-    Irq,
-    Fiq,
-}
-
 pub trait Vcpus {
     fn set_vtimer_irq(&self, vcpuid: u64);
     fn should_wait(&self, vcpuid: u64) -> bool;
@@ -324,17 +319,10 @@ pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
     }
 }
 
-pub fn vcpu_set_pending_irq(
-    vcpuid: u64,
-    irq_type: InterruptType,
-    pending: bool,
-) -> Result<(), Error> {
-    let _type = match irq_type {
-        InterruptType::Irq => hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
-        InterruptType::Fiq => hv_interrupt_type_t_HV_INTERRUPT_TYPE_FIQ,
+pub fn vcpu_set_pending_irq(vcpuid: u64, pending: bool) -> Result<(), Error> {
+    let ret = unsafe {
+        hv_vcpu_set_pending_interrupt(vcpuid, hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ, pending)
     };
-
-    let ret = unsafe { hv_vcpu_set_pending_interrupt(vcpuid, _type, pending) };
 
     if ret != HV_SUCCESS {
         Err(Error::VcpuSetPendingIrq)
@@ -386,6 +374,9 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfVm {
+    // TODO(M3-nested): `nested_enabled` drives the EL2/dlopen path below —
+    // deliberately retained as a stub for the M3 nested-virt milestone
+    // (HVF M3+/macOS 15+). Always `false` today.
     pub fn new(nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
         if nested_enabled {
@@ -516,6 +507,8 @@ pub fn shared_vtimer_offset(primary_host_counter: u64) -> u64 {
 }
 
 impl HvfVcpu<'_> {
+    // TODO(M3-nested): `nested_enabled` is an EL2 hook — deliberately retained as a
+    // stub for the M3 nested-virt milestone (HVF M3+/macOS 15+). Always `false` today.
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
         let vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
@@ -581,6 +574,9 @@ impl HvfVcpu<'_> {
     /// (`set_secondary_state`, X0 = PSCI context id). Sets EL2/GICv3/SME/CPSR,
     /// `PC = entry_addr`, and `X0 = x0`.
     fn setup_registers(&self, entry_addr: u64, x0: u64) -> Result<(), Error> {
+        // TODO(M3-nested): EL2 hook — deliberately retained as a stub for the M3
+        // nested-virt milestone (HVF M3+/macOS 15+). `nested_enabled` is always
+        // false today, so this branch is never taken on the live path.
         if self.nested_enabled {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
@@ -928,7 +924,7 @@ impl HvfVcpu<'_> {
         }
 
         if pending_irq {
-            vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
+            vcpu_set_pending_irq(self.vcpuid, true)?;
         }
 
         let ret = unsafe { hv_vcpu_run(self.vcpuid) };

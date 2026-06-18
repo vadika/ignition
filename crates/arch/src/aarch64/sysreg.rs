@@ -70,11 +70,6 @@ arm64_sys_reg!(SYSREG_CNTHV_CVAL_EL2, 3, 4, 2, 14, 3);
 
 arm64_sys_reg!(SYSREG_LORC_EL1, 3, 0, 3, 10, 4);
 
-// ICC_CTLR_EL1 (https://developer.arm.com/documentation/ddi0595/2021-06/AArch64-Registers/ICC-CTLR-EL1--Interrupt-Controller-Control-Register--EL1-)
-pub const ICC_CTLR_EL1_RSS_SHIFT: u32 = 18;
-pub const ICC_CTLR_EL1_A3V_SHIFT: u32 = 15;
-pub const ICC_CTLR_EL1_ID_BITS_SHIFT: u32 = 11;
-pub const ICC_CTLR_EL1_PRI_BITS_SHIFT: u32 = 8;
 
 pub fn sys_reg_name(addr: u32) -> Option<&'static str> {
     match addr {
