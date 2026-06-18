@@ -126,11 +126,10 @@ def fork_one(i, args, run_tok, results):
            "file_readback": None, "exit": None, "error": None}
     proc = None
     try:
-        for stale in (uds,):
-            try:
-                os.unlink(stale)
-            except FileNotFoundError:
-                pass
+        try:
+            os.unlink(uds)
+        except FileNotFoundError:
+            pass
         t0 = time.monotonic()
         cmd = [args.boot, "--restore", args.base, "--store", args.store,
                "--mem", str(args.mem), "--vsock-uds", uds,
@@ -155,7 +154,7 @@ def fork_one(i, args, run_tok, results):
         results[i] = rec
 
 
-def _teardown(results, run_tok):
+def _teardown(results):
     for rec in results:
         if not rec:
             continue
@@ -231,13 +230,13 @@ def main():
         wall_ms = round((time.monotonic() - wall0) * 1000)
         v = verdict(results)
         if args.json:
-            clean = [{k: r[k] for k in r if k != "_proc"} for r in results if r]
+            clean = [{k: r[k] for k in r if k not in ("_proc", "uds")} for r in results if r]
             print(json.dumps({"forks": clean, "wall_clock_ms": wall_ms, "verdict": v}, indent=2))
         else:
             _render_table(results, wall_ms, v)
         return 0 if v["ok"] else 1
     finally:
-        _teardown(results, run_tok)
+        _teardown(results)
 
 
 if __name__ == "__main__":

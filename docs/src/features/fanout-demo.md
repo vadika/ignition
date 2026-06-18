@@ -58,14 +58,14 @@ python3 scripts/fanout_demo.py --base tools-base -n 8
 ```console
 $ python3 scripts/fanout_demo.py --base tools-base -n 8
 fork restore_ms  exec_ms  bootid    rand        file_readback status
-0    142         38       3f9a1c…   8b2e4f7a…   8b2e4f7a…     ok
-1    151         41       3f9a1c…   c0d11e93…   c0d11e93…     ok
-2    138         37       3f9a1c…   5a7740bb…   5a7740bb…     ok
-3    160         44       3f9a1c…   91ff02ce…   91ff02ce…     ok
-4    147         39       3f9a1c…   2d6c8a14…   2d6c8a14…     ok
-5    155         42       3f9a1c…   e4b3097f…   e4b3097f…     ok
-6    144         38       3f9a1c…   77a1d650…   77a1d650…     ok
-7    149         40       3f9a1c…   0fbe23d8…   0fbe23d8…     ok
+0    142         38       3f9a1c…   8b2e4f…     8b2e4f…       ok
+1    151         41       3f9a1c…   c0d11e…     c0d11e…       ok
+2    138         37       3f9a1c…   5a7740…     5a7740…       ok
+3    160         44       3f9a1c…   91ff02…     91ff02…       ok
+4    147         39       3f9a1c…   2d6c8a…     2d6c8a…       ok
+5    155         42       3f9a1c…   e4b309…     e4b309…       ok
+6    144         38       3f9a1c…   77a1d6…     77a1d6…       ok
+7    149         40       3f9a1c…   0fbe23…     0fbe23…       ok
 
 aggregate: 8 forks, wall-clock 318 ms, restore p50/p95 149/160 ms
 verdict: lineage shared=True  randoms distinct=True  cow isolated=True  => PASS
@@ -84,7 +84,7 @@ first exec response, minus the exec itself), not an internal VMM timer.
 
 ```json
 {
-  "forks": [ { "i": 0, "bootid": "...", "rand": "...", "file_readback": "...", "exit": 0, "restore_ms": 142, "exec_ms": 38, "error": null }, ... ],
+  "forks": [ { "i": 0, "restore_ms": 142, "exec_ms": 38, "bootid": "...", "rand": "...", "file_path": "/tmp/fork-marker", "file_readback": "...", "exit": 0, "error": null }, ... ],
   "wall_clock_ms": 318,
   "verdict": { "lineage_shared": true, "randoms_distinct": true, "cow_isolated": true, "ok": true }
 }
