@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 mod model;
 mod config;
+mod vm;
 
 fn main() {
     eprintln!("ignition-fc-api: not yet wired (see api.rs/vm.rs tasks)");
