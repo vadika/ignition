@@ -62,25 +62,61 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   # URL injection: the host sends one validated URL line over vsock port 7777;
   # open-url hands it to the already-running kiosk Firefox by argv (NEVER sh -c the
   # URL). Same socat VSOCK-LISTEN pattern as the vmid listener above.
+  # open-url just records the validated URL (argv-safe; never sh -c). The
+  # kiosk-loop (cage command) picks it up and relaunches Firefox on it. We do NOT
+  # navigate a running Firefox via its remote: under cage there is no shared DBus
+  # session, so a second firefox-esr only hits the profile lock ("already running,
+  # not responding"). One firefox instance, restarted per URL, is deterministic.
   cat > /usr/bin/open-url <<'"'"'URLEOF'"'"'
 #!/bin/sh
 IFS= read -r url
+echo "[open-url] got: $url" > /dev/ttyS0 2>&1
 case "$url" in
   http://*|https://*) ;;
-  *) echo "open-url rejected: $url" >&2; exit 1 ;;
+  *) echo "[open-url] rejected: $url" > /dev/ttyS0 2>&1; exit 1 ;;
 esac
-export XDG_RUNTIME_DIR=/run/user/0
-export MOZ_ENABLE_WAYLAND=1
-for d in "$XDG_RUNTIME_DIR"/wayland-*; do
-  case "$d" in *.lock) continue ;; esac
-  [ -S "$d" ] || continue
-  WAYLAND_DISPLAY="${d##*/}"; export WAYLAND_DISPLAY; break
-done
-exec /usr/bin/firefox-esr --new-window "$url"
+echo "$url" > /run/openurl.target
+echo "[open-url] wrote target: $url" > /dev/ttyS0 2>&1
 URLEOF
   chmod +x /usr/bin/open-url
   printf "#!/bin/sh\nsocat VSOCK-LISTEN:7777,fork EXEC:/usr/bin/open-url &\n" > /etc/local.d/openurl.start
   chmod +x /etc/local.d/openurl.start
+
+  # kiosk-loop: cage runs this (not firefox directly). Runs one firefox-esr on the
+  # current URL; when open-url writes a new URL to /run/openurl.target, kills firefox
+  # and relaunches on it. Single instance, no remote/DBus/profile-lock. $1 = initial URL.
+  cat > /usr/bin/kiosk-loop <<'"'"'KIOSKEOF'"'"'
+#!/bin/sh
+# firefox-esr daemonizes (the launcher forks the real process and exits), so we
+# cannot track it by the launcher pid -- use pgrep on the real binary. Relaunch
+# ONLY when open-url writes a new URL: pkill the old instance, wait for the
+# profile lock to clear, then start a fresh --no-remote instance on the new URL.
+TARGET=/run/openurl.target
+url="${1:-about:blank}"
+: > "$TARGET"
+last=""
+start_ff() {
+  echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
+  /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1 &
+}
+start_ff
+while :; do
+  cur=$(cat "$TARGET" 2>/dev/null)
+  if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
+    last="$cur"; url="$cur"
+    echo "[kiosk-loop] navigating to: $url" > /dev/ttyS0 2>&1
+    pkill -f /usr/lib/firefox 2>/dev/null
+    while pgrep -f /usr/lib/firefox >/dev/null 2>&1; do sleep 0.2; done
+    sleep 1
+    start_ff
+  elif ! pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
+    # firefox exited on its own (crash/close) -> relaunch on the current url
+    sleep 1; start_ff
+  fi
+  sleep 0.5
+done
+KIOSKEOF
+  chmod +x /usr/bin/kiosk-loop
 
   # Net re-init on snapshot restore (same poller as the base rootfs): a restore
   # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
@@ -179,7 +215,7 @@ export MOZ_ENABLE_WAYLAND=1
 # WITH its normal toolbar and address bar. Disposability comes from the overlay
 # root + Ctrl+Alt+R reset, not from kiosk mode.
 command="/usr/bin/cage"
-command_args="-- /usr/bin/firefox-esr __HOMEPAGE__"
+command_args="-- /usr/bin/kiosk-loop __HOMEPAGE__"
 command_background=true
 pidfile="/run/cage-kiosk.pid"
 output_log="/var/log/cage.log"
