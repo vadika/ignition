@@ -27,6 +27,16 @@ def _fake_guest(uds_path, ready, request_seen):
     srv.close()
 
 
+def _fake_guest_close(uds_path, ready):
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(uds_path)
+    srv.listen(1)
+    ready.set()
+    conn, _ = srv.accept()
+    conn.close()  # accept then drop, no OK
+    srv.close()
+
+
 class TestVsockExec(unittest.TestCase):
     def test_exec_roundtrip(self):
         d = tempfile.mkdtemp()
@@ -34,7 +44,7 @@ class TestVsockExec(unittest.TestCase):
         ready, seen = threading.Event(), []
         t = threading.Thread(target=_fake_guest, args=(uds, ready, seen))
         t.start()
-        ready.wait(5)
+        assert ready.wait(5), "guest thread not ready"
         resp = fd.vsock_exec(uds, "echo hi", timeout=5.0, deadline=5.0)
         t.join(5)
         self.assertEqual(resp["exit"], 0)
@@ -42,6 +52,17 @@ class TestVsockExec(unittest.TestCase):
         self.assertFalse(resp["timed_out"])
         import json
         self.assertEqual(json.loads(seen[0])["cmd"], "echo hi")
+
+    def test_exec_closed_before_ok(self):
+        d = tempfile.mkdtemp()
+        uds = os.path.join(d, "s.sock")
+        ready = threading.Event()
+        t = threading.Thread(target=_fake_guest_close, args=(uds, ready))
+        t.start()
+        assert ready.wait(5), "guest thread not ready"
+        with self.assertRaises((IOError, OSError, TimeoutError)):
+            fd.vsock_exec(uds, "echo hi", timeout=2.0, deadline=2.0)
+        t.join(5)
 
 
 class TestParseVerdict(unittest.TestCase):

@@ -36,6 +36,9 @@ def vsock_exec(uds_path, cmd, timeout, deadline):
             if time.monotonic() >= end:
                 raise TimeoutError(f"vsock: {uds_path} never became connectable")
             time.sleep(0.05)
+    # Connect succeeded; the per-attempt connect timeout above is too tight to
+    # govern the rest of the handshake. Give the framed exchange its own budget.
+    s.settimeout(timeout)
     try:
         s.sendall(f"CONNECT {EXEC_PORT}\n".encode())
         line = b""
@@ -99,7 +102,7 @@ def parse_workload(stdout):
 
 def verdict(forks):
     """Compute the pass/fail verdict over collected per-fork records."""
-    good = [f for f in forks if not f.get("error") and f.get("exit") == 0]
+    good = [f for f in forks if f and not f.get("error") and f.get("exit") == 0]
     all_ok = len(good) == len(forks) and len(forks) > 0
     bootids = {f["bootid"] for f in good}
     rands = [f["rand"] for f in good]
@@ -174,12 +177,12 @@ def _render_table(results, wall_ms, v):
         return (x[:6] + "…") if x and len(x) > 7 else (x or "-")
     print(f"{'fork':<5}{'restore_ms':<12}{'exec_ms':<9}"
           f"{'bootid':<10}{'rand':<12}{'file_readback':<14}status")
-    for r in sorted(results, key=lambda r: r["i"]):
+    for r in sorted([r for r in results if r], key=lambda r: r["i"]):
         status = "ok" if not r["error"] else f"ERR {r['error']}"
         print(f"{r['i']:<5}{str(r['restore_ms'] or '-'):<12}"
               f"{str(r['exec_ms'] or '-'):<9}{short(r['bootid']):<10}"
               f"{short(r['rand']):<12}{short(r['file_readback']):<14}{status}")
-    rms = sorted(r["restore_ms"] for r in results if r["restore_ms"] is not None)
+    rms = sorted(r["restore_ms"] for r in results if r and r["restore_ms"] is not None)
     p = lambda q: rms[min(len(rms) - 1, int(q * len(rms)))] if rms else "-"
     print(f"\naggregate: {len(results)} forks, wall-clock {wall_ms} ms, "
           f"restore p50/p95 {p(0.5)}/{p(0.95)} ms")
@@ -207,7 +210,10 @@ def main():
         if not os.path.exists(path):
             print(f"missing {label}: {path}", file=sys.stderr)
             return 2
-    if not os.path.isdir(args.store) or not any(args.base in f for f in os.listdir(args.store)):
+    def _is_base(f):
+        return (f == args.base or f.startswith(args.base + ".")
+                or f.startswith(args.base + "-"))
+    if not os.path.isdir(args.store) or not any(_is_base(f) for f in os.listdir(args.store)):
         print(f"snapshot '{args.base}' not found in {args.store}; "
               f"run scripts/make-tools-base.sh first", file=sys.stderr)
         return 2
@@ -225,7 +231,7 @@ def main():
         wall_ms = round((time.monotonic() - wall0) * 1000)
         v = verdict(results)
         if args.json:
-            clean = [{k: r[k] for k in r if k != "_proc"} for r in results]
+            clean = [{k: r[k] for k in r if k != "_proc"} for r in results if r]
             print(json.dumps({"forks": clean, "wall_clock_ms": wall_ms, "verdict": v}, indent=2))
         else:
             _render_table(results, wall_ms, v)
