@@ -18,6 +18,7 @@ pub struct BootSource {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)] // drive_id/is_read_only accepted for FC wire-compat, intentionally unused
 pub struct Drive {
     pub drive_id: String,
     pub path_on_host: String,
@@ -28,6 +29,7 @@ pub struct Drive {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)] // iface_id/host_dev_name/guest_mac accepted for FC wire-compat, intentionally unused
 pub struct NetworkInterface {
     pub iface_id: String,
     #[serde(default)]
@@ -47,6 +49,7 @@ pub struct VmUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // mem_file_path/snapshot_type accepted for FC wire-compat, intentionally unused
 pub struct SnapshotCreate {
     pub snapshot_path: String,
     #[serde(default)]
@@ -56,6 +59,7 @@ pub struct SnapshotCreate {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // mem_file_path/enable_diff_snapshots accepted for FC wire-compat, intentionally unused
 pub struct SnapshotLoad {
     pub snapshot_path: String,
     #[serde(default)]

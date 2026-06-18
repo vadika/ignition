@@ -6,6 +6,7 @@ use std::process::Child;
 use crate::config::VmConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Stopped reserved for a future teardown transition; not reached in v1
 pub enum State { NotStarted, Running, Paused, Stopped }
 
 impl State {

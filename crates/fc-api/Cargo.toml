@@ -9,7 +9,7 @@ name = "ignition-fc-api"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "io-util", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal", "time"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
