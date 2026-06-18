@@ -59,6 +59,29 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   printf "#!/bin/sh\nsocat VSOCK-LISTEN:9000,fork EXEC:/usr/bin/vmid-reseed &\n" > /etc/local.d/vmid.start
   chmod +x /etc/local.d/vmid.start
 
+  # URL injection: the host sends one validated URL line over vsock port 7777;
+  # open-url hands it to the already-running kiosk Firefox by argv (NEVER sh -c the
+  # URL). Same socat VSOCK-LISTEN pattern as the vmid listener above.
+  cat > /usr/bin/open-url <<'"'"'URLEOF'"'"'
+#!/bin/sh
+IFS= read -r url
+case "$url" in
+  http://*|https://*) ;;
+  *) echo "open-url rejected: $url" >&2; exit 1 ;;
+esac
+export XDG_RUNTIME_DIR=/run/user/0
+export MOZ_ENABLE_WAYLAND=1
+for d in "$XDG_RUNTIME_DIR"/wayland-*; do
+  case "$d" in *.lock) continue ;; esac
+  [ -S "$d" ] || continue
+  WAYLAND_DISPLAY="${d##*/}"; export WAYLAND_DISPLAY; break
+done
+exec /usr/bin/firefox-esr --new-window "$url"
+URLEOF
+  chmod +x /usr/bin/open-url
+  printf "#!/bin/sh\nsocat VSOCK-LISTEN:7777,fork EXEC:/usr/bin/open-url &\n" > /etc/local.d/openurl.start
+  chmod +x /etc/local.d/openurl.start
+
   # Net re-init on snapshot restore (same poller as the base rootfs): a restore
   # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
   # link down->up. Without this, a restored/cloned GUI guest keeps the snapshot
