@@ -44,5 +44,41 @@ class TestVsockExec(unittest.TestCase):
         self.assertEqual(json.loads(seen[0])["cmd"], "echo hi")
 
 
+class TestParseVerdict(unittest.TestCase):
+    def test_parse_workload(self):
+        out = "BOOTID=3f9a\nRAND=a17c4e\nFILE=/tmp/fork-marker:a17c4e\n"
+        rec = fd.parse_workload(out)
+        self.assertEqual(rec, {"bootid": "3f9a", "rand": "a17c4e",
+                               "file_path": "/tmp/fork-marker",
+                               "file_readback": "a17c4e"})
+
+    def test_verdict_pass(self):
+        forks = [
+            {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
+            {"bootid": "x", "rand": "b", "file_readback": "b", "exit": 0, "error": None},
+        ]
+        v = fd.verdict(forks)
+        self.assertTrue(v["lineage_shared"])
+        self.assertTrue(v["randoms_distinct"])
+        self.assertTrue(v["cow_isolated"])
+        self.assertTrue(v["ok"])
+
+    def test_verdict_fails_on_dup_random(self):
+        forks = [
+            {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
+            {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
+        ]
+        v = fd.verdict(forks)
+        self.assertFalse(v["randoms_distinct"])
+        self.assertFalse(v["ok"])
+
+    def test_verdict_fails_on_error(self):
+        forks = [
+            {"bootid": "x", "rand": "a", "file_readback": "a", "exit": 0, "error": None},
+            {"bootid": None, "rand": None, "file_readback": None, "exit": None, "error": "timeout"},
+        ]
+        self.assertFalse(fd.verdict(forks)["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

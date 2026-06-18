@@ -67,3 +67,48 @@ def _recvn(s, n):
             raise IOError("vsock: truncated frame")
         buf += chunk
     return buf
+
+
+WORKLOAD = (
+    "r=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \\n'); "
+    "printf 'BOOTID=%s\\n' \"$(cat /proc/sys/kernel/random/boot_id)\"; "
+    "printf 'RAND=%s\\n' \"$r\"; "
+    "m=/tmp/fork-marker; printf '%s' \"$r\" > \"$m\"; "
+    "printf 'FILE=%s:%s\\n' \"$m\" \"$(cat \"$m\")\""
+)
+
+
+def parse_workload(stdout):
+    """Parse the BOOTID/RAND/FILE lines the workload prints. Returns a dict;
+    raises ValueError if a field is missing."""
+    fields = {}
+    for ln in stdout.splitlines():
+        if ln.startswith("BOOTID="):
+            fields["bootid"] = ln[len("BOOTID="):].strip()
+        elif ln.startswith("RAND="):
+            fields["rand"] = ln[len("RAND="):].strip()
+        elif ln.startswith("FILE="):
+            path, _, val = ln[len("FILE="):].partition(":")
+            fields["file_path"] = path.strip()
+            fields["file_readback"] = val.strip()
+    missing = {"bootid", "rand", "file_path", "file_readback"} - fields.keys()
+    if missing:
+        raise ValueError(f"workload output missing {missing}: {stdout!r}")
+    return fields
+
+
+def verdict(forks):
+    """Compute the pass/fail verdict over collected per-fork records."""
+    good = [f for f in forks if not f.get("error") and f.get("exit") == 0]
+    all_ok = len(good) == len(forks) and len(forks) > 0
+    bootids = {f["bootid"] for f in good}
+    rands = [f["rand"] for f in good]
+    lineage = all_ok and len(bootids) == 1
+    distinct = all_ok and len(set(rands)) == len(rands)
+    cow = all_ok and all(f["rand"] == f["file_readback"] for f in good)
+    return {
+        "lineage_shared": lineage,
+        "randoms_distinct": distinct,
+        "cow_isolated": cow,
+        "ok": bool(all_ok and lineage and distinct and cow),
+    }
