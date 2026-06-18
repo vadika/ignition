@@ -250,10 +250,6 @@ impl FuzzController {
         }
     }
 
-    pub fn is_captured(&self) -> bool { self.captured }
-    pub fn iterations(&self) -> u64 { self.iterations }
-    pub fn crash_count(&self) -> u64 { self.crash_count }
-
     fn live_ram(&mut self) -> &mut [u8] {
         // SAFETY: see struct doc; single-threaded, mapping outlives the run.
         unsafe { std::slice::from_raw_parts_mut(self.ram_ptr, self.ram_len) }

@@ -70,13 +70,6 @@ impl Metrics {
         }
     }
 
-    pub fn capped(&self) -> bool {
-        self.capped
-    }
-    pub fn first_crash_secs(&self) -> Option<f64> {
-        self.first_crash_secs
-    }
-
     /// Render the machine-parseable report block consumed by
     /// `scripts/fuzz_m3_bench.py`. `iterations`/`elapsed_secs` come from the
     /// controller (the loop counter and the run clock).
@@ -144,7 +137,7 @@ mod tests {
         let mut m = Metrics::new();
         m.record_first_crash(1.5);
         m.record_first_crash(9.9);
-        assert_eq!(m.first_crash_secs(), Some(1.5));
+        assert!(m.report(0, 0.0).contains("time_to_crash_s=1.500"));
     }
 
     #[test]
@@ -172,6 +165,6 @@ mod tests {
         for _ in 0..(SAMPLE_CAP + 10) {
             m.record_dirty(1);
         }
-        assert!(m.capped());
+        assert!(m.report(0, 0.0).contains("capped=true"));
     }
 }

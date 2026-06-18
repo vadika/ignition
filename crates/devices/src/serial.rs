@@ -38,9 +38,6 @@ impl Trigger for SerialIrq {
     }
 }
 
-/// Back-compat alias for the smoke tests / output-only harnesses.
-pub type NoopTrigger = SerialIrq;
-
 /// Serializable snapshot of the 16550 register state (mirrors `vm_superio::serial::SerialState`
 /// minus the RX FIFO buffer — a few buffered bytes lost on restore is acceptable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

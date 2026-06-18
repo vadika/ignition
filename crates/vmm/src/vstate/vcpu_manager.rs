@@ -195,6 +195,38 @@ impl VcpuManager {
         self.reset_point.lock().unwrap().is_some()
     }
 
+    /// Shared prologue for snapshot/checkpoint/reset. Freezes CPU_ON under the
+    /// `running` lock so no claim races the latch, rejects a re-entrant request
+    /// while one is still in flight, latches the participant set (the vCPUs already
+    /// registered — a CPU_ON mid-spawn is the documented mid-boot exclusion), and
+    /// sizes the rendezvous barrier. Returns the latched ids on success, or `None`
+    /// (already unfrozen) if there is nothing to do. Caller sets its own `*_req`
+    /// and broadcasts the exits via `broadcast_exit`.
+    fn begin_rendezvous(&self) -> Option<Vec<u64>> {
+        {
+            let _running = self.running.lock().unwrap();
+            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
+                return None;
+            }
+        }
+        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
+        if ids.is_empty() {
+            // No vCPU has registered yet; unfreeze and bail so a later request works.
+            self.rendezvous_active.store(false, Ordering::Relaxed);
+            return None;
+        }
+        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        Some(ids)
+    }
+
+    /// Interrupt every latched vCPU so each exits to `Canceled` and joins the
+    /// rendezvous. Call after the relevant `*_req` flag is set with Release.
+    fn broadcast_exit(ids: Vec<u64>) {
+        for id in ids {
+            let _ = ignition_hvf::vcpu_request_exit(id);
+        }
+    }
+
     /// Request a snapshot. Freezes CPU_ON, latches the participant set, sizes the
     /// rendezvous barrier, and interrupts every registered vCPU so each exits to
     /// `Canceled` and joins the rendezvous. No-op if no handler is installed.
@@ -202,31 +234,10 @@ impl VcpuManager {
         if self.snapshot_handler.is_none() {
             return;
         }
-        // Freeze CPU_ON under the `running` lock so no claim races the latch.
-        // Reject a re-entrant request while a snapshot is still in flight — it
-        // would clear `collected` before the in-flight leader drains it.
-        {
-            let _running = self.running.lock().unwrap();
-            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
-                return;
-            }
-        }
-        // Participants = the vCPUs already registered (running their loop). A
-        // CPU_ON mid-spawn (claimed but not yet registered) is the documented
-        // mid-boot exclusion; snapshots are taken after boot.
-        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
-        if ids.is_empty() {
-            // No vCPU has registered yet; nothing to snapshot. Unfreeze and bail
-            // so a later snapshot still works.
-            self.rendezvous_active.store(false, Ordering::Relaxed);
-            return;
-        }
-        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        let Some(ids) = self.begin_rendezvous() else { return };
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
-        for id in ids {
-            let _ = ignition_hvf::vcpu_request_exit(id);
-        }
+        Self::broadcast_exit(ids);
     }
 
     /// Request a checkpoint. Mirrors `request_snapshot`: freezes CPU_ON, latches
@@ -237,23 +248,10 @@ impl VcpuManager {
         if self.checkpoint_handler.is_none() {
             return;
         }
-        {
-            let _running = self.running.lock().unwrap();
-            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
-                return;
-            }
-        }
-        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
-        if ids.is_empty() {
-            self.rendezvous_active.store(false, Ordering::Relaxed);
-            return;
-        }
-        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        let Some(ids) = self.begin_rendezvous() else { return };
         self.collected.lock().unwrap().clear();
         self.checkpoint_req.store(true, Ordering::Release);
-        for id in ids {
-            let _ = ignition_hvf::vcpu_request_exit(id);
-        }
+        Self::broadcast_exit(ids);
     }
 
     /// Request a reset. Freezes CPU_ON, latches the participant set, sizes the
@@ -265,27 +263,9 @@ impl VcpuManager {
         if self.reset_handler.is_none() || self.reset_point.lock().unwrap().is_none() {
             return;
         }
-        {
-            let _running = self.running.lock().unwrap();
-            if self.rendezvous_active.swap(true, Ordering::Relaxed) {
-                return;
-            }
-        }
-        let ids: Vec<u64> = self.vcpuids.lock().unwrap().clone();
-        if ids.is_empty() {
-            self.rendezvous_active.store(false, Ordering::Relaxed);
-            return;
-        }
-        *self.snap_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(ids.len())));
+        let Some(ids) = self.begin_rendezvous() else { return };
         self.reset_req.store(true, Ordering::Release);
-        for id in ids {
-            let _ = ignition_hvf::vcpu_request_exit(id);
-        }
-    }
-
-    /// The HVF vcpuid of the primary vCPU (index 0), if it has been registered.
-    pub fn primary_vcpuid(&self) -> Option<u64> {
-        self.vcpuids.lock().unwrap().first().copied()
+        Self::broadcast_exit(ids);
     }
 
     /// Try to claim `mpidr` for a bring-up. Idempotent guard against unknown or
@@ -637,7 +617,7 @@ impl VcpuManager {
                         // Barrier 1: a full happens-before edge — every push is
                         // visible to the leader after this returns.
                         if bar.wait().is_leader() {
-                            self.run_snapshot_leader();
+                            self.run_collect_leader(&self.snapshot_handler, &self.snapshot_req, "snapshot");
                         }
                         // Barrier 2: peers wait here while the leader writes;
                         // release together and resume.
@@ -658,7 +638,7 @@ impl VcpuManager {
                         // Barrier 1: a full happens-before edge — every push is
                         // visible to the leader after this returns.
                         if bar.wait().is_leader() {
-                            self.run_checkpoint_leader();
+                            self.run_collect_leader(&self.checkpoint_handler, &self.checkpoint_req, "checkpoint");
                         }
                         // Barrier 2: peers wait here while the leader builds the
                         // reset point; release together and resume.
@@ -709,10 +689,16 @@ impl VcpuManager {
 
     /// Runs on the single leader thread between the two rendezvous barriers, with
     /// every other vCPU parked. Drains the collected per-vCPU states, aborts on
-    /// any save failure (no torn snapshot), else invokes the handler. Always
-    /// clears the snapshot flags before returning so the second barrier resumes a
-    /// clean state.
-    fn run_snapshot_leader(self: &Arc<Self>) {
+    /// any save failure (no torn collection), else invokes `handler`. Always
+    /// clears `req` (and `rendezvous_active`) before returning so the second
+    /// barrier resumes a clean state. `what` names the operation in log lines
+    /// ("snapshot" or "checkpoint").
+    fn run_collect_leader(
+        self: &Arc<Self>,
+        handler: &Option<SnapshotHandler>,
+        req: &AtomicBool,
+        what: &str,
+    ) {
         let mut items = std::mem::take(&mut *self.collected.lock().unwrap());
         items.sort_by_key(|(mpidr, _)| *mpidr);
 
@@ -730,64 +716,22 @@ impl VcpuManager {
 
         match failed {
             Some((mpidr, e)) => {
-                log::error!("snapshot aborted: vcpu {mpidr:#x} save_state failed: {e}");
+                log::error!("{what} aborted: vcpu {mpidr:#x} save_state failed: {e}");
             }
             None => {
-                if let Some(h) = &self.snapshot_handler {
+                if let Some(h) = handler {
                     // A panic in the handler must not unwind the vCPU thread.
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         h(checkpoints)
                     }));
                     if r.is_err() {
-                        log::error!("snapshot handler panicked; guest resumed");
+                        log::error!("{what} handler panicked; guest resumed");
                     }
                 }
             }
         }
 
-        self.snapshot_req.store(false, Ordering::Release);
-        self.rendezvous_active.store(false, Ordering::Relaxed);
-    }
-
-    /// Runs on the single leader thread between the two rendezvous barriers, with
-    /// every other vCPU parked. Drains the collected per-vCPU states, aborts on
-    /// any save failure, else invokes the checkpoint handler (which builds and
-    /// stores the `ResetPoint`). Always clears the checkpoint flags before
-    /// returning so the second barrier resumes a clean state.
-    fn run_checkpoint_leader(self: &Arc<Self>) {
-        let mut items = std::mem::take(&mut *self.collected.lock().unwrap());
-        items.sort_by_key(|(mpidr, _)| *mpidr);
-
-        let mut checkpoints = Vec::with_capacity(items.len());
-        let mut failed = None;
-        for (mpidr, res) in items {
-            match res {
-                Ok(state) => checkpoints.push(VcpuCheckpoint { mpidr, state }),
-                Err(e) => {
-                    failed = Some((mpidr, e));
-                    break;
-                }
-            }
-        }
-
-        match failed {
-            Some((mpidr, e)) => {
-                log::error!("checkpoint aborted: vcpu {mpidr:#x} save_state failed: {e}");
-            }
-            None => {
-                if let Some(h) = &self.checkpoint_handler {
-                    // A panic in the handler must not unwind the vCPU thread.
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        h(checkpoints)
-                    }));
-                    if r.is_err() {
-                        log::error!("checkpoint handler panicked; guest resumed");
-                    }
-                }
-            }
-        }
-
-        self.checkpoint_req.store(false, Ordering::Release);
+        req.store(false, Ordering::Release);
         self.rendezvous_active.store(false, Ordering::Relaxed);
     }
 

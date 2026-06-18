@@ -6,8 +6,6 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 
 use ignition_hvf::VcpuState;
@@ -39,7 +37,6 @@ pub enum SnapshotType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotManifest {
     pub name: String,
-    pub created: u64, // seconds since the Unix epoch
     pub mem_size: u64,
     pub vcpu_count: u64,
     pub snapshot_type: SnapshotType,
@@ -47,18 +44,10 @@ pub struct SnapshotManifest {
 }
 
 impl SnapshotManifest {
-    fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    }
-
     /// A self-contained base snapshot with no parent.
     pub fn new_full(name: String, mem_size: u64, vcpu_count: u64) -> Self {
         Self {
             name,
-            created: Self::now_secs(),
             mem_size,
             vcpu_count,
             snapshot_type: SnapshotType::Full,
@@ -70,7 +59,6 @@ impl SnapshotManifest {
     pub fn new_diff(name: String, parent: String, mem_size: u64, vcpu_count: u64) -> Self {
         Self {
             name,
-            created: Self::now_secs(),
             mem_size,
             vcpu_count,
             snapshot_type: SnapshotType::Diff,
