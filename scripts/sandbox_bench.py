@@ -37,11 +37,13 @@ def _pct(xs, q):
 
 
 def run_one(mode, i, args, run_tok):
-    """Spawn one sandbox in `mode` ('cold'|'hot'), run the workload over vsock,
-    record timings + output, then kill the child. Never raises to the pool."""
+    """Spawn one sandbox in `mode` ('cold'|'hot'), run the workload TWICE over
+    vsock, and kill the child. exec1 is the first run (on a hot restore it faults
+    the working set in from the demand-paged snapshot clone); exec2 is the warm
+    run (pages now resident) and should match cold. Never raises to the pool."""
     uds = f"/tmp/sbench-{run_tok}-{mode}-{i}.sock"
-    rec = {"i": i, "mode": mode, "ready_ms": None, "exec_ms": None,
-           "exit": None, "ok_output": False, "error": None}
+    rec = {"i": i, "mode": mode, "ready_ms": None, "exec1_ms": None,
+           "exec2_ms": None, "exit": None, "ok_output": False, "error": None}
     proc = None
     try:
         try:
@@ -60,16 +62,21 @@ def run_one(mode, i, args, run_tok):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         sock = fd.vsock_connect(uds, deadline=args.deadline)
         rec["ready_ms"] = round((time.monotonic() - t0) * 1000)
-        te0 = time.monotonic()
-        resp = fd.vsock_run(sock, WORKLOAD, timeout=args.timeout)
-        rec["exec_ms"] = round((time.monotonic() - te0) * 1000)
-        rec["exit"] = resp.get("exit")
-        if resp.get("timed_out") or resp.get("exit") != 0:
-            rec["error"] = f"exec exit={resp.get('exit')} timed_out={resp.get('timed_out')}"
-        else:
+        for key in ("exec1_ms", "exec2_ms"):
+            # vsock_run closes the socket; reconnect for the warm run (the
+            # listener is already up, so this connect is cheap).
+            s = sock if key == "exec1_ms" else fd.vsock_connect(uds, deadline=args.deadline)
+            te = time.monotonic()
+            resp = fd.vsock_run(s, WORKLOAD, timeout=args.timeout)
+            rec[key] = round((time.monotonic() - te) * 1000)
+            rec["exit"] = resp.get("exit")
+            if resp.get("timed_out") or resp.get("exit") != 0:
+                rec["error"] = f"exec exit={resp.get('exit')} timed_out={resp.get('timed_out')}"
+                break
             rec["ok_output"] = resp.get("stdout", "").strip().startswith(EXPECT_PREFIX)
             if not rec["ok_output"]:
                 rec["error"] = f"unexpected output: {resp.get('stdout', '')!r}"
+                break
     except Exception as e:  # noqa: BLE001 - bench driver, report per-sandbox
         rec["error"] = str(e)
     finally:
@@ -97,22 +104,24 @@ def run_mode(mode, args, run_tok):
 
 def summarize(mode, recs, wall_ms):
     ok = [r for r in recs if not r["error"]]
-    rdy = [r["ready_ms"] for r in ok if r["ready_ms"] is not None]
-    ex = [r["exec_ms"] for r in ok if r["exec_ms"] is not None]
     mean = lambda xs: round(sum(xs) / len(xs)) if xs else None
+    col = lambda k: [r[k] for r in ok if r[k] is not None]
+    stat = lambda k: {"p50": _pct(col(k), 0.5), "p95": _pct(col(k), 0.95), "mean": mean(col(k))}
     return {
         "mode": mode, "n": len(recs), "ok": len(ok), "failed": len(recs) - len(ok),
-        "ready_ms": {"p50": _pct(rdy, 0.5), "p95": _pct(rdy, 0.95), "mean": mean(rdy)},
-        "exec_ms": {"p50": _pct(ex, 0.5), "p95": _pct(ex, 0.95), "mean": mean(ex)},
+        "ready_ms": stat("ready_ms"),
+        "exec1_ms": stat("exec1_ms"),  # first run: faults working set in (hot)
+        "exec2_ms": stat("exec2_ms"),  # warm run: pages resident
         "wall_clock_ms": wall_ms,
     }
 
 
 def _print_summary(s):
-    r, e = s["ready_ms"], s["exec_ms"]
-    print(f"  {s['mode']:<5} n={s['n']} ok={s['ok']} failed={s['failed']}  "
-          f"ready p50/p95/mean {r['p50']}/{r['p95']}/{r['mean']} ms  "
-          f"exec p50/p95/mean {e['p50']}/{e['p95']}/{e['mean']} ms  "
+    r, e1, e2 = s["ready_ms"], s["exec1_ms"], s["exec2_ms"]
+    print(f"  {s['mode']:<8} n={s['n']} ok={s['ok']} failed={s['failed']}  "
+          f"ready p50/p95 {r['p50']}/{r['p95']} ms  "
+          f"exec1(cold-pages) p50/p95 {e1['p50']}/{e1['p95']} ms  "
+          f"exec2(warm) p50/p95 {e2['p50']}/{e2['p95']} ms  "
           f"wall {s['wall_clock_ms']} ms")
 
 
