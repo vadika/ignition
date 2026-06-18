@@ -16,7 +16,7 @@ docker run --platform linux/arm64 --name fcroot_tools_build \
   -v "$(cd "$(dirname "$0")" && pwd)/vmid-reseed.c:/vmid-reseed.c:ro" \
   -v "$(cd "$(dirname "$0")" && pwd)/ign-exec.py:/ign-exec.py:ro" \
   alpine:3.19 sh -euxc '
-  apk add --no-cache openrc util-linux ifupdown-ng socat python3 py3-pip git gcc musl-dev linux-headers coreutils
+  apk add --no-cache openrc util-linux ifupdown-ng socat python3 py3-pip py3-numpy git gcc musl-dev linux-headers coreutils
 
   # The tools base intentionally keeps the C toolchain and kernel headers so
   # sandboxed agents can compile (including against linux headers) with no
@@ -94,7 +94,7 @@ docker run --rm -v "$STAGE:/work" ubuntu:22.04 bash -euxc '
   rm -f /tmp/rootfs/.dockerenv
   for d in dev proc run sys tmp mnt; do mkdir -p /tmp/rootfs/$d; done
   rm -f /work/out/rootfs-tools.ext4
-  mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs-tools /work/out/rootfs-tools.ext4 512M
+  mke2fs -q -t ext4 -d /tmp/rootfs -L rootfs-tools /work/out/rootfs-tools.ext4 768M
   ls -la /work/out/rootfs-tools.ext4
 '
 

@@ -19,43 +19,39 @@ MAX_FRAME = 64 * 1024 * 1024
 def vsock_connect(uds_path, deadline):
     """Connect to the guest ign-exec agent and complete the CONNECT/OK handshake.
 
-    Retries connect() until `deadline` seconds elapse (the control UDS appears
-    only once boot wires up vsock). Returns a live socket with a generous
-    timeout set; raises on protocol/timeout failure. This is the spawn ->
-    guest-ready latency, i.e. the real fork cost."""
+    Retries the FULL connect + handshake until `deadline` seconds elapse, and
+    returns a live socket. Two things race: the control UDS appears only once
+    boot wires up vsock, and the guest's port-7000 listener comes up later still
+    (on a cold boot, ~hundreds of ms after the UDS, via openrc). boot answers a
+    CONNECT to a not-yet-listening port by closing the connection, so the
+    handshake itself must be retried, not just connect(). On a hot restore the
+    listener is already up, so the first attempt succeeds. This is the spawn ->
+    guest-ready latency, i.e. the real fork/boot cost. Raises on timeout."""
     end = time.monotonic() + deadline
-    s = None
     while True:
+        s = None
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(max(0.1, end - time.monotonic()))
+            s.settimeout(max(0.5, end - time.monotonic()))
             s.connect(uds_path)
-            break
-        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            s.sendall(f"CONNECT {EXEC_PORT}\n".encode())
+            line = b""
+            while not line.endswith(b"\n"):
+                b = s.recv(1)
+                if not b:
+                    raise IOError("vsock: connection closed before OK")
+                line += b
+                if len(line) > 128:
+                    raise IOError("vsock: oversized ack line")
+            if not line.startswith(b"OK "):
+                raise IOError(f"vsock: expected OK, got {line!r}")
+            return s
+        except (OSError, IOError) as e:  # OSError covers connect + IOError handshake failures
             if s:
                 s.close()
             if time.monotonic() >= end:
-                raise TimeoutError(f"vsock: {uds_path} never became connectable")
+                raise TimeoutError(f"vsock: {uds_path} not ready before deadline (last: {e})")
             time.sleep(0.05)
-    # Connect succeeded; the per-attempt connect timeout above is too tight to
-    # govern the rest of the handshake. Give the framed exchange its own budget.
-    s.settimeout(max(1.0, end - time.monotonic()))
-    try:
-        s.sendall(f"CONNECT {EXEC_PORT}\n".encode())
-        line = b""
-        while not line.endswith(b"\n"):
-            b = s.recv(1)
-            if not b:
-                raise IOError("vsock: connection closed before OK")
-            line += b
-            if len(line) > 128:
-                raise IOError("vsock: oversized ack line")
-        if not line.startswith(b"OK "):
-            raise IOError(f"vsock: expected OK, got {line!r}")
-    except Exception:
-        s.close()
-        raise
-    return s
 
 
 def vsock_run(sock, cmd, timeout):
