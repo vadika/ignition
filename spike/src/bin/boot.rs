@@ -165,14 +165,12 @@ impl Drop for TermiosGuard {
     }
 }
 
-/// Resources the checkpoint/reset handlers capture. `mem_file` is `Some` in
-/// restore mode (instance memory.bin -> clonefile pristine) and `None` for a
-/// fresh boot (MAP_ANON -> owned copy).
+/// Resources the checkpoint/reset handlers capture. The checkpoint always takes
+/// an owned heap copy of live RAM (works for both MAP_ANON fresh boot and
+/// MAP_PRIVATE restore), so no backing file is needed.
 struct ResetWiring {
     host_usize: usize,
     ram_size: u64,
-    mem_file: Option<PathBuf>,
-    inst_dir: PathBuf,
     gic: Arc<HvfGicV3>,
     frozen: Arc<FrozenDevices>,
     dirty: Option<DirtyTracker>,
@@ -189,8 +187,6 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
         let point = point.clone();
         let host_usize = w.host_usize;
         let ram_size = w.ram_size;
-        let mem_file = w.mem_file.clone();
-        let inst_dir = w.inst_dir.clone();
         let gic = w.gic.clone();
         let frozen = w.frozen.clone();
         let dirty = w.dirty.clone();
@@ -201,25 +197,10 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             let live: &[u8] = unsafe {
                 std::slice::from_raw_parts(host_usize as *const u8, ram_size as usize)
             };
-            let pristine = match &mem_file {
-                Some(src) => {
-                    // MAP_SHARED -> flush so the clonefile sees current RAM.
-                    let rc = unsafe { libc::msync(host_usize as *mut libc::c_void, ram_size as usize, libc::MS_SYNC) };
-                    if rc != 0 {
-                        eprintln!("[checkpoint] msync failed ({}); pristine may be slightly stale", std::io::Error::last_os_error());
-                    }
-                    let dst = inst_dir.join("pristine.bin");
-                    let _ = std::fs::remove_file(&dst);
-                    match ignition_vmm::reset::PristineRam::from_clone(src, &dst, ram_size as usize) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("[checkpoint] clonefile pristine failed ({e}); falling back to copy");
-                            ignition_vmm::reset::PristineRam::from_copy(live)
-                        }
-                    }
-                }
-                None => ignition_vmm::reset::PristineRam::from_copy(live),
-            };
+            // Always an owned heap copy of current RAM. Under MAP_PRIVATE restore
+            // there is no file backing live RAM to clonefile; under MAP_ANON fresh
+            // boot there never was. One uniform path.
+            let pristine = ignition_vmm::reset::PristineRam::from_copy(live);
             let gic_blob = match gic.save_state() {
                 Ok(b) => b,
                 Err(e) => {
@@ -1309,8 +1290,6 @@ fn main() {
     install_reset_handlers(&mut manager, ResetWiring {
         host_usize: host as usize,
         ram_size,
-        mem_file: None,
-        inst_dir: std::env::temp_dir(),
         gic: gic.clone(),
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
@@ -1916,35 +1895,32 @@ fn run_restore(
     let inst_dir = snapshot::instance_dir(store, restore_name, process::id());
     let _ = fs::remove_dir_all(&inst_dir);
     fs::create_dir_all(&inst_dir)?;
-    let inst_mem = inst_dir.join("memory.bin");
-    // Clone the ROOT memory.bin (not the leaf — a Diff leaf's memory.bin is only its
-    // packed dirty pages). Diff layers are overlaid onto this clone below.
-    snapshot::clonefile_or_copy(&root_paths.memory, &inst_mem)?;
     let t_clone = restore_start.elapsed();
 
-    // 2. Map the instance memory.bin as guest RAM. MAP_SHARED: pages fault in lazily
-    //    from the clone, and guest writes land in the clone (APFS copy-on-writes the
-    //    block off the base on first write) — the base is never touched.
-    let memf = fs::OpenOptions::new().read(true).write(true).open(&inst_mem)?;
+    // 2. Map the shared, immutable base memory.bin MAP_PRIVATE as guest RAM:
+    //    guest writes copy-on-write to anonymous pages (the base is never
+    //    modified), and every restore maps the SAME base vnode, so its page
+    //    cache stays warm across launches. No per-instance memory clone.
+    let basef = fs::File::open(&root_paths.memory)?;
     let host = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             mem_size as usize,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            memf.as_raw_fd(),
+            libc::MAP_PRIVATE,
+            basef.as_raw_fd(),
             0,
         )
     };
     if host == libc::MAP_FAILED {
-        return Err(io::Error::other("mmap of instance memory.bin failed"));
+        return Err(io::Error::other("mmap of base memory.bin failed"));
     }
-    drop(memf); // the mapping keeps the underlying file alive after the fd closes
+    drop(basef); // the mapping keeps the underlying file alive after the fd closes
     let host_addr = host as u64;
     let t_mmap = restore_start.elapsed();
 
-    // 2b. Overlay each Diff layer in order onto the MAP_SHARED clone. Writes land in
-    //     the private instance file (APFS CoWs the block off the root on first write),
+    // 2b. Overlay each Diff layer in order onto the MAP_PRIVATE mapping. Writes
+    //     copy-on-write to private anon pages (the base file stays immutable),
     //     so every stored layer — root and diffs — stays byte-for-byte immutable.
     //     Done BEFORE the vCPUs run so the guest sees the fully reassembled RAM.
     if chain.len() > 1 {
@@ -2251,11 +2227,19 @@ fn run_restore(
     let q_dirty = restore_start.elapsed();
 
     // Seed the reset point: the restored snapshot IS the default Ctrl-A r target.
+    // Full snapshot (single layer): the immutable base file IS the post-restore
+    // image, so map it read-only (zero copy, shares the warm vnode). Diff chain:
+    // the reassembled image lives only in the MAP_PRIVATE pages, so take an owned
+    // heap copy of live RAM.
     {
-        let pristine_dst = inst_dir.join("pristine.bin");
-        let _ = fs::remove_file(&pristine_dst);
-        let pristine = ignition_vmm::reset::PristineRam::from_clone(&inst_mem, &pristine_dst, mem_size as usize)
-            .map_err(|e| io::Error::other(format!("seed pristine clonefile: {e}")))?;
+        let pristine = if chain.len() == 1 {
+            ignition_vmm::reset::PristineRam::map_file_ro(&root_paths.memory, mem_size as usize)
+                .map_err(|e| io::Error::other(format!("seed pristine map_file_ro: {e}")))?
+        } else {
+            let live: &[u8] =
+                unsafe { std::slice::from_raw_parts(host as *const u8, mem_size as usize) };
+            ignition_vmm::reset::PristineRam::from_copy(live)
+        };
         *manager.reset_point().lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
             pristine,
             vcpus: snap.vcpus.clone(),
@@ -2268,8 +2252,6 @@ fn run_restore(
     install_reset_handlers(&mut manager, ResetWiring {
         host_usize: host as usize,
         ram_size: mem_size,
-        mem_file: Some(inst_mem.clone()),
-        inst_dir: inst_dir.clone(),
         gic: gic.clone(),
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
