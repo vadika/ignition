@@ -21,6 +21,4 @@ ignition-vmnet = { path = "../crates/vmnet" }
 ignition-sandbox = { path = "../crates/sandbox" }
 winit = "0.30"
 softbuffer = "0.4"
-
-[dev-dependencies]
 serde_json = "1"

@@ -244,11 +244,11 @@ impl VcpuManager {
     /// `Canceled` and joins the rendezvous. No-op if no handler is installed.
     /// `name` overrides the launch-time write name when `Some` (the control
     /// socket); `None` keeps it (the serial Ctrl-A path).
-    pub fn request_snapshot(&self, name: Option<&str>) {
+    pub fn request_snapshot(&self, name: Option<&str>) -> bool {
         if self.snapshot_handler.is_none() {
-            return;
+            return false;
         }
-        let Some(ids) = self.begin_rendezvous() else { return };
+        let Some(ids) = self.begin_rendezvous() else { return false };
         *self.snapshot_name.lock().unwrap() = name.map(str::to_string);
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
@@ -260,6 +260,7 @@ impl VcpuManager {
         while self.rendezvous_active.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
+        true
     }
 
     /// Request a checkpoint. Mirrors `request_snapshot`: freezes CPU_ON, latches

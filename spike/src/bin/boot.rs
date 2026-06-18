@@ -387,6 +387,74 @@ fn spawn_stdin_reader(
     });
 }
 
+/// Parse one control line and run the matching VcpuManager request. Returns the
+/// JSON response line. Unknown actions and malformed JSON return an error reply.
+/// The `{"ok":true}` reply is synchronous for `snapshot` and `resume` (they block
+/// until their rendezvous completes); for `checkpoint`, `reset`, and `pause` it is
+/// a receipt-of-request, returned as soon as the request is broadcast.
+fn dispatch_control(
+    line: &str,
+    manager: &ignition_vmm::vstate::vcpu_manager::VcpuManager,
+) -> String {
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return format!("{{\"ok\":false,\"error\":\"bad json: {e}\"}}"),
+    };
+    match v.get("action").and_then(|a| a.as_str()) {
+        Some("snapshot") => {
+            let name = v.get("name").and_then(|n| n.as_str());
+            if manager.request_snapshot(name) {
+                "{\"ok\":true}".to_string()
+            } else {
+                "{\"ok\":false,\"error\":\"snapshot did not run (no handler or rendezvous busy)\"}".to_string()
+            }
+        }
+        Some("checkpoint") => { manager.request_checkpoint(); "{\"ok\":true}".to_string() }
+        Some("reset") => { manager.request_reset(); "{\"ok\":true}".to_string() }
+        Some("pause") => { manager.request_pause(); "{\"ok\":true}".to_string() }
+        Some("resume") => { manager.request_resume(); "{\"ok\":true}".to_string() }
+        other => format!("{{\"ok\":false,\"error\":\"unknown action: {other:?}\"}}"),
+    }
+}
+
+/// Bind a control unix socket and serve line-JSON commands (one request line ->
+/// one response line) by calling VcpuManager.request_*(). Detached; lives for the
+/// process lifetime. Removes any stale socket file first.
+fn spawn_control_listener(
+    path: PathBuf,
+    manager: Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => { log::error!("control socket bind {path:?} failed: {e}"); return; }
+    };
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let stream = match conn { Ok(s) => s, Err(_) => continue };
+            let mgr = manager.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return, // peer closed
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() { continue; }
+                    let resp = dispatch_control(trimmed, &mgr);
+                    // &UnixStream impls Write; writeln! needs a &mut to it.
+                    if writeln!(&mut &stream, "{resp}").is_err() { return; }
+                }
+            });
+        }
+    });
+}
+
 /// Apply the Seatbelt sandbox, or exit. Fail-closed: an apply error terminates
 /// the process (a security gate must not silently degrade open). `--no-sandbox`
 /// is the one explicit, loudly-logged way to run unconfined.
@@ -783,6 +851,7 @@ fn main() {
     let mut gui = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
+    let mut control_sock: Option<PathBuf> = None;
     // Fuzz mode (Task 8): boot a single-vCPU guest from an initramfs and run the
     // in-VMM fuzz loop against the ignition-fuzz device.
     let mut fuzz = false;
@@ -878,6 +947,9 @@ fn main() {
                 let v = it.next().expect("--vsock-uds needs a path");
                 vsock_uds = Some(PathBuf::from(v));
             }
+            "--control-sock" => {
+                control_sock = Some(PathBuf::from(it.next().expect("--control-sock needs a path")));
+            }
             "--restore" => {
                 restore_name = Some(it.next().expect("--restore needs a snapshot name").to_string());
             }
@@ -934,7 +1006,7 @@ fn main() {
 
     // Restore path: skip normal boot entirely.
     if let Some(rname) = restore_name {
-        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, no_reseed, gui, net_socket) {
+        match run_restore(&store, &rname, name.clone(), force, track_dirty, vsock_uds, no_sandbox, no_reseed, gui, net_socket, control_sock) {
             Ok(()) => eprintln!("\n[restore exited cleanly]"),
             Err(e) => {
                 eprintln!("\n[restore error: {e}]");
@@ -1306,6 +1378,9 @@ fn main() {
     // it before process::exit on Ctrl-A x.
     let termios = TermiosGuard::new();
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    if let Some(ctl) = control_sock.clone() {
+        spawn_control_listener(ctl, manager.clone());
+    }
     eprintln!("--- console attached (quit: Ctrl-A x, snapshot: Ctrl-A s, balloon: Ctrl-A b, checkpoint: Ctrl-A c, reset: Ctrl-A r), {smp} vCPU(s) ---");
     eprintln!("--- snapshots will be saved as '{write_name}' under {} ---", store.display());
 
@@ -1834,6 +1909,7 @@ fn run_restore(
     no_reseed: bool,
     gui: bool,
     net_socket: Option<PathBuf>,
+    control_sock: Option<PathBuf>,
 ) -> io::Result<()> {
     // Host-side restore clock: chain resolution + mmap + diff overlay + GIC/device/vCPU
     // state restore, up to handing the guest to the run loop. The boot-timer device
@@ -2267,6 +2343,9 @@ fn run_restore(
     });
 
     spawn_stdin_reader(serial.clone(), termios.saved(), manager.clone(), balloon_target.clone(), balloon.clone());
+    if let Some(ctl) = control_sock.clone() {
+        spawn_control_listener(ctl, manager.clone());
+    }
     let q_stdin = restore_start.elapsed();
     eprintln!("--- restore console attached (quit: Ctrl-A x, balloon: Ctrl-A b, checkpoint: Ctrl-A c, reset: Ctrl-A r) ---");
 
@@ -2488,5 +2567,39 @@ mod tests {
         let got = build_cmdline(Some("init=/sbin/overlay-init"));
         assert!(got.starts_with(&layout::default_cmdline()));
         assert!(got.ends_with(" init=/sbin/overlay-init"));
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    fn mgr() -> Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager> {
+        let bus = Arc::new(ignition_devices::bus::Bus::new());
+        ignition_vmm::vstate::vcpu_manager::VcpuManager::new(1, bus)
+    }
+    #[test]
+    fn known_actions_ack() {
+        let m = mgr();
+        // These ack unconditionally (receipt-of-request); snapshot is excluded
+        // because it now reports whether it actually ran (see snapshot_takes_name).
+        for a in ["checkpoint", "reset", "pause", "resume"] {
+            let r = dispatch_control(&format!("{{\"action\":\"{a}\"}}"), &m);
+            assert_eq!(r, "{\"ok\":true}", "action {a}");
+        }
+    }
+    #[test]
+    fn snapshot_takes_name() {
+        let m = mgr();
+        // No snapshot handler is installed on a bare VcpuManager, so request_snapshot
+        // no-ops and reports false; dispatch_control surfaces that as an error reply.
+        let r = dispatch_control("{\"action\":\"snapshot\",\"name\":\"s1\"}", &m);
+        assert!(r.contains("\"ok\":false"), "got: {r}");
+        assert!(r.contains("did not run"), "got: {r}");
+    }
+    #[test]
+    fn bad_json_and_unknown_action_error() {
+        let m = mgr();
+        assert!(dispatch_control("not json", &m).contains("\"ok\":false"));
+        assert!(dispatch_control("{\"action\":\"nope\"}", &m).contains("unknown action"));
     }
 }
