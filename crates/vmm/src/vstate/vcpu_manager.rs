@@ -70,6 +70,10 @@ pub struct VcpuManager {
     shutdown: AtomicBool,
     /// Set by `request_snapshot`; cleared by the leader inside `run_loop`.
     snapshot_req: AtomicBool,
+    /// Per-request snapshot name set by `request_snapshot(Some(..))` (the control
+    /// socket); `None` from the serial Ctrl-A path so the leader keeps the
+    /// launch-time `write_name`. Read-and-cleared by the snapshot leader.
+    snapshot_name: Mutex<Option<String>>,
     /// Set by `request_checkpoint`; cleared by the checkpoint leader.
     checkpoint_req: AtomicBool,
     /// Set by `request_reset`; cleared by the reset leader.
@@ -110,12 +114,12 @@ pub struct VcpuManager {
 /// A snapshot handler: invoked on the elected leader vCPU thread once every
 /// vCPU has saved its register state. Receives the per-vCPU checkpoints and
 /// performs the global capture (RAM + GIC + device records) and file write.
-type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>;
+type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>;
 
 /// Builds and stores a `ResetPoint` from the vCPU checkpoints collected at the
 /// barrier (clonefile pristine + capture gic/devices). Runs on the leader vCPU
 /// thread with all vCPUs parked.
-pub type CheckpointHandler = Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>;
+pub type CheckpointHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>;
 
 /// Rolls live RAM/GIC/device state back to the current `ResetPoint`. Runs on the
 /// leader vCPU thread with all vCPUs parked. Per-vCPU register restore happens
@@ -134,6 +138,7 @@ impl VcpuManager {
             threads: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             snapshot_req: AtomicBool::new(false),
+            snapshot_name: Mutex::new(None),
             checkpoint_req: AtomicBool::new(false),
             reset_req: AtomicBool::new(false),
             reset_vtimer_offset: AtomicU64::new(0),
@@ -162,7 +167,7 @@ impl VcpuManager {
     /// has rendezvoused and saved its state.
     pub fn set_snapshot_handler(
         self: &mut Arc<Self>,
-        handler: Box<dyn Fn(Vec<VcpuCheckpoint>) + Send + Sync>,
+        handler: Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>,
     ) {
         let me = Arc::get_mut(self).expect("set_snapshot_handler must be called before run");
         me.snapshot_handler = Some(handler);
@@ -230,11 +235,14 @@ impl VcpuManager {
     /// Request a snapshot. Freezes CPU_ON, latches the participant set, sizes the
     /// rendezvous barrier, and interrupts every registered vCPU so each exits to
     /// `Canceled` and joins the rendezvous. No-op if no handler is installed.
-    pub fn request_snapshot(&self) {
+    /// `name` overrides the launch-time write name when `Some` (the control
+    /// socket); `None` keeps it (the serial Ctrl-A path).
+    pub fn request_snapshot(&self, name: Option<&str>) {
         if self.snapshot_handler.is_none() {
             return;
         }
         let Some(ids) = self.begin_rendezvous() else { return };
+        *self.snapshot_name.lock().unwrap() = name.map(str::to_string);
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
         Self::broadcast_exit(ids);
@@ -720,9 +728,11 @@ impl VcpuManager {
             }
             None => {
                 if let Some(h) = handler {
+                    // Snapshot-only slot: only request_snapshot sets it, and the rendezvous serializes snapshot vs checkpoint, so the checkpoint path observes None by construction.
+                    let name = self.snapshot_name.lock().unwrap().take();
                     // A panic in the handler must not unwind the vCPU thread.
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        h(checkpoints)
+                        h(checkpoints, name)
                     }));
                     if r.is_err() {
                         log::error!("{what} handler panicked; guest resumed");
@@ -833,6 +843,15 @@ mod tests {
         m.request_checkpoint();
         assert!(!m.checkpoint_req.load(Ordering::Relaxed));
         assert!(!m.rendezvous_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn request_snapshot_with_name_without_handler_is_noop() {
+        let mgr = mgr(1);
+        // No handler and no registered vCPU: returns early, no panic, name slot stays clear.
+        mgr.request_snapshot(Some("snap-1"));
+        assert!(mgr.snapshot_name.lock().unwrap().is_none());
+        assert!(!mgr.snapshot_req.load(Ordering::Acquire));
     }
 
     #[test]

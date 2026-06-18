@@ -273,7 +273,7 @@ impl App {
             HotAction::Snapshot => {
                 if let Some(mgr) = &self.manager {
                     eprintln!("\n[gui] snapshot requested");
-                    mgr.request_snapshot();
+                    mgr.request_snapshot(None);
                 }
             }
             HotAction::Quit => {

@@ -191,7 +191,7 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
         let frozen = w.frozen.clone();
         let dirty = w.dirty.clone();
         let rx_stop = w.rx_stop.clone();
-        manager.set_checkpoint_handler(Box::new(move |checkpoints| {
+        manager.set_checkpoint_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, _req_name: Option<String>| {
             // vCPUs parked. Quiesce the vmnet RX feeder during the RAM clone.
             if let Some(stop) = &rx_stop { stop.store(true, Ordering::Release); }
             let live: &[u8] = unsafe {
@@ -359,7 +359,7 @@ fn spawn_stdin_reader(
                 }
                 Action::Snapshot => {
                     eprintln!("\n[snapshot requested]");
-                    manager.request_snapshot();
+                    manager.request_snapshot(None);
                 }
                 Action::Checkpoint => {
                     eprintln!("\n[reset point marked]");
@@ -1158,12 +1158,15 @@ fn main() {
         // restore-path guard. Captured by value (bool is Copy) so the closure owns it.
         let force_snap = force;
 
-        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
+        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, req_name: Option<String>| {
             // Runs on the leader vCPU thread with all vCPUs parked.
             //
             // Layer type is decided by the carried current_parent:
             //   None    -> Full root (first snapshot; nothing to diff against).
             //   Some(p) -> Diff against p; requires the tracker to be armed.
+            // Control-socket snapshots carry their own name; serial Ctrl-A passes
+            // None and keeps the launch-time write_name.
+            let write_name_snap = req_name.unwrap_or_else(|| write_name_snap.clone());
             let parent = parent_snap.lock().unwrap().clone();
 
             // A Diff is only possible with a tracker. Refuse rather than silently
@@ -2102,11 +2105,14 @@ fn run_restore(
         let dirty_snap = dirty_tracker.clone();
         let parent_snap = current_parent.clone();
         let force_snap = force;
-        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>| {
+        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, req_name: Option<String>| {
             // Runs on the leader vCPU thread with all vCPUs parked. Layer type is
             // decided by the carried current_parent (seeded to the leaf on restore):
             //   None    -> Full root (only when tracking is off).
             //   Some(p) -> Diff against p; requires the tracker to be armed.
+            // Control-socket snapshots carry their own name; serial Ctrl-A passes
+            // None and keeps the launch-time write_name.
+            let write_name_snap = req_name.unwrap_or_else(|| write_name_snap.clone());
             let parent = parent_snap.lock().unwrap().clone();
 
             // Restored-from guard (independent of dirty tracking): refuse to overwrite
