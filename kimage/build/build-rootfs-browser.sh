@@ -84,10 +84,10 @@ ONREOF
   # open-url hands it to the already-running kiosk Firefox by argv (NEVER sh -c the
   # URL). Same socat VSOCK-LISTEN pattern as the vmid listener above.
   # open-url just records the validated URL (argv-safe; never sh -c). The
-  # kiosk-loop (cage command) picks it up and relaunches Firefox on it. We do NOT
-  # navigate a running Firefox via its remote: under cage there is no shared DBus
-  # session, so a second firefox-esr only hits the profile lock ("already running,
-  # not responding"). One firefox instance, restarted per URL, is deterministic.
+  # kiosk-loop (cage command) picks it up and hands it to the running Firefox via its
+  # DBus remote (cage now runs under dbus-run-session, so the second `firefox-esr <url>`
+  # finds the running instance instead of hitting the profile lock). Navigation is a
+  # remote handoff to the warm instance — near-instant, no kill/relaunch.
   cat > /usr/bin/open-url <<'"'"'URLEOF'"'"'
 #!/bin/sh
 IFS= read -r url
@@ -103,19 +103,21 @@ URLEOF
   printf "#!/bin/sh\nsocat VSOCK-LISTEN:7777,fork EXEC:/usr/bin/open-url &\n" > /etc/local.d/openurl.start
   chmod +x /etc/local.d/openurl.start
 
-  # kiosk-loop: cage runs this (not firefox directly). Runs one firefox-esr on the
-  # current URL; when open-url writes a new URL to /run/openurl.target, kills firefox
-  # and relaunches on it. Single instance, no remote/DBus/profile-lock. $1 = initial URL.
+  # kiosk-loop: cage runs this (under dbus-run-session, not firefox directly). Launches
+  # ONE firefox-esr (no --no-remote, so it owns the DBus remote) and keeps it running;
+  # when open-url writes a new URL to /run/openurl.target, hands the URL to that running
+  # instance via a transient `firefox-esr <url>` remote call (no kill/relaunch). $1 = initial URL.
   cat > /usr/bin/kiosk-loop <<'"'"'KIOSKEOF'"'"'
 #!/bin/sh
-# /usr/bin/firefox-esr is "exec /usr/lib/firefox-esr/firefox-esr" -- it execs, so we
-# run it in a subshell that captures the REAL exit code into $DONE. That lets us tell:
+# The MAIN firefox runs in a subshell that captures its REAL exit code into $DONE. That
+# lets us tell:
 #   exit 0   = the user closed the window  -> end the disposable session (poweroff)
 #   non-zero = crash, Ctrl+Shift+R, or a snapshot-restore that killed firefox GL/Wayland
-#              -> relaunch and recover (the restored firefox dies on resume; this is how
+#              -> relaunch and recover (a restored firefox can die on resume; this is how
 #              a New-Browser session comes back instead of powering off instantly).
-# Navigation (open-url writes a new URL) kills + relaunches. A killed/crashed firefox
-# can leave a stale profile lock, so clear it before every launch.
+# Navigation (open-url writes a new URL) is a REMOTE handoff to the running instance via
+# a separate, short-lived `firefox-esr <url>` (DBus remote) — no kill, no cold start. That
+# remote call exit code is ignored (it is NOT the $DONE-tracked main process).
 TARGET=/run/openurl.target
 DONE="${XDG_RUNTIME_DIR:-/tmp}/ff-done"   # kiosk-writable; /run itself is root-owned
 PROFILES="$HOME/.mozilla/firefox"
@@ -126,25 +128,26 @@ start_ff() {
   rm -f "$PROFILES"/*/lock "$PROFILES"/*/.parentlock "$DONE" 2>/dev/null
   echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
   # Foreground firefox inside the subshell so $? is its real exit code; publish it.
-  ( /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1; echo $? > "$DONE" ) &
+  # No --no-remote: this instance registers on the session bus so later `firefox-esr <url>`
+  # calls route to it instead of starting a second (profile-locked) instance.
+  ( /usr/bin/firefox-esr "$url" >/dev/null 2>&1; echo $? > "$DONE" ) &
 }
-kill_ff() {
-  pkill -f /usr/lib/firefox 2>/dev/null
-  i=0
-  while pgrep -f /usr/lib/firefox >/dev/null 2>&1 && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done
-  pkill -9 -f /usr/lib/firefox 2>/dev/null
-  while pgrep -f /usr/lib/firefox >/dev/null 2>&1; do sleep 0.2; done
-  rm -f "$DONE"   # discard the exit code from this intentional kill
+navigate() {
+  # Hand the URL to the already-running firefox over its DBus remote. Returns fast; its
+  # exit code is intentionally discarded (only the main firefox drives $DONE).
+  echo "[kiosk-loop] navigating (remote) to: $url" > /dev/ttyS0 2>&1
+  /usr/bin/firefox-esr "$url" >/dev/null 2>&1 || true
 }
 start_ff
 while :; do
   cur=$(cat "$TARGET" 2>/dev/null)
   if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
     last="$cur"; url="$cur"
-    echo "[kiosk-loop] navigating to: $url" > /dev/ttyS0 2>&1
-    kill_ff
-    sleep 1
-    start_ff
+    if pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
+      navigate                       # warm instance alive -> remote handoff (fast)
+    else
+      start_ff                       # no live instance (edge) -> launch on the URL
+    fi
   elif [ -f "$DONE" ]; then
     code=$(cat "$DONE" 2>/dev/null); rm -f "$DONE"
     if [ "$code" = 0 ]; then
@@ -154,7 +157,7 @@ while :; do
     fi
     echo "[kiosk-loop] firefox exited (code $code); relaunching" > /dev/ttyS0 2>&1
     sleep 1
-    start_ff
+    start_ff                         # crash/restore recovery -> reopen current $url
   fi
   sleep 0.5
 done
@@ -198,7 +201,11 @@ NETEOF
   # xkeyboard-config: XKB layout data — without it libxkbcommon compiles an empty
   # keymap, so cage focuses the window but keystrokes map to nothing (verified: key
   # events reach the guest, but no characters appear until this is installed).
-  apk add --no-cache cage foot seatd font-terminus libinput-tools xkeyboard-config wev
+  # dbus: provides a per-session message bus (via dbus-run-session) so a second
+  # `firefox-esr <url>` hands the URL to the ALREADY-RUNNING firefox over its DBus
+  # remote instead of cold-launching (~15s). Makes navigation near-instant on the
+  # warm snapshot.
+  apk add --no-cache cage foot seatd font-terminus libinput-tools xkeyboard-config wev dbus
   apk add --no-cache firefox-esr mesa-dri-gallium mesa-gl ca-certificates font-dejavu
 
   # Run the GUI stack (cage + firefox) as an unprivileged user, not root: firefox
@@ -283,7 +290,11 @@ export MOZ_ENABLE_WAYLAND=1
 # WITH its normal toolbar and address bar. Disposability comes from the overlay
 # root + Ctrl+Alt+R reset, not from kiosk mode.
 command="/usr/bin/cage"
-command_args="-- /usr/bin/kiosk-loop __HOMEPAGE__"
+# dbus-run-session gives the kiosk session a private message bus so the firefox DBus
+# remote works (a later `firefox-esr <url>` reaches the running instance). Without it
+# there is no session bus under cage and the remote falls back to a new, profile-locked
+# instance.
+command_args="-- dbus-run-session -- /usr/bin/kiosk-loop __HOMEPAGE__"
 command_background=true
 command_user="kiosk:kiosk"
 pidfile="/run/cage-kiosk.pid"
