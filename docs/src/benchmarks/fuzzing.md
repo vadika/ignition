@@ -46,3 +46,51 @@ Reproduce:
 ```console
 M3_DURATION=60 python3 scripts/fuzz_m3_bench.py
 ```
+
+## TPM 2.0 command processor (ms-tpm-20-ref)
+
+The fuzzing payoff target: Microsoft's reference TPM 2.0 stack
+(`ms-tpm-20-ref`, real OpenSSL crypto backend) compiled as an aarch64 Linux
+userspace target on the same snapshot fuzzer. `target_init` runs the one-time
+manufacture / power-on / `TPM2_Startup` **before** the snapshot doorbell, so the
+snapshot captures a fully-started TPM; each iteration runs one command through
+`ExecuteCommand` and the TPM's mutable global state (NV image, sessions, objects)
+is rolled back by the per-iteration dirty-page reset.
+
+Honest framing: this runs in the normal-world Linux guest (no EL3 / secure world
+on HVF), so the win is **fast reset of a large, stateful firmware workload on
+Apple Silicon**, not "impossible to fuzz elsewhere." It is the stepping stone to
+targets that genuinely need a platform a host `fork()` can't provide.
+
+Measured on HVF (`scripts/fuzz_tpm2_bench.py`, GetCapability seed, single core,
+`--mem 256`, 30 s windows):
+
+| metric | dirty reset | full reset |
+|---|---|---|
+| execs/sec | **1443** | 140 |
+| reset latency p50 | 38 µs | — |
+| coverage (edges) | 419 | — |
+| dirty-set p50 / max | 39 / 55 pages | — |
+
+The dirty-vs-full speedup is **10.3×** — larger than libpng's 4.8×, because the
+TPM's bigger working set makes a full-RAM-copy reset much slower (140 vs libpng's
+271 execs/sec) while the dirty-set stays small (~39 pages). That gap *is* the
+stateful-reset story: rolling back only what one command touched, in tens of
+microseconds, instead of re-initialising or re-copying the whole TPM each run.
+
+Correctness gate (`scripts/fuzz_tpm2_test.py`): a planted length-field OOB in the
+`TPM2_NV_Write` path (ASan-instrumented) is rediscovered from the near-boundary
+seed in **0.018 s** and replays deterministically. Real-CVE rediscovery (a
+vulnerable upstream pin) is the tracked stretch; the OpenSSL backend that makes it
+possible is already in place.
+
+Reproduce:
+
+```console
+TPM2_DURATION=60 python3 scripts/fuzz_tpm2_bench.py   # benchmark
+python3 scripts/fuzz_tpm2_test.py                     # correctness gate
+```
+
+The initramfs is built (on an arm64 Docker host) with
+`kimage/build/build-fuzz-initramfs.sh tpm2` — it clones ms-tpm-20-ref at a pinned
+commit and builds the TPM core + platform with ASan + SanCov against OpenSSL 1.1.
