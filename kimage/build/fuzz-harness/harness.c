@@ -15,6 +15,11 @@
 /* The fuzz target lives in target.c (instrumented with AddressSanitizer). */
 void target_parse(const uint8_t *data, unsigned long len);
 
+/* Optional one-time per-target setup, run BEFORE the snapshot doorbell so its
+ * effects are baked into the snapshot and identical every iteration. Targets
+ * that need no setup (synthetic, libpng) omit it and get this weak no-op. */
+__attribute__((weak)) void target_init(void) {}
+
 static volatile uint8_t *g_ctrl;   /* control registers (16 KiB) */
 static volatile uint8_t *g_win;    /* shared window (input bytes) */
 static volatile uint8_t *g_cov;    /* 8-bit SanCov edge counters (host reads) */
@@ -82,6 +87,7 @@ int main(void) {
 
     __asan_set_death_callback(asan_on_death);
 
+    target_init();               /* one-time, pre-snapshot (weak no-op by default) */
     /* One-time setup is complete; park at the parse site. */
     doorbell(CMD_SNAPSHOT_ME);   /* <-- snapshot/reset PC lands just after here */
 
