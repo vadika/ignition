@@ -255,6 +255,10 @@ start_pre() {
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 0700 "$XDG_RUNTIME_DIR"
     chown kiosk:kiosk "$XDG_RUNTIME_DIR"
+    # start-stop-daemon opens output_log AS the kiosk user, but /var/log is root-owned;
+    # pre-create it owned by kiosk or the cage start aborts with Permission denied.
+    : > /var/log/cage.log
+    chown kiosk:kiosk /var/log/cage.log
     # kiosk-loop (running as kiosk) truncates this at startup; open-url (root) writes
     # it later. Pre-create it owned by kiosk so the unprivileged loop can touch it.
     : > /run/openurl.target
