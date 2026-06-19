@@ -95,7 +95,7 @@ URLEOF
 # "Firefox is already running, but is not responding" and the browser is dead.
 # So clear the lock before every launch and force-kill stragglers before relaunch.
 TARGET=/run/openurl.target
-PROFILES=/root/.mozilla/firefox
+PROFILES="$HOME/.mozilla/firefox"
 url="${1:-about:blank}"
 : > "$TARGET"
 last=""
@@ -171,6 +171,13 @@ NETEOF
   apk add --no-cache cage foot seatd font-terminus libinput-tools xkeyboard-config wev
   apk add --no-cache firefox-esr mesa-dri-gallium mesa-gl ca-certificates font-dejavu
 
+  # Run the GUI stack (cage + firefox) as an unprivileged user, not root: firefox
+  # refuses some operations as root and it is poor hygiene. cage opens DRM/input via
+  # seatd (libseat), so the kiosk user only needs the seat/video/input/tty groups,
+  # not root. First adduser -D gets uid 1000 on alpine (matches XDG_RUNTIME_DIR below).
+  adduser -D -h /home/kiosk kiosk
+  for g in video input seat tty; do addgroup kiosk "$g" 2>/dev/null || true; done
+
   # Firefox kiosk policy: no first-run, no telemetry, no update checks, set homepage.
   mkdir -p /usr/lib/firefox/distribution
   cat > /usr/lib/firefox/distribution/policies.json <<'"'"'POLEOF'"'"'
@@ -206,7 +213,8 @@ POLEOF
 #!/sbin/openrc-run
 description="cage kiosk (firefox) on the virtio-gpu framebuffer"
 
-export XDG_RUNTIME_DIR=/run/user/0
+export HOME=/home/kiosk
+export XDG_RUNTIME_DIR=/run/user/1000
 export WLR_RENDERER=pixman
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 export XKB_DEFAULT_LAYOUT=us
@@ -229,6 +237,7 @@ export MOZ_ENABLE_WAYLAND=1
 command="/usr/bin/cage"
 command_args="-- /usr/bin/kiosk-loop __HOMEPAGE__"
 command_background=true
+command_user="kiosk:kiosk"
 pidfile="/run/cage-kiosk.pid"
 output_log="/var/log/cage.log"
 error_log="/var/log/cage.log"
@@ -245,6 +254,11 @@ start_pre() {
     fi
     mkdir -p "$XDG_RUNTIME_DIR"
     chmod 0700 "$XDG_RUNTIME_DIR"
+    chown kiosk:kiosk "$XDG_RUNTIME_DIR"
+    # kiosk-loop (running as kiosk) truncates this at startup; open-url (root) writes
+    # it later. Pre-create it owned by kiosk so the unprivileged loop can touch it.
+    : > /run/openurl.target
+    chown kiosk:kiosk /run/openurl.target
     # Wait until libinput can enumerate the keyboard (udev has finished tagging
     # /dev/input/event*). cage enumerates input once at startup; if it starts before
     # tagging, it gets no keyboard and the app never receives focus.
