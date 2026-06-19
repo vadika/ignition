@@ -11,7 +11,7 @@ STAGE="$HOME/kbuild"
 mkdir -p "$OUT"
 TAR="$STAGE/rootfs-browser.tar"
 
-HOMEPAGE="${HOMEPAGE:-https://duckduckgo.com}"
+HOMEPAGE="${HOMEPAGE:-https://vadika.github.io/ignition-browser/}"
 
 # 1. Provision the browser rootfs inside an arm64 alpine container.
 docker rm -f fcroot_browser_build >/dev/null 2>&1 || true
