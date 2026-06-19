@@ -72,7 +72,8 @@ TARGET="${1:-synthetic}"
 case "$TARGET" in
   synthetic) OUT_NAME="fuzz-initramfs.cpio" ;;
   libpng)    OUT_NAME="fuzz-initramfs-libpng.cpio" ;;
-  *) echo "usage: $0 [synthetic|libpng]" >&2; exit 2 ;;
+  tpm2)      OUT_NAME="fuzz-initramfs-tpm2.cpio" ;;
+  *) echo "usage: $0 [synthetic|libpng|tpm2]" >&2; exit 2 ;;
 esac
 
 docker rm -f fuzzinit_build >/dev/null 2>&1 || true
@@ -97,6 +98,56 @@ docker run --platform linux/arm64 --name fuzzinit_build \
   cp -L /usr/lib/libgcc_s.so.1 /out/root/usr/lib/
   cd /out/root
   # initramfs has no devtmpfs auto-mount; pre-create the nodes the harness needs.
+  mknod -m 600 dev/mem c 1 1
+  mknod -m 622 dev/console c 5 1
+  mknod -m 666 dev/null c 1 3
+  find . | cpio -o -H newc > /out/fuzz-initramfs.cpio
+'
+elif [ "$TARGET" = "tpm2" ]; then
+# ms-tpm-20-ref TPM 2.0 command processor (ASan + SanCov). Built on alpine 3.16,
+# which still ships OpenSSL 1.1.1 (this TPM commit pokes 1.1 BIGNUM internals and
+# #errors on 3.x) AND a working aarch64 ASan runtime (3.15 has neither pairing).
+# The TPM core (libtpm.a) + platform (libplatform.a) are built from a pinned
+# upstream commit with ASan + SanCov; Entropy.c is swapped for a deterministic
+# counter (tpm2_det_entropy.c) so crash replay is reproducible; NV stays the
+# upstream static s_NV array (RAM, dirty-tracked, rolled back each iteration).
+# target_tpm2.c runs the one-time manufacture/startup in target_init (pre-snapshot)
+# and one command per iteration via ExecuteCommand. harness.c is shared and NOT
+# coverage-instrumented (it defines the trace-pc callback). Heavy: the TPM core
+# compiles under qemu-emulated arm64, ~20 min.
+TPM_REF_COMMIT=ee21db0a941decd3cac67925ea3310873af60ab3
+docker run --platform linux/arm64 --name fuzzinit_build \
+  -v "$HERE/fuzz-harness:/src:ro" -e TPM_REF_COMMIT="$TPM_REF_COMMIT" \
+  alpine:3.16 sh -euxc '
+  apk add --no-cache clang compiler-rt gcc musl-dev openssl-dev openssl-libs-static \
+    autoconf automake libtool m4 pkgconf autoconf-archive make bash gawk grep sed binutils git
+  mkdir -p /out/root/lib /out/root/usr/lib /out/root/dev /out/root/proc /out/root/sys /build
+  cd /build
+  git clone https://github.com/microsoft/ms-tpm-20-ref.git
+  cd ms-tpm-20-ref && git checkout "$TPM_REF_COMMIT" && cd TPMCmd
+  # gcc supplies the crt files + libgcc that alpine clang links against.
+  bash ./bootstrap
+  CC=clang ./configure
+  # Instrument the TPM core (command parser + crypto glue) for coverage + ASan.
+  make -j"$(nproc)" EXTRA_CFLAGS="-fsanitize=address -fsanitize-coverage=trace-pc" \
+    tpm/src/libtpm.a Platform/src/libplatform.a
+  # Swap the host-RNG Entropy.o for the deterministic counter.
+  clang -O1 -c /src/tpm2_det_entropy.c -o /build/det_entropy.o
+  cp Platform/src/libplatform.a /build/libplatform.a
+  ar d /build/libplatform.a libplatform_a-Entropy.o
+  ar r /build/libplatform.a /build/det_entropy.o
+  INC="-I tpm/include -I tpm/include/public -I TpmConfiguration"
+  clang -fsanitize=address -fsanitize-coverage=trace-pc -O1 -g $INC -c /src/target_tpm2.c -o /build/target_tpm2.o
+  clang -fsanitize=address -O1 -g -I /src -c /src/harness.c -o /build/harness.o
+  # Circular dep (libplatform <-> libtpm): list libplatform twice. libcrypto is static.
+  clang -fsanitize=address -O1 -g /build/target_tpm2.o /build/harness.o \
+    /build/libplatform.a tpm/src/libtpm.a /build/libplatform.a /usr/lib/libcrypto.a -lpthread \
+    -o /out/root/init
+  echo "=== ldd /out/root/init ==="
+  ldd /out/root/init || true
+  cp -L /lib/ld-musl-aarch64.so.1 /out/root/lib/
+  cp -L /usr/lib/libgcc_s.so.1 /out/root/usr/lib/
+  cd /out/root
   mknod -m 600 dev/mem c 1 1
   mknod -m 622 dev/console c 5 1
   mknod -m 666 dev/null c 1 3
