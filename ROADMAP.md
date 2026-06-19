@@ -157,12 +157,23 @@ narrowest interface (a buffer in memory), so there is no external interface to r
   (Linux/KVM cross-check dropped from scope; ignition-own numbers only.)
 - [ ] **Stateful targets** *(next)* — `freetype` / `libxml2`: still single-threaded compute, larger
   dirty-page sets, more bug surface; stresses the reset path harder.
-- [ ] **Domain payoff — firmware / TEE harnesses** — TPM 2.0 command-handler or OP-TEE TA,
-  parked at the command-parse entry, input injected into the command buffer. *The target
-  nobody can fuzz comfortably elsewhere* — it assumes a platform/secure-world a host
-  `fork()` can't provide but a microVM snapshot can. Turns "snapshot fuzzing reimplemented
-  on a Mac" into "snapshot-fuzz firmware/TEE parsers on Apple Silicon" — novel and
-  publishable, squarely in ignition's wheelhouse (vtpmd, fTPM, OP-TEE).
+- [x] **Domain payoff — firmware / TEE harnesses** — TPM 2.0 first. The real
+  ms-tpm-20-ref command processor (OpenSSL backend) runs as an aarch64-userspace
+  snapshot-fuzz target: manufactured + started in `target_init` (pre-snapshot), one
+  command per iteration through `ExecuteCommand`, the large TPM state dirty-page-reset
+  each iteration. **Verified on HVF:** dirty **1443** vs full **140** execs/sec (10.3×
+  — bigger than libpng's 4.8×, since the TPM's larger working set makes full-copy reset
+  much slower), **419** coverage edges, reset p50 38 µs; planted NV_Write OOB rediscovered
+  in 0.018 s, deterministic replay. `docs/superpowers/specs/2026-06-19-tpm2-snapshot-fuzz-demo-design.md`,
+  `docs/src/benchmarks/fuzzing.md`, `scripts/fuzz_tpm2_{test,bench}.py`.
+  Honest framing: userspace (no EL3/secure-world here), so the win is fast large-state
+  reset on Apple Silicon, not "impossible elsewhere."
+  - [ ] **Stretch — real-CVE rediscovery** — swap the planted bug for a vulnerable
+    ms-tpm-20-ref pin (e.g. CVE-2023-1017 OOB in `CryptParameterDecryption`); needs a
+    crafted seed corpus + session-setup reachability. The OpenSSL backend already
+    in place unblocks it.
+  - [ ] **OP-TEE TA / firmware** — the genuinely-needs-a-platform targets, if
+    nested-virt (EL2) ever lands.
 
 Honest threat-model note: the Seatbelt sandbox v1 (below) confines egress/exec/writes/secrets,
 but full read+mach confinement (deny-default) and the uid drop are still v2, so the

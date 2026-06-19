@@ -1,8 +1,38 @@
 # TPM 2.0 snapshot-fuzz demo — design
 
 **Date:** 2026-06-19
-**Status:** approved, pre-implementation
+**Status:** in implementation
 **Track:** Demonstrator — fuzzing payoff (firmware/TEE harnesses)
+
+## Addendum (2026-06-19, during implementation): crypto backend → OpenSSL
+
+The original spec chose a **trimmed, crypto-stubbed** TPM. Implementation found
+the ceiling the spec's risk note anticipated: `crypt/` is 21 interdependent files
+(`CryptUtil`, `CryptHash`, `CryptRand`, `CryptSym`, `CryptRsa`, `CryptEcc`,
+`CryptSelfTest`, …) and `TPM_Manufacture` + `TPM2_Startup` run self-tests across
+all of hash/sym/rsa/ecc. Stubbing that believably ≈ reimplementing the crypto
+engine — fragile and multi-day.
+
+**Decision (user-approved): use upstream's supported OpenSSL backend.** Build the
+real `libtpm.a` + `libplatform.a` from a pinned ms-tpm-20-ref commit, instrumented
+with ASan + SanCov. This is more robust, gives full command coverage, and unlocks
+the real-CVE stretch. Build notes that differ from the body below:
+
+- **Toolchain:** alpine 3.16 in the arm64 build container — it still ships OpenSSL
+  1.1.1 (this TPM commit pokes 1.1 `BIGNUM` internals and `#error`s on 3.x) AND a
+  working aarch64 ASan runtime (3.15 had neither pairing; 3.19 has OpenSSL 3).
+- **Determinism:** only `Entropy.c` is overridden (deterministic counter via
+  `tpm2_det_entropy.c`, `ar`-swapped into `libplatform.a`). NV stays upstream's
+  static `s_NV` RAM array — already dirty-tracked and rolled back each iteration,
+  so no custom platform needed.
+- **No vendored TPM source in-repo:** the build case clones ms-tpm-20-ref at the
+  pinned commit (`ee21db0a941decd3cac67925ea3310873af60ab3`) and builds it; the
+  repo carries only `target_tpm2.c`, `tpm2_det_entropy.c`, and the build-script
+  case. (Supersedes the `kimage/build/fuzz-harness/tpm2/` vendored-subset plan.)
+- **Verified on HVF:** 1359 execs/sec, 153 coverage edges, clean GetCapability.
+
+The rest of the spec (snapshot point, planted bug, gates, benchmark, seeds) stands
+unchanged. Where the body says "no crypto backend / stubbed crypto," read OpenSSL.
 
 ## Goal
 
