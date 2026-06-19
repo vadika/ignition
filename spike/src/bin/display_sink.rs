@@ -213,6 +213,13 @@ struct App {
     /// The VM owning this window, so a host hotkey can request reset/checkpoint/
     /// snapshot. `None` outside the GUI reset use-case (keys then always forward).
     manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
+    /// Fractional scroll carried between MouseWheel events. Trackpad PixelDelta
+    /// arrives in sub-notch increments; accumulate and emit one REL_WHEEL per whole
+    /// notch so slow scrolls aren't rounded away to nothing.
+    scroll_accum: f32,
+    /// Start the window hidden (--gui-hidden, used by the first-run base build). The
+    /// guest still renders and snapshots; only the host window is suppressed.
+    visible: bool,
 }
 
 impl App {
@@ -286,9 +293,26 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Fit the window to the screen. The guest renders at gw×gh (self.width/height);
+        // blit_frame scales that to whatever the window is, and scale_pos maps clicks
+        // back, so the window may be smaller than the guest scanout without distortion
+        // beyond uniform scaling. A guest taller than the display (e.g. 1000px on a
+        // 956pt screen) would otherwise run off the bottom. Scale by a single factor to
+        // preserve aspect, leaving room for the menu bar + title bar + a margin.
+        let (mut w, mut h) = (self.width as f64, self.height as f64);
+        if let Some(mon) = event_loop.primary_monitor() {
+            let sf = mon.scale_factor().max(1.0);
+            let size = mon.size();
+            let avail_w = (size.width as f64 / sf - 40.0).max(320.0);
+            let avail_h = (size.height as f64 / sf - 120.0).max(240.0);
+            let f = (avail_w / w).min(avail_h / h).min(1.0);
+            w *= f;
+            h *= f;
+        }
         let attrs = Window::default_attributes()
             .with_title("ignition")
-            .with_inner_size(LogicalSize::new(self.width, self.height))
+            .with_inner_size(LogicalSize::new(w, h))
+            .with_visible(self.visible)
             .with_resizable(false);
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
@@ -300,8 +324,11 @@ impl ApplicationHandler for App {
         self.resize_surface();
         self.force_paint = true;
         // A CLI-launched window may not become the key window automatically on macOS;
-        // ask for focus so keyboard events flow without a manual click.
-        window.focus_window();
+        // ask for focus so keyboard events flow without a manual click. Skip when hidden
+        // (--gui-hidden) so the first-run base build never steals focus or flashes.
+        if self.visible {
+            window.focus_window();
+        }
         window.request_redraw();
     }
 
@@ -378,6 +405,29 @@ impl ApplicationHandler for App {
                     let _ = tab.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                use ignition_devices::virtio::input::InputEvent;
+                use winit::event::MouseScrollDelta;
+                if let Some(tab) = &self.tablet {
+                    // Normalize to wheel notches. LineDelta is already in lines;
+                    // PixelDelta (trackpads) is ~40px/notch.
+                    // ponytail: 40px/notch is a fixed guess; expose a knob if it feels off.
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                    };
+                    self.scroll_accum += dy;
+                    let notches = self.scroll_accum.trunc();
+                    if notches != 0.0 {
+                        self.scroll_accum -= notches;
+                        let evs = [
+                            InputEvent { etype: 2, code: 8, value: notches as i32 as u32 }, // EV_REL REL_WHEEL
+                            InputEvent { etype: 0, code: 0, value: 0 },                      // EV_SYN
+                        ];
+                        let _ = tab.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -412,6 +462,7 @@ pub fn run_event_loop(
     gw: u32,
     gh: u32,
     manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
+    visible: bool,
 ) {
     let event_loop = EventLoop::new().expect("winit event loop");
     event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -434,6 +485,8 @@ pub fn run_event_loop(
         gh,
         modifiers: winit::keyboard::ModifiersState::empty(),
         manager,
+        scroll_accum: 0.0,
+        visible,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("[gui] event loop exited with error: {e}");

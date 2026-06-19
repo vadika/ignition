@@ -18,7 +18,9 @@ const CFG_ABS_INFO: u8 = 0x12;
 #[allow(dead_code)] // translator-only
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
+const REL_WHEEL: u16 = 8;
 #[allow(dead_code)] // emitted by the host translator (spike), documents the protocol
 const SYN_REPORT: u16 = 0;
 const ABS_X: u16 = 0;
@@ -126,6 +128,10 @@ impl VirtioInput {
                     set_bit(u, ABS_X);
                     set_bit(u, ABS_Y);
                     1
+                }
+                (EV_REL, Flavor::Tablet { .. }) => {
+                    set_bit(u, REL_WHEEL);
+                    2
                 }
                 _ => 0,
             },
@@ -337,6 +343,18 @@ mod tests {
         assert_ne!(u[0] & 0b11, 0); // ABS_X(0), ABS_Y(1)
         let (_size, u) = read_cfg(&tab, CFG_EV_BITS, EV_KEY as u8);
         assert_ne!(u[272 / 8] & (1 << (272 % 8)), 0); // BTN_LEFT = 272
+    }
+
+    #[test]
+    fn config_ev_bits_tablet_has_rel_wheel() {
+        let tab = VirtioInput::tablet(1280, 800);
+        let (size, u) = read_cfg(&tab, CFG_EV_BITS, EV_REL as u8);
+        assert!(size >= 2);
+        assert_ne!(u[REL_WHEEL as usize / 8] & (1 << (REL_WHEEL % 8)), 0);
+        // Keyboard advertises no relative axes.
+        let kbd = VirtioInput::keyboard();
+        let (size, _u) = read_cfg(&kbd, CFG_EV_BITS, EV_REL as u8);
+        assert_eq!(size, 0);
     }
 
     #[test]
