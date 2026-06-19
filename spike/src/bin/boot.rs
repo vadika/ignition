@@ -51,10 +51,13 @@ const CTRL_A: u8 = 0x01;
 /// GUI framebuffer size: virtio-gpu scanout, host window, and tablet ABS range all
 /// use these. The guest renders at this resolution, so the fresh-boot AND restore
 /// paths MUST pass the same values or the window and scanout disagree -- and a base
-/// snapshot only restores cleanly at the resolution it was built with. 800 was too
-/// short for modern sites that assume more vertical room; 1000 gives headroom.
-const GUI_W: u32 = 1280;
-const GUI_H: u32 = 1000;
+/// snapshot only restores cleanly at the resolution it was built with. Sized a touch
+/// under the host work area (1470x922) so the centered window (title bar + a gap on
+/// each side) fits, while still mapping the guest fb to the physical surface at an exact
+/// integer factor (no fractional-scale blur). Re-tune to the target display + rebuild
+/// the base when moving to a different screen.
+const GUI_W: u32 = 1400;
+const GUI_H: u32 = 880;
 
 /// State of the host-side escape sequence. Ctrl-A then `x` quits the harness;
 /// Ctrl-A then anything else forwards a literal Ctrl-A plus that byte.

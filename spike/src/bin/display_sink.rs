@@ -115,7 +115,7 @@ pub fn scale_pos(px: f64, py: f64, surf_w: u32, surf_h: u32, gw: u32, gh: u32) -
 }
 
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
@@ -293,27 +293,36 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Fit the window to the screen. The guest renders at gw×gh (self.width/height);
-        // blit_frame scales that to whatever the window is, and scale_pos maps clicks
-        // back, so the window may be smaller than the guest scanout without distortion
-        // beyond uniform scaling. A guest taller than the display (e.g. 1000px on a
-        // 956pt screen) would otherwise run off the bottom. Scale by a single factor to
-        // preserve aspect, leaving room for the menu bar + title bar + a margin.
+        // The guest renders at gw×gh (self.width/height), chosen a touch under the host
+        // work area. Make the window's LOGICAL content exactly gw×gh: on a 2x display
+        // the physical surface is then 2·gw×2·gh and blit_frame upscales by an exact
+        // integer factor (sharp pixel-doubling, no fractional-scale blur). gw×gh leaves
+        // room for the title bar within the work area, so decorations stay on. On a
+        // screen smaller than the guest, downscale to fit (the only case that
+        // reintroduces fractional scaling, unavoidable there).
         let (mut w, mut h) = (self.width as f64, self.height as f64);
+        let mut pos: Option<LogicalPosition<f64>> = None;
         if let Some(mon) = event_loop.primary_monitor() {
             let sf = mon.scale_factor().max(1.0);
             let size = mon.size();
-            let avail_w = (size.width as f64 / sf - 40.0).max(320.0);
-            let avail_h = (size.height as f64 / sf - 120.0).max(240.0);
+            let (screen_w, screen_h) = (size.width as f64 / sf, size.height as f64 / sf);
+            let avail_w = screen_w.max(320.0);
+            let avail_h = (screen_h - 30.0).max(240.0); // leave the menu bar
             let f = (avail_w / w).min(avail_h / h).min(1.0);
             w *= f;
             h *= f;
+            // Center the window in the work area (below the menu bar) so the gap is
+            // symmetric instead of all on the bottom-right.
+            pos = Some(LogicalPosition::new((screen_w - w) / 2.0, 30.0 + (avail_h - h) / 2.0));
         }
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title("ignition")
             .with_inner_size(LogicalSize::new(w, h))
             .with_visible(self.visible)
             .with_resizable(false);
+        if let Some(p) = pos {
+            attrs = attrs.with_position(p);
+        }
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
