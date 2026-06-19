@@ -55,8 +55,27 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   chmod +x /etc/local.d/network.start
   printf "#!/bin/sh\ndevmem 0x091FF000 8 123\n" > /etc/local.d/boottime.start
   chmod +x /etc/local.d/boottime.start
-  # vmid: host-pushed CRNG reseed on snapshot restore (see build-rootfs.sh).
-  printf "#!/bin/sh\nsocat VSOCK-LISTEN:9000,fork EXEC:/usr/bin/vmid-reseed &\n" > /etc/local.d/vmid.start
+  # on-restore: runs once per snapshot restore (the host pushes the CRNG seed over
+  # vsock 9000 on every restore). Reseed the CRNG, THEN force a network re-init. A
+  # restore attaches a FRESH gvproxy with a new MAC/lease, so the restored guest must
+  # rebind virtio_net and re-DHCP to get a working address+route. The carrier-flap
+  # poller (netwatch) is best-effort and was not firing in the app launcher; this hook
+  # fires reliably on every restore. Net state is echoed to ttyS0 (session log).
+  cat > /usr/bin/on-restore <<'"'"'ONREOF'"'"'
+#!/bin/sh
+/usr/bin/vmid-reseed
+d=$(basename "$(readlink /sys/class/net/eth0/device)")
+echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
+echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+ifdown eth0 2>/dev/null
+ifup eth0 2>/dev/null
+echo "[on-restore] net re-init done" > /dev/ttyS0 2>&1
+ip addr show eth0 > /dev/ttyS0 2>&1
+ip route > /dev/ttyS0 2>&1
+ONREOF
+  chmod +x /usr/bin/on-restore
+  # vmid: host-pushed CRNG reseed + net re-init on snapshot restore.
+  printf "#!/bin/sh\nsocat VSOCK-LISTEN:9000,fork EXEC:/usr/bin/on-restore &\n" > /etc/local.d/vmid.start
   chmod +x /etc/local.d/vmid.start
 
   # URL injection: the host sends one validated URL line over vsock port 7777;
