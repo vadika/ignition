@@ -148,8 +148,13 @@ while :; do
     sleep 1
     start_ff
   elif ! pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
-    # firefox exited on its own (crash/close) -> relaunch on the current url
-    sleep 1; start_ff
+    # firefox exited (the user closed the window, or it crashed) -> end the disposable
+    # session: power off so boot exits (PSCI SYSTEM_OFF) and the host tears the session
+    # down + closes the window. start_ff waits for firefox to appear, so this never
+    # fires during the launcher fork window. (Browsing again = open a new session.)
+    echo "[kiosk-loop] firefox exited; powering off session" > /dev/ttyS0 2>&1
+    poweroff -f
+    exit 0
   fi
   sleep 0.5
 done
