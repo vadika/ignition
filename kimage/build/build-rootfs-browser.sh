@@ -111,6 +111,13 @@ start_ff() {
   rm -f "$PROFILES"/*/lock "$PROFILES"/*/.parentlock 2>/dev/null
   echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
   /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1 &
+  # firefox-esr is a launcher that forks the real /usr/lib/firefox and exits, and a
+  # cold start under llvmpipe takes several seconds. Wait until the real process
+  # appears (up to ~30s) before returning, so the crash-relaunch check below does not
+  # fire during the fork window and spawn a SECOND instance fighting for the profile
+  # ("bookmarks and history ... file is in use by another application").
+  i=0
+  while ! pgrep -f /usr/lib/firefox >/dev/null 2>&1 && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i+1)); done
 }
 start_ff
 while :; do
@@ -194,6 +201,20 @@ NETEOF
 }
 POLEOF
   sed -i "s|__HOMEPAGE__|$HOMEPAGE|" /usr/lib/firefox/distribution/policies.json
+
+  # Suppress the one-time "Firefox automatically sends some data to Mozilla" infobar
+  # (DisableTelemetry alone does not hide it). autoconfig locks the bypass pref for
+  # every profile, so a fresh disposable session never shows it.
+  mkdir -p /usr/lib/firefox/defaults/pref
+  cat > /usr/lib/firefox/defaults/pref/autoconfig.js <<'"'"'ACEOF'"'"'
+pref("general.config.filename", "firefox.cfg");
+pref("general.config.obscure_value", 0);
+ACEOF
+  cat > /usr/lib/firefox/firefox.cfg <<'"'"'CFGEOF'"'"'
+// firefox.cfg: the first line is ignored by the autoconfig parser, keep it a comment.
+lockPref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+lockPref("datareporting.healthreport.uploadEnabled", false);
+CFGEOF
 
   # udev (eudev): wlroots libinput discovers /dev/input/event* via udev. Without it
   # cage aborts ("libinput initialization failed, no input devices"). Run at sysinit
