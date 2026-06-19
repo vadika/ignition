@@ -30,7 +30,7 @@ def run(cmd, sol, timeout):
     try:
         p.send_signal(signal.SIGINT); p.wait(timeout=5)
     except Exception:
-        p.kill()
+        p.kill(); p.wait()
     out = p.stdout.read().decode(errors="replace") if p.stdout else ""
     return found, out
 

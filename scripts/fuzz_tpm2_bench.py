@@ -31,18 +31,17 @@ def parse_metrics(path):
 
 
 def run(reset, metrics_path, sols):
-    logf = open(sols + ".log", "w+b")
     cmd = [BOOT, "--fuzz", "--mem", MEM, "--initramfs", INITRAMFS, "--solutions", sols,
            "--reset", reset, "--seed", SEED, "--metrics", metrics_path, KERNEL]
-    p = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
-    deadline = time.time() + DURATION
-    while time.time() < deadline and p.poll() is None:
-        time.sleep(0.5)
-    try:
-        p.send_signal(signal.SIGINT); p.wait(timeout=10)
-    except Exception:
-        p.kill()
-    logf.close()
+    with open(sols + ".log", "w+b") as logf:
+        p = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+        deadline = time.time() + DURATION
+        while time.time() < deadline and p.poll() is None:
+            time.sleep(0.5)
+        try:
+            p.send_signal(signal.SIGINT); p.wait(timeout=10)
+        except Exception:
+            p.kill(); p.wait()
     return parse_metrics(metrics_path)
 
 
