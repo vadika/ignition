@@ -89,13 +89,26 @@ URLEOF
 #!/bin/sh
 # firefox-esr daemonizes (the launcher forks the real process and exits), so we
 # cannot track it by the launcher pid -- use pgrep on the real binary. Relaunch
-# ONLY when open-url writes a new URL: pkill the old instance, wait for the
-# profile lock to clear, then start a fresh --no-remote instance on the new URL.
+# ONLY when open-url writes a new URL, OR when firefox died (crash, Ctrl+Shift+R,
+# or a snapshot-restore that invalidated its GL/Wayland context). A SIGKILLed or
+# crashed firefox leaves a stale profile lock; the next launch would then show
+# "Firefox is already running, but is not responding" and the browser is dead.
+# So clear the lock before every launch and force-kill stragglers before relaunch.
 TARGET=/run/openurl.target
+PROFILES=/root/.mozilla/firefox
 url="${1:-about:blank}"
 : > "$TARGET"
 last=""
+kill_ff() {
+  pkill -f /usr/lib/firefox 2>/dev/null
+  i=0
+  while pgrep -f /usr/lib/firefox >/dev/null 2>&1 && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done
+  pkill -9 -f /usr/lib/firefox 2>/dev/null
+  while pgrep -f /usr/lib/firefox >/dev/null 2>&1; do sleep 0.2; done
+}
 start_ff() {
+  # Drop any stale profile lock left by a crashed/killed/frozen instance.
+  rm -f "$PROFILES"/*/lock "$PROFILES"/*/.parentlock 2>/dev/null
   echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
   /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1 &
 }
@@ -105,8 +118,7 @@ while :; do
   if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
     last="$cur"; url="$cur"
     echo "[kiosk-loop] navigating to: $url" > /dev/ttyS0 2>&1
-    pkill -f /usr/lib/firefox 2>/dev/null
-    while pgrep -f /usr/lib/firefox >/dev/null 2>&1; do sleep 0.2; done
+    kill_ff
     sleep 1
     start_ff
   elif ! pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
@@ -307,6 +319,9 @@ docker run --rm -v "$STAGE:/work" ubuntu:22.04 bash -euxc '
   rm -rf /tmp/rootfs && mkdir -p /tmp/rootfs
   tar xf /work/rootfs-browser.tar -C /tmp/rootfs
   rm -f /tmp/rootfs/.dockerenv
+  # Drop the build-only C sources left at / by the ro bind mounts (compiled to
+  # /usr/bin/{devmem,vmid-reseed} already; the sources are not needed at runtime).
+  rm -f /tmp/rootfs/devmem.c /tmp/rootfs/vmid-reseed.c
   for d in dev proc run sys tmp mnt; do mkdir -p /tmp/rootfs/$d; done
 
   rm -f /work/out/rootfs-browser.ext4
