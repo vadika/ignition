@@ -1,6 +1,6 @@
 # GUI display (software-rendered)
 
-`boot --gui <kernel> <rootfs>` opens a 1280x800 macOS window backed by a CPU
+`boot --gui <kernel> <rootfs>` opens a macOS window backed by a CPU
 framebuffer (`winit` + `softbuffer`, no Metal). The Linux guest renders into the
 window through a virtio-gpu device; a pair of virtio-input devices make the
 window interactive; and the GUI rootfs runs a cage Wayland kiosk for a full
@@ -11,8 +11,15 @@ software-rendered desktop.
 On macOS the winit event loop must own the main thread. Under `--gui` the entire
 VMM — vCPU threads, the serial console reader, the vsock reactor, the vmnet RX
 feeder — runs on spawned threads while the event loop runs on main. The window
-title is "ignition" and its size is fixed at 1280x800 logical points (on a
-Retina display the physical surface is larger; the blit path scales to fill).
+title is "ignition". The guest renders at a fixed scanout (`GUI_W`×`GUI_H`,
+currently 1400×880), chosen a touch under the host's work area so the window's
+**logical** size equals the scanout. On a 2× Retina display the physical surface
+is then exactly 2× the scanout, so the blit path upscales by an integer factor
+(sharp pixel-doubling, no fractional blur). The window is centered in the work
+area, leaving a symmetric gap on each side and room for the title bar. On a
+display smaller than the scanout it downscales to fit. Because the scanout size
+is baked into a snapshot, changing `GUI_W`/`GUI_H` requires rebuilding the base
+(see [Disposable browser](disposable-browser.md)).
 
 The present path is non-blocking: frames arrive over an mpsc channel and are
 coalesced to the latest before each blit, so a slow or frozen window never
@@ -56,12 +63,19 @@ interactive: a keyboard (`EV_KEY`) and an absolute tablet (`EV_ABS` x/y +
 buttons). The winit event loop translates host key/pointer/click events into
 Linux evdev events and injects them into the guest's eventq (`inject_rx`-style
 path), so typing logs in at the console and the pointer tracks the macOS cursor
-1:1 over the 1280x800 scanout.
+1:1 over the scanout.
 
 Mouse position is scaled from the physical surface size to guest coordinates
 (nearest-neighbor); button events map to `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`.
-Physical key codes map to Linux evdev scan codes; unmapped keys are dropped
-silently.
+Scroll is supported: the tablet advertises `EV_REL`/`REL_WHEEL`, and the window
+translates `MouseWheel` events into `REL_WHEEL` (trackpad sub-notch `PixelDelta`
+is accumulated so slow scrolls aren't rounded away). Physical key codes map to
+Linux evdev scan codes; unmapped keys are dropped silently.
+
+Note: the wheel axis is registered by the guest driver only at probe (guest
+boot). A guest restored from a snapshot taken before scroll support was added has
+no wheel axis, so injected `REL_WHEEL` events are dropped — rebuild the base
+snapshot to pick it up.
 
 The guest kernel needs:
 
