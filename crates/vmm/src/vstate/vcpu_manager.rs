@@ -563,6 +563,84 @@ impl VcpuManager {
         }
     }
 
+    /// If a snapshot/checkpoint/reset request is pending, join the rendezvous on
+    /// this vCPU thread and return `true` (caller `continue`s the run loop without
+    /// running the guest). Returns `false` when nothing is pending.
+    ///
+    /// Checked at the top of the run loop rather than only on a `Canceled` exit:
+    /// `vcpu_request_exit` is a one-shot cancel that the next `hv_vcpu_run`
+    /// consumes, and a vCPU servicing a burst of device notifies can have that
+    /// cancel surface as the device exit instead of `Canceled`, never diverting
+    /// otherwise. The request flags are monotonic until the leader clears them, so
+    /// every vCPU observes them here within one run().
+    fn try_rendezvous(self: &Arc<Self>, mpidr: u64, vcpu: &mut HvfVcpu) -> bool {
+        if self.snapshot_req.load(Ordering::Acquire) {
+            // Save our own registers (HVF thread-affinity) and meet every other
+            // vCPU at the barrier.
+            let st = vcpu.save_state();
+            self.collected.lock().unwrap().push((mpidr, st));
+            let bar = self
+                .snap_barrier
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("snap_barrier set when snapshot_req is set");
+            // Barrier 1: a full happens-before edge — every push is visible to the
+            // leader after this returns.
+            if bar.wait().is_leader() {
+                self.run_collect_leader(&self.snapshot_handler, &self.snapshot_req, "snapshot");
+            }
+            // Barrier 2: peers wait here while the leader writes; release together.
+            bar.wait();
+            return true;
+        }
+        if self.checkpoint_req.load(Ordering::Acquire) {
+            let st = vcpu.save_state();
+            self.collected.lock().unwrap().push((mpidr, st));
+            let bar = self
+                .snap_barrier
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("snap_barrier set when checkpoint_req is set");
+            if bar.wait().is_leader() {
+                self.run_collect_leader(&self.checkpoint_handler, &self.checkpoint_req, "checkpoint");
+            }
+            bar.wait();
+            return true;
+        }
+        if self.reset_req.load(Ordering::Acquire) {
+            let bar = self
+                .snap_barrier
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("snap_barrier set when reset_req is set");
+            // Barrier 1: all parked before the leader touches RAM/GIC/devices.
+            if bar.wait().is_leader() {
+                self.run_reset_leader();
+            }
+            // Barrier 2: rollback complete; each vCPU restores its own registers.
+            bar.wait();
+            let off = self.reset_vtimer_offset.load(Ordering::Acquire);
+            if let Some(rp) = self.reset_point.lock().unwrap().as_ref()
+                && let Some(cp) = rp.vcpus.iter().find(|c| c.mpidr == mpidr)
+                && let Err(e) = vcpu.restore_state(&cp.state, off)
+            {
+                log::error!("reset: vcpu {mpidr:#x} restore_state failed: {e}");
+            }
+            // Force the vtimer UNMASKED after reset, overriding the checkpoint's
+            // mask. A checkpoint marked while the guest was mid-timer-handling
+            // captures vtimer_mask=true; the rolled-back code never reaches its
+            // re-arm, so a restored mask leaves the vtimer dead on this core (RCU
+            // stall). Unmasking lets the timer fire so the guest re-arms normally;
+            // harmless when it was already unmasked (idle checkpoint).
+            let _ = ignition_hvf::vcpu_set_vtimer_mask(vcpu.id(), false);
+            return true;
+        }
+        false
+    }
+
     /// The shared per-vCPU run loop (primary and secondary).
     fn run_loop(self: &Arc<Self>, mpidr: u64, mut vcpu: HvfVcpu) -> Result<(), ignition_hvf::Error> {
         let vcpus: Arc<dyn Vcpus> = Arc::new(NoIrqVcpus);
@@ -578,9 +656,23 @@ impl VcpuManager {
         // already blocked in run(); a vcpu that exits for any other reason
         // re-checks the (monotonic) flag here on the next iteration. Bounded by
         // one vcpu.run() (MAX_PARK on WFI).
+        //
+        // The rendezvous check sits at the SAME top-of-loop spot, before
+        // vcpu.run(), for the identical reason. `vcpu_request_exit`
+        // (hv_vcpus_exit) only arms a one-shot cancel that the *next*
+        // hv_vcpu_run consumes; if that run was already returning an MMIO/WFX
+        // exit (e.g. a vCPU servicing a burst of virtio-vsock queue notifies),
+        // the cancel is swallowed as that exit and never resurfaces as
+        // `Canceled`. Such a vCPU would then loop on guest work forever and
+        // never reach the barrier, deadlocking every peer already parked there.
+        // Latching on the request flag here — not on the (lossy) Canceled exit —
+        // guarantees every vCPU diverts to the rendezvous within one run().
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if self.try_rendezvous(mpidr, &mut vcpu) {
+                continue;
             }
             match vcpu.run(vcpus.clone())? {
                 VcpuExit::MmioWrite(addr, data) => self.bus.write(addr, data),
@@ -619,81 +711,12 @@ impl VcpuManager {
                     return Ok(());
                 }
                 VcpuExit::Canceled => {
-                    if self.snapshot_req.load(Ordering::Acquire) {
-                        // Save our own registers (HVF thread-affinity) and meet
-                        // every other vCPU at the barrier.
-                        let st = vcpu.save_state();
-                        self.collected.lock().unwrap().push((mpidr, st));
-                        let bar = self
-                            .snap_barrier
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .expect("snap_barrier set when snapshot_req is set");
-                        // Barrier 1: a full happens-before edge — every push is
-                        // visible to the leader after this returns.
-                        if bar.wait().is_leader() {
-                            self.run_collect_leader(&self.snapshot_handler, &self.snapshot_req, "snapshot");
-                        }
-                        // Barrier 2: peers wait here while the leader writes;
-                        // release together and resume.
-                        bar.wait();
-                        continue;
-                    }
-                    if self.checkpoint_req.load(Ordering::Acquire) {
-                        // Save our own registers (HVF thread-affinity) and meet
-                        // every other vCPU at the barrier.
-                        let st = vcpu.save_state();
-                        self.collected.lock().unwrap().push((mpidr, st));
-                        let bar = self
-                            .snap_barrier
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .expect("snap_barrier set when checkpoint_req is set");
-                        // Barrier 1: a full happens-before edge — every push is
-                        // visible to the leader after this returns.
-                        if bar.wait().is_leader() {
-                            self.run_collect_leader(&self.checkpoint_handler, &self.checkpoint_req, "checkpoint");
-                        }
-                        // Barrier 2: peers wait here while the leader builds the
-                        // reset point; release together and resume.
-                        bar.wait();
-                        continue;
-                    }
-                    if self.reset_req.load(Ordering::Acquire) {
-                        let bar = self
-                            .snap_barrier
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .expect("snap_barrier set when reset_req is set");
-                        // Barrier 1: all parked before the leader touches
-                        // RAM/GIC/devices.
-                        if bar.wait().is_leader() {
-                            self.run_reset_leader();
-                        }
-                        // Barrier 2: rollback complete; each vCPU now restores its
-                        // own registers from its checkpoint in the reset point.
-                        bar.wait();
-                        let off = self.reset_vtimer_offset.load(Ordering::Acquire);
-                        if let Some(rp) = self.reset_point.lock().unwrap().as_ref()
-                            && let Some(cp) = rp.vcpus.iter().find(|c| c.mpidr == mpidr)
-                            && let Err(e) = vcpu.restore_state(&cp.state, off)
-                        {
-                            log::error!("reset: vcpu {mpidr:#x} restore_state failed: {e}");
-                        }
-                        // Force the vtimer UNMASKED after reset, overriding the
-                        // checkpoint's mask. A checkpoint marked while the guest was
-                        // mid-timer-handling captures vtimer_mask=true; the rolled-back
-                        // code never reaches its re-arm, so a restored mask leaves the
-                        // vtimer dead on this core (RCU stall). Unmasking lets the timer
-                        // fire so the guest re-arms normally; harmless when it was
-                        // already unmasked (idle checkpoint).
-                        let _ = ignition_hvf::vcpu_set_vtimer_mask(vcpu.id(), false);
-                        continue;
-                    }
-                    return Ok(());
+                    // A cancel only means "stop running the guest and re-check".
+                    // The top-of-loop checks (shutdown, then try_rendezvous) decide
+                    // what to do; a spurious cancel with nothing pending just
+                    // re-enters the guest. Doing the rendezvous here too would
+                    // double-handle the request the top check already owns.
+                    continue;
                 }
                 VcpuExit::WaitForEventTimeout(d) => thread::sleep(d.min(MAX_PARK)),
                 VcpuExit::WaitForEvent => thread::sleep(MAX_PARK),
