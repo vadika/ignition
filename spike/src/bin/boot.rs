@@ -48,6 +48,14 @@ mod display_sink;
 /// Host console escape key: Ctrl-A (0x01).
 const CTRL_A: u8 = 0x01;
 
+/// GUI framebuffer size: virtio-gpu scanout, host window, and tablet ABS range all
+/// use these. The guest renders at this resolution, so the fresh-boot AND restore
+/// paths MUST pass the same values or the window and scanout disagree -- and a base
+/// snapshot only restores cleanly at the resolution it was built with. 800 was too
+/// short for modern sites that assume more vertical room; 1000 gives headroom.
+const GUI_W: u32 = 1280;
+const GUI_H: u32 = 1000;
+
 /// State of the host-side escape sequence. Ctrl-A then `x` quits the harness;
 /// Ctrl-A then anything else forwards a literal Ctrl-A plus that byte.
 enum EscState {
@@ -740,7 +748,7 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
         if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-gpu", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new(
                 "virtio-gpu",
-                Box::new(ignition_devices::virtio::gpu::VirtioGpu::new(1280, 800, sink)),
+                Box::new(ignition_devices::virtio::gpu::VirtioGpu::new(GUI_W, GUI_H, sink)),
                 mem,
                 irq,
             ))? {
@@ -758,7 +766,7 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
         if let Some(h) = place::<VirtioMmio, _>(mgr, &mode, "virtio-tablet", layout::MMIO_WINDOW,
             move |irq| VirtioMmio::new(
                 "virtio-tablet",
-                Box::new(ignition_devices::virtio::input::VirtioInput::tablet(1280, 800)),
+                Box::new(ignition_devices::virtio::input::VirtioInput::tablet(GUI_W, GUI_H)),
                 mem_tab, irq))? {
             ctx.tablet_mmio = Some(h);
         }
@@ -1431,12 +1439,12 @@ fn main() {
         display_sink::run_event_loop(
             rx,
             done,
-            1280,
-            800,
+            GUI_W,
+            GUI_H,
             kbd_handle,
             tab_handle,
-            1280,
-            800,
+            GUI_W,
+            GUI_H,
             Some(manager.clone()),
         );
     } else {
@@ -2425,12 +2433,12 @@ fn run_restore(
         display_sink::run_event_loop(
             rx,
             done,
-            1280,
-            800,
+            GUI_W,
+            GUI_H,
             kbd_handle,
             tab_handle,
-            1280,
-            800,
+            GUI_W,
+            GUI_H,
             Some(manager.clone()),
         );
         Ok(())
