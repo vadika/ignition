@@ -47,26 +47,15 @@ trap cleanup EXIT INT TERM
 exec 3<>"$fifo"
 
 echo "cold-booting browser rootfs to create snapshot '$NAME' ..."
-# NET=1 (default) attaches socket_vmnet so the homepage loads during warm-up.
-# NET=0 builds a net-free base: required for the disposable-browser app (zero-setup,
-# no socket_vmnet daemon) and more correct for the quiescent-snapshot rule (no live
-# TLS at snapshot) -- pair it with a rootfs built HOMEPAGE=about:blank (see
-# build-rootfs-browser.sh) so Firefox idles with no pending connections; each cloned
-# child then gets gvproxy NAT + an injected URL.
-# Net mode for the warm base. The base MUST include the virtio-net DEVICE (so a
-# restored clone can attach a fresh backend + re-DHCP); a net-free base has no
-# eth0 to restore. Quiescence (no live TLS) comes from sitting on about:blank, NOT
-# from omitting the device.
+# Net mode for the warm base. The base MUST include the virtio-net DEVICE so a
+# restored clone can attach a fresh backend + re-DHCP. Quiescence (no live TLS)
+# comes from sitting on about:blank, NOT from omitting the device.
 #   NET_SOCKET=<path> : --net over a gvproxy qemu socket (no daemon/sudo) -- what
 #                       the disposable-browser app uses; device present, DHCP lease.
-#   NET=1 (default)   : --net over socket_vmnet (needs the daemon).
-#   NET=0             : no net device (only for non-networked bases).
-NET="${NET:-1}"
+#   else (default)    : --net over socket_vmnet (needs the daemon).
 NET_SOCKET="${NET_SOCKET:-}"
 if [ -n "$NET_SOCKET" ]; then
   NET_FLAG="--net --net-socket $NET_SOCKET"
-elif [ "$NET" = 0 ]; then
-  NET_FLAG=""
 else
   NET_FLAG="--net"
 fi
