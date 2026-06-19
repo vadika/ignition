@@ -855,6 +855,7 @@ fn main() {
     let mut no_sandbox = false;
     let mut no_reseed = false;
     let mut gui = false;
+    let mut gui_hidden = false;
     let mut track_dirty = false;
     let mut restore_name: Option<String> = None;
     let mut control_sock: Option<PathBuf> = None;
@@ -942,6 +943,13 @@ fn main() {
             }
             "--gui" => {
                 gui = true;
+            }
+            // Like --gui but starts the host window hidden (the guest still renders +
+            // snapshots normally). Used by the first-run base build so the warming
+            // browser does not flash a window the user might click.
+            "--gui-hidden" => {
+                gui = true;
+                gui_hidden = true;
             }
             "--track-dirty" => {
                 track_dirty = true;
@@ -1446,6 +1454,7 @@ fn main() {
             GUI_W,
             GUI_H,
             Some(manager.clone()),
+            !gui_hidden,
         );
     } else {
         apply_or_exit(&sb_paths, no_sandbox);
@@ -2440,6 +2449,7 @@ fn run_restore(
             GUI_W,
             GUI_H,
             Some(manager.clone()),
+            true, // restored sessions are always visible (--gui-hidden is first-run only)
         );
         Ok(())
     } else {
