@@ -37,6 +37,21 @@ void target_init(void) {
 }
 
 void target_parse(const uint8_t *data, unsigned long len) {
+    /* PLANTED BUG (fuzz demo gate, see spec). A length-field OOB in the classic
+     * CVE shape, standing in for a vulnerable TPM command handler: when the input
+     * is a TPM2_NV_Write command (commandCode 0x00000137 at the header's cc slot),
+     * copy its size-prefixed payload into a fixed 32-byte scratch with no bound
+     * check. ASan traps the stack overflow and the harness rings CRASH; the M1-
+     * style gate rediscovers it by mutating the size field past 32. It lives in
+     * the wrapper (not a patched upstream handler) so the build stays a clean
+     * upstream clone; real handler bugs are the real-CVE stretch. */
+    if (len >= 14 &&
+        data[6] == 0x00 && data[7] == 0x00 && data[8] == 0x01 && data[9] == 0x37) {
+        uint16_t sz = (uint16_t)((data[12] << 8) | data[13]);  /* payload size field */
+        volatile unsigned char scratch[32];
+        for (uint16_t k = 0; k < sz && (14u + k) <= len; k++)
+            scratch[k] = data[14 + k];   /* BUG: writes past scratch when sz > 32 */
+    }
     unsigned char rsp[4096];
     unsigned char *rp = rsp;
     uint32_t rlen = sizeof rsp;
