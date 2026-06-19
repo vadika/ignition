@@ -63,14 +63,16 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   # fires reliably on every restore. Net state is echoed to ttyS0 (session log).
   cat > /usr/bin/on-restore <<'"'"'ONREOF'"'"'
 #!/bin/sh
+# Runs once per restore (host pushes the CRNG seed over vsock 9000). Reseed, then
+# refresh the DHCP lease for the fresh gvproxy. Do NOT unbind/bind virtio_net: that
+# rebind (intended to re-read a clone MAC) DESTROYS eth0 here -- the bind fails after
+# unbind and the device never returns, leaving no eth0 + no route. Each session has
+# its own isolated gvproxy, so the MAC need not change; a plain re-DHCP is enough.
 /usr/bin/vmid-reseed
-d=$(basename "$(readlink /sys/class/net/eth0/device)")
-echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
-echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
 ifdown eth0 2>/dev/null
 ifup eth0 2>/dev/null
 echo "[on-restore] net re-init done" > /dev/ttyS0 2>&1
-ip addr show eth0 > /dev/ttyS0 2>&1
+ip -o addr show eth0 > /dev/ttyS0 2>&1
 ip route > /dev/ttyS0 2>&1
 ONREOF
   chmod +x /usr/bin/on-restore
@@ -147,7 +149,7 @@ while :; do
     code=$(cat "$DONE" 2>/dev/null); rm -f "$DONE"
     if [ "$code" = 0 ]; then
       echo "[kiosk-loop] firefox closed (exit 0); powering off session" > /dev/ttyS0 2>&1
-      poweroff -f
+      doas poweroff -f   # kiosk-loop runs as the kiosk user; reboot(2) needs root
       exit 0
     fi
     echo "[kiosk-loop] firefox exited (code $code); relaunching" > /dev/ttyS0 2>&1
@@ -173,11 +175,10 @@ KIOSKEOF
   while :; do
     cur=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
     if [ "$prev" = 0 ] && [ "$cur" = 1 ]; then
-      d=$(basename "$(readlink /sys/class/net/eth0/device)")
-      echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind 2>/dev/null
-      echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind 2>/dev/null
+      # Carrier came back (restore bounces the link). Just re-DHCP -- do NOT
+      # unbind/bind virtio_net: that rebind destroys eth0 (bind fails after unbind).
       ifdown eth0 2>/dev/null; ifup eth0
-      sleep 5          # cooldown: ignore the rebind-induced carrier flap
+      sleep 5          # cooldown: ignore the re-DHCP-induced flap
       prev=1
       continue
     fi
@@ -206,6 +207,10 @@ NETEOF
   # not root. First adduser -D gets uid 1000 on alpine (matches XDG_RUNTIME_DIR below).
   adduser -D -h /home/kiosk kiosk
   for g in video input seat tty; do addgroup kiosk "$g" 2>/dev/null || true; done
+  # kiosk-loop (running as kiosk) ends the disposable session by powering off, but
+  # reboot(2) needs root. Allow kiosk to run ONLY poweroff via doas (Alpine sudo).
+  apk add --no-cache doas
+  echo "permit nopass kiosk as root cmd poweroff" > /etc/doas.conf
 
   # Firefox kiosk policy: no first-run, no telemetry, no update checks, set homepage.
   mkdir -p /usr/lib/firefox/distribution
