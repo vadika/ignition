@@ -106,37 +106,33 @@ URLEOF
   # and relaunches on it. Single instance, no remote/DBus/profile-lock. $1 = initial URL.
   cat > /usr/bin/kiosk-loop <<'"'"'KIOSKEOF'"'"'
 #!/bin/sh
-# firefox-esr daemonizes (the launcher forks the real process and exits), so we
-# cannot track it by the launcher pid -- use pgrep on the real binary. Relaunch
-# ONLY when open-url writes a new URL, OR when firefox died (crash, Ctrl+Shift+R,
-# or a snapshot-restore that invalidated its GL/Wayland context). A SIGKILLed or
-# crashed firefox leaves a stale profile lock; the next launch would then show
-# "Firefox is already running, but is not responding" and the browser is dead.
-# So clear the lock before every launch and force-kill stragglers before relaunch.
+# /usr/bin/firefox-esr is "exec /usr/lib/firefox-esr/firefox-esr" -- it execs, so we
+# run it in a subshell that captures the REAL exit code into $DONE. That lets us tell:
+#   exit 0   = the user closed the window  -> end the disposable session (poweroff)
+#   non-zero = crash, Ctrl+Shift+R, or a snapshot-restore that killed firefox GL/Wayland
+#              -> relaunch and recover (the restored firefox dies on resume; this is how
+#              a New-Browser session comes back instead of powering off instantly).
+# Navigation (open-url writes a new URL) kills + relaunches. A killed/crashed firefox
+# can leave a stale profile lock, so clear it before every launch.
 TARGET=/run/openurl.target
+DONE="${XDG_RUNTIME_DIR:-/tmp}/ff-done"   # kiosk-writable; /run itself is root-owned
 PROFILES="$HOME/.mozilla/firefox"
 url="${1:-about:blank}"
 : > "$TARGET"
 last=""
+start_ff() {
+  rm -f "$PROFILES"/*/lock "$PROFILES"/*/.parentlock "$DONE" 2>/dev/null
+  echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
+  # Foreground firefox inside the subshell so $? is its real exit code; publish it.
+  ( /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1; echo $? > "$DONE" ) &
+}
 kill_ff() {
   pkill -f /usr/lib/firefox 2>/dev/null
   i=0
   while pgrep -f /usr/lib/firefox >/dev/null 2>&1 && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i+1)); done
   pkill -9 -f /usr/lib/firefox 2>/dev/null
   while pgrep -f /usr/lib/firefox >/dev/null 2>&1; do sleep 0.2; done
-}
-start_ff() {
-  # Drop any stale profile lock left by a crashed/killed/frozen instance.
-  rm -f "$PROFILES"/*/lock "$PROFILES"/*/.parentlock 2>/dev/null
-  echo "[kiosk-loop] launching firefox: $url" > /dev/ttyS0 2>&1
-  /usr/bin/firefox-esr --no-remote "$url" >/dev/null 2>&1 &
-  # firefox-esr is a launcher that forks the real /usr/lib/firefox and exits, and a
-  # cold start under llvmpipe takes several seconds. Wait until the real process
-  # appears (up to ~30s) before returning, so the crash-relaunch check below does not
-  # fire during the fork window and spawn a SECOND instance fighting for the profile
-  # ("bookmarks and history ... file is in use by another application").
-  i=0
-  while ! pgrep -f /usr/lib/firefox >/dev/null 2>&1 && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i+1)); done
+  rm -f "$DONE"   # discard the exit code from this intentional kill
 }
 start_ff
 while :; do
@@ -147,14 +143,16 @@ while :; do
     kill_ff
     sleep 1
     start_ff
-  elif ! pgrep -f /usr/lib/firefox >/dev/null 2>&1; then
-    # firefox exited (the user closed the window, or it crashed) -> end the disposable
-    # session: power off so boot exits (PSCI SYSTEM_OFF) and the host tears the session
-    # down + closes the window. start_ff waits for firefox to appear, so this never
-    # fires during the launcher fork window. (Browsing again = open a new session.)
-    echo "[kiosk-loop] firefox exited; powering off session" > /dev/ttyS0 2>&1
-    poweroff -f
-    exit 0
+  elif [ -f "$DONE" ]; then
+    code=$(cat "$DONE" 2>/dev/null); rm -f "$DONE"
+    if [ "$code" = 0 ]; then
+      echo "[kiosk-loop] firefox closed (exit 0); powering off session" > /dev/ttyS0 2>&1
+      poweroff -f
+      exit 0
+    fi
+    echo "[kiosk-loop] firefox exited (code $code); relaunching" > /dev/ttyS0 2>&1
+    sleep 1
+    start_ff
   fi
   sleep 0.5
 done
