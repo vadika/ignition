@@ -60,11 +60,13 @@ pub fn group_index(source_id: &str) -> usize {
 
 /// Number of "next group" presses to advance from `current` to `target`, wrapping over `n` groups.
 pub fn cycle_count(current: usize, target: usize, n: usize) -> usize {
+    if n == 0 { return 0; }
     (target + n - current % n) % n
 }
 
 /// Read the current macOS keyboard layout's input-source id (e.g. "com.apple.keylayout.Russian")
 /// via the Carbon Text Input Sources API. Returns None if it can't be read.
+/// Call on the main thread (Carbon TIS is main-thread-only); the winit event loop is main-thread.
 #[cfg(target_os = "macos")]
 fn current_source_id() -> Option<String> {
     use core_foundation::base::{CFRelease, TCFType};
