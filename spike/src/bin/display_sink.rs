@@ -63,6 +63,42 @@ pub fn cycle_count(current: usize, target: usize, n: usize) -> usize {
     (target + n - current % n) % n
 }
 
+/// Read the current macOS keyboard layout's input-source id (e.g. "com.apple.keylayout.Russian")
+/// via the Carbon Text Input Sources API. Returns None if it can't be read.
+#[cfg(target_os = "macos")]
+fn current_source_id() -> Option<String> {
+    use core_foundation::base::{CFRelease, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::os::raw::c_void;
+    type TISInputSourceRef = *mut c_void;
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef; // +1 ref (must release)
+        fn TISGetInputSourceProperty(src: TISInputSourceRef, key: CFStringRef) -> *const c_void; // get-rule
+        static kTISPropertyInputSourceID: CFStringRef;
+    }
+    unsafe {
+        let src = TISCopyCurrentKeyboardInputSource();
+        if src.is_null() {
+            return None;
+        }
+        let val = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+        let out = if val.is_null() {
+            None
+        } else {
+            Some(CFString::wrap_under_get_rule(val as CFStringRef).to_string())
+        };
+        CFRelease(src as *const c_void);
+        out
+    }
+}
+
+/// The xkb group index that matches the current macOS layout (0 = us fallback).
+#[cfg(target_os = "macos")]
+fn current_macos_group() -> usize {
+    current_source_id().map(|id| group_index(&id)).unwrap_or(0)
+}
+
 /// A host-side action triggered by a GUI hotkey chord, dispatched to the
 /// `VcpuManager` instead of being forwarded to the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
