@@ -15,6 +15,9 @@ use std::time::Duration;
 use ignition_devices::display::{DisplaySink, Frame};
 use winit::keyboard::KeyCode;
 
+/// Linux evdev KEY_SCROLLLOCK. cage binds it to "advance xkb group" via grp:sclk_toggle.
+const KEY_SCROLLLOCK: u16 = 70;
+
 /// Map a winit physical key to a Linux evdev key code. Covers the committed subset
 /// (letters, digits, common control/navigation/modifier/punctuation keys). Unmapped
 /// keys return None and are dropped.
@@ -37,6 +40,68 @@ pub fn map_keycode(kc: KeyCode) -> Option<u16> {
         AltLeft => 56, AltRight => 100, SuperLeft => 125, SuperRight => 126,
         _ => return None,
     })
+}
+
+/// (macOS Text Input Source id, xkb layout name). The array index is the xkb GROUP index;
+/// this order MUST match `XKB_DEFAULT_LAYOUT` in kimage/build/build-rootfs-browser.sh.
+/// Group 0 is `us` and is the fallback for any unrecognised macOS layout.
+pub const LAYOUTS: &[(&str, &str)] = &[
+    ("com.apple.keylayout.US", "us"),
+    ("com.apple.keylayout.Russian", "ru"),
+    ("com.apple.keylayout.German", "de"),
+    ("com.apple.keylayout.French", "fr"),
+    ("com.apple.keylayout.Spanish", "es"),
+    ("com.apple.keylayout.Italian", "it"),
+    ("com.apple.keylayout.Ukrainian", "ua"),
+    ("com.apple.keylayout.Polish", "pl"),
+];
+
+/// macOS input-source id -> xkb group index (0 = us fallback for anything unknown).
+pub fn group_index(source_id: &str) -> usize {
+    LAYOUTS.iter().position(|(id, _)| *id == source_id).unwrap_or(0)
+}
+
+/// Number of "next group" presses to advance from `current` to `target`, wrapping over `n` groups.
+pub fn cycle_count(current: usize, target: usize, n: usize) -> usize {
+    if n == 0 { return 0; }
+    (target + n - current % n) % n
+}
+
+/// Read the current macOS keyboard layout's input-source id (e.g. "com.apple.keylayout.Russian")
+/// via the Carbon Text Input Sources API. Returns None if it can't be read.
+/// Call on the main thread (Carbon TIS is main-thread-only); the winit event loop is main-thread.
+#[cfg(target_os = "macos")]
+fn current_source_id() -> Option<String> {
+    use core_foundation::base::{CFRelease, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::os::raw::c_void;
+    type TISInputSourceRef = *mut c_void;
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef; // +1 ref (must release)
+        fn TISGetInputSourceProperty(src: TISInputSourceRef, key: CFStringRef) -> *const c_void; // get-rule
+        static kTISPropertyInputSourceID: CFStringRef;
+    }
+    unsafe {
+        let src = TISCopyCurrentKeyboardInputSource();
+        if src.is_null() {
+            return None;
+        }
+        let val = TISGetInputSourceProperty(src, kTISPropertyInputSourceID);
+        let out = if val.is_null() {
+            None
+        } else {
+            Some(CFString::wrap_under_get_rule(val as CFStringRef).to_string())
+        };
+        CFRelease(src as *const c_void);
+        out
+    }
+}
+
+/// The xkb group index that matches the current macOS layout (0 = us fallback).
+#[cfg(target_os = "macos")]
+fn current_macos_group() -> usize {
+    current_source_id().map(|id| group_index(&id)).unwrap_or(0)
 }
 
 /// A host-side action triggered by a GUI hotkey chord, dispatched to the
@@ -210,6 +275,9 @@ struct App {
     /// Live modifier state, updated from `ModifiersChanged`, read to detect the
     /// Ctrl+Alt+<letter> host hotkey chords before forwarding keys to the guest.
     modifiers: winit::keyboard::ModifiersState,
+    /// Host-side model of the guest's active xkb group (cage starts at 0 on every fresh
+    /// restore; a session restore is a fresh boot process so this resets to 0 automatically).
+    guest_group: usize,
     /// The VM owning this window, so a host hotkey can request reset/checkpoint/
     /// snapshot. `None` outside the GUI reset use-case (keys then always forward).
     manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
@@ -289,6 +357,39 @@ impl App {
             }
         }
     }
+
+    /// Make the guest's active xkb group match the current macOS layout by injecting
+    /// `KEY_SCROLLLOCK` presses (each advances one group). No-op on non-macOS or when
+    /// already aligned. Best-effort: a failed inject just leaves the group as-is.
+    #[cfg(target_os = "macos")]
+    fn sync_group(&mut self) {
+        use ignition_devices::virtio::input::InputEvent;
+        let Some(kbd) = &self.keyboard else { return };
+        let target = current_macos_group();
+        let steps = cycle_count(self.guest_group, target, LAYOUTS.len());
+        if steps == 0 {
+            return;
+        }
+        // One contiguous batch of `steps` Scroll Lock press/release pairs (cage advances the
+        // xkb group on each press). Injecting in a single call keeps the advance events
+        // together in the guest queue rather than splitting a press from its release.
+        let mut evs = Vec::with_capacity(steps * 4);
+        for _ in 0..steps {
+            evs.push(InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 1 }); // press
+            evs.push(InputEvent { etype: 0, code: 0, value: 0 });             // SYN
+            evs.push(InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 0 }); // release
+            evs.push(InputEvent { etype: 0, code: 0, value: 0 });             // SYN
+        }
+        let ok = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+        // Only advance the host-side model if the events were actually queued, so a failed
+        // inject doesn't leave guest_group claiming an alignment the guest never reached.
+        if ok {
+            self.guest_group = target;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sync_group(&mut self) {}
 }
 
 impl ApplicationHandler for App {
@@ -371,17 +472,20 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if let PhysicalKey::Code(kc) = event.physical_key
-                    && let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard)
-                {
-                    let value = if event.state.is_pressed() { 1 } else { 0 };
-                    let evs = [
-                        InputEvent { etype: 1, code, value },       // EV_KEY
-                        InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
-                    ];
-                    // Best-effort: recover the guard if a vCPU panic poisoned the
-                    // device mutex, so a GUI event can't mask the original crash.
-                    let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+                if let PhysicalKey::Code(kc) = event.physical_key {
+                    if event.state.is_pressed() && !event.repeat && map_keycode(kc).is_some() {
+                        self.sync_group();
+                    }
+                    if let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard) {
+                        let value = if event.state.is_pressed() { 1 } else { 0 };
+                        let evs = [
+                            InputEvent { etype: 1, code, value },       // EV_KEY
+                            InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
+                        ];
+                        // Best-effort: recover the guard if a vCPU panic poisoned the
+                        // device mutex, so a GUI event can't mask the original crash.
+                        let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -493,6 +597,7 @@ pub fn run_event_loop(
         gw,
         gh,
         modifiers: winit::keyboard::ModifiersState::empty(),
+        guest_group: 0,
         manager,
         scroll_accum: 0.0,
         visible,
@@ -588,5 +693,28 @@ mod tests {
         blit_frame(&mut buf, 2, 1, &frame);
         assert_eq!(buf[0], (0x33u32 << 16) | (0x22 << 8) | 0x11);
         assert_eq!(buf[1], (0x66u32 << 16) | (0x55 << 8) | 0x44);
+    }
+
+    #[test]
+    fn layout_table_order_matches_baked_groups() {
+        // LAYOUTS[i] is xkb group i. This count MUST equal the number of comma-separated
+        // entries in XKB_DEFAULT_LAYOUT in kimage/build/build-rootfs-browser.sh.
+        assert_eq!(LAYOUTS.len(), 8);
+        assert_eq!(LAYOUTS[0].1, "us"); // group 0 is the fallback
+    }
+
+    #[test]
+    fn group_index_known_and_unknown() {
+        assert_eq!(group_index("com.apple.keylayout.US"), 0);
+        assert_eq!(group_index("com.apple.keylayout.Russian"), 1);
+        assert_eq!(group_index("com.apple.keylayout.German"), 2);
+        assert_eq!(group_index("com.apple.keylayout.Nonexistent"), 0); // unknown -> us
+    }
+
+    #[test]
+    fn cycle_count_wraps() {
+        assert_eq!(cycle_count(0, 3, 8), 3);
+        assert_eq!(cycle_count(3, 3, 8), 0);
+        assert_eq!(cycle_count(7, 1, 8), 2); // wrap forward: 7 -> 0 -> 1
     }
 }
