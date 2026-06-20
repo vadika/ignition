@@ -39,6 +39,30 @@ pub fn map_keycode(kc: KeyCode) -> Option<u16> {
     })
 }
 
+/// (macOS Text Input Source id, xkb layout name). The array index is the xkb GROUP index;
+/// this order MUST match `XKB_DEFAULT_LAYOUT` in kimage/build/build-rootfs-browser.sh.
+/// Group 0 is `us` and is the fallback for any unrecognised macOS layout.
+pub const LAYOUTS: &[(&str, &str)] = &[
+    ("com.apple.keylayout.US", "us"),
+    ("com.apple.keylayout.Russian", "ru"),
+    ("com.apple.keylayout.German", "de"),
+    ("com.apple.keylayout.French", "fr"),
+    ("com.apple.keylayout.Spanish", "es"),
+    ("com.apple.keylayout.Italian", "it"),
+    ("com.apple.keylayout.Ukrainian", "ua"),
+    ("com.apple.keylayout.Polish", "pl"),
+];
+
+/// macOS input-source id -> xkb group index (0 = us fallback for anything unknown).
+pub fn group_index(source_id: &str) -> usize {
+    LAYOUTS.iter().position(|(id, _)| *id == source_id).unwrap_or(0)
+}
+
+/// Number of "next group" presses to advance from `current` to `target`, wrapping over `n` groups.
+pub fn cycle_count(current: usize, target: usize, n: usize) -> usize {
+    (target + n - current % n) % n
+}
+
 /// A host-side action triggered by a GUI hotkey chord, dispatched to the
 /// `VcpuManager` instead of being forwarded to the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,5 +612,28 @@ mod tests {
         blit_frame(&mut buf, 2, 1, &frame);
         assert_eq!(buf[0], (0x33u32 << 16) | (0x22 << 8) | 0x11);
         assert_eq!(buf[1], (0x66u32 << 16) | (0x55 << 8) | 0x44);
+    }
+
+    #[test]
+    fn layout_table_order_matches_baked_groups() {
+        // LAYOUTS[i] is xkb group i. This count MUST equal the number of comma-separated
+        // entries in XKB_DEFAULT_LAYOUT in kimage/build/build-rootfs-browser.sh.
+        assert_eq!(LAYOUTS.len(), 8);
+        assert_eq!(LAYOUTS[0].1, "us"); // group 0 is the fallback
+    }
+
+    #[test]
+    fn group_index_known_and_unknown() {
+        assert_eq!(group_index("com.apple.keylayout.US"), 0);
+        assert_eq!(group_index("com.apple.keylayout.Russian"), 1);
+        assert_eq!(group_index("com.apple.keylayout.German"), 2);
+        assert_eq!(group_index("com.apple.keylayout.Nonexistent"), 0); // unknown -> us
+    }
+
+    #[test]
+    fn cycle_count_wraps() {
+        assert_eq!(cycle_count(0, 3, 8), 3);
+        assert_eq!(cycle_count(3, 3, 8), 0);
+        assert_eq!(cycle_count(7, 1, 8), 2); // wrap forward: 7 -> 0 -> 1
     }
 }
