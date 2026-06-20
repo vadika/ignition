@@ -15,6 +15,9 @@ use std::time::Duration;
 use ignition_devices::display::{DisplaySink, Frame};
 use winit::keyboard::KeyCode;
 
+/// Linux evdev KEY_SCROLLLOCK. cage binds it to "advance xkb group" via grp:sclk_toggle.
+const KEY_SCROLLLOCK: u16 = 70;
+
 /// Map a winit physical key to a Linux evdev key code. Covers the committed subset
 /// (letters, digits, common control/navigation/modifier/punctuation keys). Unmapped
 /// keys return None and are dropped.
@@ -272,6 +275,9 @@ struct App {
     /// Live modifier state, updated from `ModifiersChanged`, read to detect the
     /// Ctrl+Alt+<letter> host hotkey chords before forwarding keys to the guest.
     modifiers: winit::keyboard::ModifiersState,
+    /// Host-side model of the guest's active xkb group (cage starts at 0 on every fresh
+    /// restore; a session restore is a fresh boot process so this resets to 0 automatically).
+    guest_group: usize,
     /// The VM owning this window, so a host hotkey can request reset/checkpoint/
     /// snapshot. `None` outside the GUI reset use-case (keys then always forward).
     manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
@@ -351,6 +357,30 @@ impl App {
             }
         }
     }
+
+    /// Make the guest's active xkb group match the current macOS layout by injecting
+    /// `KEY_SCROLLLOCK` presses (each advances one group). No-op on non-macOS or when
+    /// already aligned. Best-effort: a failed inject just leaves the group as-is.
+    #[cfg(target_os = "macos")]
+    fn sync_group(&mut self) {
+        use ignition_devices::virtio::input::InputEvent;
+        let Some(kbd) = &self.keyboard else { return };
+        let target = current_macos_group();
+        let n = LAYOUTS.len();
+        for _ in 0..cycle_count(self.guest_group, target, n) {
+            let evs = [
+                InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 1 }, // press
+                InputEvent { etype: 0, code: 0, value: 0 },             // SYN
+                InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 0 }, // release
+                InputEvent { etype: 0, code: 0, value: 0 },             // SYN
+            ];
+            let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+        }
+        self.guest_group = target;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sync_group(&mut self) {}
 }
 
 impl ApplicationHandler for App {
@@ -433,17 +463,20 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
-                if let PhysicalKey::Code(kc) = event.physical_key
-                    && let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard)
-                {
-                    let value = if event.state.is_pressed() { 1 } else { 0 };
-                    let evs = [
-                        InputEvent { etype: 1, code, value },       // EV_KEY
-                        InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
-                    ];
-                    // Best-effort: recover the guard if a vCPU panic poisoned the
-                    // device mutex, so a GUI event can't mask the original crash.
-                    let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+                if let PhysicalKey::Code(kc) = event.physical_key {
+                    if event.state.is_pressed() {
+                        self.sync_group();
+                    }
+                    if let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard) {
+                        let value = if event.state.is_pressed() { 1 } else { 0 };
+                        let evs = [
+                            InputEvent { etype: 1, code, value },       // EV_KEY
+                            InputEvent { etype: 0, code: 0, value: 0 }, // EV_SYN/SYN_REPORT
+                        ];
+                        // Best-effort: recover the guard if a vCPU panic poisoned the
+                        // device mutex, so a GUI event can't mask the original crash.
+                        let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -555,6 +588,7 @@ pub fn run_event_loop(
         gw,
         gh,
         modifiers: winit::keyboard::ModifiersState::empty(),
+        guest_group: 0,
         manager,
         scroll_accum: 0.0,
         visible,
