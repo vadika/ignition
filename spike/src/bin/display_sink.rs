@@ -366,17 +366,26 @@ impl App {
         use ignition_devices::virtio::input::InputEvent;
         let Some(kbd) = &self.keyboard else { return };
         let target = current_macos_group();
-        let n = LAYOUTS.len();
-        for _ in 0..cycle_count(self.guest_group, target, n) {
-            let evs = [
-                InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 1 }, // press
-                InputEvent { etype: 0, code: 0, value: 0 },             // SYN
-                InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 0 }, // release
-                InputEvent { etype: 0, code: 0, value: 0 },             // SYN
-            ];
-            let _ = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+        let steps = cycle_count(self.guest_group, target, LAYOUTS.len());
+        if steps == 0 {
+            return;
         }
-        self.guest_group = target;
+        // One contiguous batch of `steps` Scroll Lock press/release pairs (cage advances the
+        // xkb group on each press). Injecting in a single call keeps the advance events
+        // together in the guest queue rather than splitting a press from its release.
+        let mut evs = Vec::with_capacity(steps * 4);
+        for _ in 0..steps {
+            evs.push(InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 1 }); // press
+            evs.push(InputEvent { etype: 0, code: 0, value: 0 });             // SYN
+            evs.push(InputEvent { etype: 1, code: KEY_SCROLLLOCK, value: 0 }); // release
+            evs.push(InputEvent { etype: 0, code: 0, value: 0 });             // SYN
+        }
+        let ok = kbd.lock().unwrap_or_else(|p| p.into_inner()).inject_input(&evs);
+        // Only advance the host-side model if the events were actually queued, so a failed
+        // inject doesn't leave guest_group claiming an alignment the guest never reached.
+        if ok {
+            self.guest_group = target;
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -464,7 +473,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 if let PhysicalKey::Code(kc) = event.physical_key {
-                    if event.state.is_pressed() {
+                    if event.state.is_pressed() && !event.repeat && map_keycode(kc).is_some() {
                         self.sync_group();
                     }
                     if let (Some(code), Some(kbd)) = (map_keycode(kc), &self.keyboard) {
