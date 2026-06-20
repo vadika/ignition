@@ -63,17 +63,20 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   # fires reliably on every restore. Net state is echoed to ttyS0 (session log).
   cat > /usr/bin/on-restore <<'"'"'ONREOF'"'"'
 #!/bin/sh
-# Runs once per restore (host pushes the CRNG seed over vsock 9000). Reseed, then
-# refresh the DHCP lease for the fresh gvproxy. Do NOT unbind/bind virtio_net: that
-# rebind (intended to re-read a clone MAC) DESTROYS eth0 here -- the bind fails after
-# unbind and the device never returns, leaving no eth0 + no route. Each session has
-# its own isolated gvproxy, so the MAC need not change; a plain re-DHCP is enough.
+# Runs once per restore (host pushes the CRNG seed over vsock 9000). Reseed, then bring the
+# network back STATICALLY instead of re-DHCP. A re-DHCP (ifdown/ifup -> udhcpc DISCOVER/
+# OFFER/REQUEST/ACK) took ~5s after restore and gated the first page load. Each session has
+# its own fresh, single-client gvproxy on a deterministic 192.168.127.0/24 (gateway+DNS
+# .1, client .3 -- the address DHCP always handed out), so we can just assert that config
+# and skip the handshake. ip addr/route replace is idempotent (safe if netwatch also runs).
+# Do NOT unbind/bind virtio_net (that destroys eth0 here). $? values are ignored.
 /usr/bin/vmid-reseed
-ifdown eth0 2>/dev/null
-ifup eth0 2>/dev/null
-echo "[on-restore] net re-init done" > /dev/ttyS0 2>&1
+ip link set eth0 up 2>/dev/null
+ip addr replace 192.168.127.3/24 dev eth0 2>/dev/null
+ip route replace default via 192.168.127.1 dev eth0 2>/dev/null
+echo "nameserver 192.168.127.1" > /etc/resolv.conf
+echo "[on-restore] net static-config done" > /dev/ttyS0 2>&1
 ip -o addr show eth0 > /dev/ttyS0 2>&1
-ip route > /dev/ttyS0 2>&1
 ONREOF
   chmod +x /usr/bin/on-restore
   # vmid: host-pushed CRNG reseed + net re-init on snapshot restore.
@@ -164,24 +167,23 @@ done
 KIOSKEOF
   chmod +x /usr/bin/kiosk-loop
 
-  # Net re-init on snapshot restore (same poller as the base rootfs): a restore
-  # starts a fresh vmnet interface (new MAC) and the VMM bounces the virtio-net
-  # link down->up. Without this, a restored/cloned GUI guest keeps the snapshot
-  # MAC and every clone DHCPs to the SAME IP. This busybox poller sees the carrier
-  # down->up edge, rebinds virtio_net so it re-reads the new MAC, then re-DHCPs.
-  # udev (eudev) is present in this image but the poller reads /sys directly, so it
-  # behaves identically. The rebind itself flaps the carrier, so a cooldown after
-  # acting avoids a rebind loop.
+  # Net re-init fallback on snapshot restore: a restore bounces the virtio-net link
+  # down->up. on-restore (vsock 9000) is the primary path and fires reliably from the app;
+  # this carrier poller is a backup for paths that do not push the seed. It now re-asserts
+  # the SAME static config as on-restore (no DHCP), so a flap costs ~0 instead of a ~5s
+  # re-DHCP. ip addr/route replace is idempotent. Do NOT unbind/bind virtio_net (destroys eth0).
   cat > /etc/local.d/netwatch.start <<'"'"'NETEOF'"'"'
 #!/bin/sh
 ( prev=1
   while :; do
     cur=$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)
     if [ "$prev" = 0 ] && [ "$cur" = 1 ]; then
-      # Carrier came back (restore bounces the link). Just re-DHCP -- do NOT
-      # unbind/bind virtio_net: that rebind destroys eth0 (bind fails after unbind).
-      ifdown eth0 2>/dev/null; ifup eth0
-      sleep 5          # cooldown: ignore the re-DHCP-induced flap
+      # Carrier came back (restore bounces the link). Re-assert the static config.
+      ip link set eth0 up 2>/dev/null
+      ip addr replace 192.168.127.3/24 dev eth0 2>/dev/null
+      ip route replace default via 192.168.127.1 dev eth0 2>/dev/null
+      echo "nameserver 192.168.127.1" > /etc/resolv.conf
+      sleep 5          # cooldown: ignore the config-induced flap
       prev=1
       continue
     fi
