@@ -97,11 +97,13 @@ A third rootfs (`rootfs-browser.ext4`) adds Firefox ESR in a kiosk configuration
 plus `/sbin/overlay-init`, which the cold boot uses to mount the ext4 image
 read-only as the lower overlay layer and a tmpfs as the upper layer before
 handing off to init. The homepage URL is set at build time via `HOMEPAGE`; the
-default is DuckDuckGo.
+default is DuckDuckGo. The base is pinned to **Alpine 3.21** for **cage 0.2.0**,
+which the [runtime window resize](../features/gui-display.md#runtime-resize)
+requires (cage 0.1.5 terminates when the sole output is cycled); do not downgrade.
 
 ```bash
 cd kimage
-scp build/build-rootfs-browser.sh build/devmem.c artemis2:~/kbuild/
+scp build/build-rootfs-browser.sh build/devmem.c build/vmid-reseed.c artemis2:~/kbuild/
 ssh artemis2 'cd ~/kbuild && chmod +x build-rootfs-browser.sh && HOMEPAGE=https://duckduckgo.com ./build-rootfs-browser.sh'
 scp artemis2:'~/kbuild/out/rootfs-browser.ext4' out/rootfs-browser.ext4
 ```

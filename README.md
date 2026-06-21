@@ -33,8 +33,9 @@ Validated end-to-end on Apple Silicon. Working today:
 - **PL031 RTC + boot-timer.**
 - **SMP** — multiple vCPUs via PSCI `CPU_ON` (`--smp N`).
 - **GUI display** — `--gui` opens a software-rendered macOS window over virtio-gpu (2D) +
-  virtio-input (keyboard + tablet); a cage Wayland compositor runs a real desktop. Snapshots,
-  restores, and fans out like any guest.
+  virtio-input (keyboard + tablet); a cage Wayland compositor runs a real desktop. The window
+  is **resizable**: dragging it re-modesets the guest (virtio-gpu connector-cycle) and the
+  desktop reflows to the new size. Snapshots, restores, and fans out like any guest.
 - **Snapshot / restore** — clone-capable, lazy `clonefile` + `MAP_SHARED`, multi-vCPU + net + GUI.
 - **Diff snapshots** — `--track-dirty` write-protect tracking (DMA-aware: device writes are tracked
   too); immutable delta chains.

@@ -11,15 +11,20 @@ software-rendered desktop.
 On macOS the winit event loop must own the main thread. Under `--gui` the entire
 VMM — vCPU threads, the serial console reader, the vsock reactor, the vmnet RX
 feeder — runs on spawned threads while the event loop runs on main. The window
-title is "ignition". The guest renders at a fixed scanout (`GUI_W`×`GUI_H`,
+title is "ignition". The guest boots at an initial scanout (`GUI_W`×`GUI_H`,
 currently 1400×880), chosen a touch under the host's work area so the window's
 **logical** size equals the scanout. On a 2× Retina display the physical surface
 is then exactly 2× the scanout, so the blit path upscales by an integer factor
 (sharp pixel-doubling, no fractional blur). The window is centered in the work
 area, leaving a symmetric gap on each side and room for the title bar. On a
-display smaller than the scanout it downscales to fit. Because the scanout size
-is baked into a snapshot, changing `GUI_W`/`GUI_H` requires rebuilding the base
-(see [Disposable browser](disposable-browser.md)).
+display smaller than the scanout it downscales to fit.
+
+The window is **resizable**: dragging it re-modesets the guest so the desktop
+reflows to the new size, rather than just rescaling a fixed scanout (see [Runtime
+resize](#runtime-resize) below). The boot scanout is still baked into a snapshot,
+so changing `GUI_W`/`GUI_H` requires rebuilding the base; a restored guest reopens
+at the base size and resizes live from there (see [Disposable
+browser](disposable-browser.md)).
 
 The present path is non-blocking: frames arrive over an mpsc channel and are
 coalesced to the latest before each blit, so a slow or frozen window never
@@ -43,8 +48,11 @@ the display path:
 - `RESOURCE_FLUSH` — presents the scanned-out resource through the display sink,
   forwarding the frame to the winit event loop.
 
-No 3D, VIRGL, or Venus support; no display resize or hotplug. GPU resource table
-and scanout binding are serialized as part of snapshot state (see below).
+Runtime resize is supported via the config-change path (see [Runtime
+resize](#runtime-resize)); `GET_DISPLAY_INFO` reports the live mode and an
+`events_read`/`events_clear` register pair carries `VIRTIO_GPU_EVENT_DISPLAY`. No
+3D, VIRGL, or Venus support. GPU resource table and scanout binding are serialized
+as part of snapshot state (see below).
 
 The guest kernel must be built with:
 
@@ -65,8 +73,11 @@ Linux evdev events and injects them into the guest's eventq (`inject_rx`-style
 path), so typing logs in at the console and the pointer tracks the macOS cursor
 1:1 over the scanout.
 
-Mouse position is scaled from the physical surface size to guest coordinates
-(nearest-neighbor); button events map to `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`.
+Mouse position is scaled from the physical surface size into the tablet's fixed
+absolute axis range (`0..32767`, the QEMU virtio-tablet convention); libinput maps
+that range onto the current guest output extent, so the pointer stays correct at
+any resolution and a [runtime resize](#runtime-resize) never touches input. Button
+events map to `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE`.
 Scroll is supported: the tablet advertises `EV_REL`/`REL_WHEEL`, and the window
 translates `MouseWheel` events into `REL_WHEEL` (trackpad sub-notch `PixelDelta`
 is accumulated so slow scrolls aren't rounded away). Physical key codes map to
@@ -83,6 +94,36 @@ The guest kernel needs:
 CONFIG_VIRTIO_INPUT=y
 CONFIG_INPUT_EVDEV=y
 ```
+
+## Runtime resize
+
+The `--gui` window is resizable, and dragging it makes the **guest reflow** to the
+new size — not just rescale a fixed scanout. The chain is the standard virtio-gpu
+display-info path plus one wrinkle for the kiosk compositor:
+
+1. **Host** — `WindowEvent::Resized` is debounced (~150 ms after the drag settles);
+   the target guest size is the window's logical size, clamped to `[320×240,
+   GUI_W×GUI_H]` and even-rounded. During the drag the blit just rescales the last
+   frame, so the window stays live.
+2. **Device → guest** — the host sets the device's advertised mode and raises a
+   config-change interrupt (`VIRTIO_GPU_EVENT_DISPLAY` in `events_read`). The Linux
+   `virtio_gpu` driver acks (`events_clear`), re-queries `GET_DISPLAY_INFO`, and
+   raises a DRM hotplug.
+3. **Connector-cycle** — cage (wlroots) picks its output mode **only** when an
+   output is created; it never re-picks on a bare mode-list change. So a resize is
+   driven as a **disconnect → reconnect**: phase 1 reports the scanout connector
+   disabled (cage destroys the output); after a short gap, phase 2 re-enables it at
+   the new mode (cage's `handle_new_output` adopts the new preferred mode and the
+   desktop reflows). The transition shows a brief (~100 ms) blank.
+
+Pointer mapping is resolution-independent (fixed tablet range, see virtio-input
+above), so input needs no per-resize update.
+
+**Compositor floor:** this needs **cage ≥ 0.2.0**. cage 0.1.5 (Alpine 3.19)
+calls `wl_display_terminate` when the sole output is destroyed, so the disconnect
+phase would kill the kiosk; cage 0.2.0 (Alpine 3.21) terminates only for *nested*
+backends, so the DRM-backed kiosk survives the cycle. The browser rootfs is pinned
+to Alpine 3.21 for this (`kimage/build/build-rootfs-browser.sh`).
 
 ## Wayland compositor (cage + foot)
 
