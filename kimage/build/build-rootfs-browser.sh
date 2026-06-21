@@ -195,10 +195,11 @@ NETEOF
   rc-update add local boot
 
   # --- GUI layer: cage + foot + seatd over the virtio-gpu/input devices ---
-  # cage/foot/seatd live in the alpine community repo; enable it. 3.21 ships cage
-  # 0.2.0, which (DRM backend) survives destroying the sole output, so a virtio-gpu
-  # connector-cycle re-modesets the kiosk on host window resize. 3.19's cage 0.1.5
-  # terminates instead — do not downgrade below 3.21.
+  # cage/foot/seatd live in the alpine community repo; enable it. alpine 3.21 ships
+  # cage 0.2.0: on the DRM backend it survives destroying the sole output, so a
+  # virtio-gpu connector-cycle re-modesets the kiosk on host window resize. cage
+  # 0.1.5 (alpine 3.19) terminates instead, so do not downgrade below 3.21.
+  # NB: no apostrophes in this comment (the whole block is inside sh -euxc PROVISION).
   echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/community" >> /etc/apk/repositories
   apk update
   # pixman software path: no mesa/GL. cage pulls wlroots/libinput/wayland/pixman/libdrm.
