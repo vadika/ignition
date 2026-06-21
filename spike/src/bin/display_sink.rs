@@ -179,6 +179,26 @@ pub fn scale_pos(px: f64, py: f64, surf_w: u32, surf_h: u32, gw: u32, gh: u32) -
     (clamp(x, gw - 1), clamp(y, gh - 1))
 }
 
+/// Map a physical window size to clamped, even-rounded guest *logical* dimensions.
+/// Logical (physical / `scale`) so a HiDPI window does not double the guest
+/// resolution. `min`/`max` are (w, h) bounds; even-rounded since some modesetting
+/// paths dislike odd widths (B8G8R8A8 stride is 4-aligned regardless).
+pub fn target_dims(
+    phys_w: u32,
+    phys_h: u32,
+    scale: f64,
+    min: (u32, u32),
+    max: (u32, u32),
+) -> (u32, u32) {
+    let logical = |p: u32| (p as f64 / scale.max(0.1)).round() as u32;
+    let clamp = |v: u32, lo: u32, hi: u32| v.max(lo).min(hi);
+    let even = |v: u32| v & !1;
+    (
+        even(clamp(logical(phys_w), min.0, max.0)),
+        even(clamp(logical(phys_h), min.1, max.1)),
+    )
+}
+
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::WindowEvent;
@@ -716,5 +736,17 @@ mod tests {
         assert_eq!(cycle_count(0, 3, 8), 3);
         assert_eq!(cycle_count(3, 3, 8), 0);
         assert_eq!(cycle_count(7, 1, 8), 2); // wrap forward: 7 -> 0 -> 1
+    }
+
+    #[test]
+    fn target_dims_clamps_rounds_and_descales() {
+        // within bounds, odd physical -> even guest logical
+        assert_eq!(target_dims(1401, 881, 1.0, (320, 240), (2000, 2000)), (1400, 880));
+        // below min clamps up
+        assert_eq!(target_dims(100, 100, 1.0, (320, 240), (2000, 2000)), (320, 240));
+        // above max clamps down
+        assert_eq!(target_dims(5000, 5000, 1.0, (320, 240), (2000, 2000)), (2000, 2000));
+        // HiDPI scale 2.0 -> logical halves (physical 2800x1760 -> 1400x880)
+        assert_eq!(target_dims(2800, 1760, 2.0, (320, 240), (2000, 2000)), (1400, 880));
     }
 }
