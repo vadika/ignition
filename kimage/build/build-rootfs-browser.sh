@@ -19,7 +19,7 @@ docker run --platform linux/arm64 --name fcroot_browser_build \
   -e HOMEPAGE="$HOMEPAGE" \
   -v "$(cd "$(dirname "$0")" && pwd)/devmem.c:/devmem.c:ro" \
   -v "$(cd "$(dirname "$0")" && pwd)/vmid-reseed.c:/vmid-reseed.c:ro" \
-  alpine:3.19 sh -euxc '
+  alpine:3.21 sh -euxc '
   # --- base provisioning (kept in sync with build-rootfs.sh) ---
   apk add --no-cache openrc util-linux ifupdown-ng socat
 
@@ -195,8 +195,11 @@ NETEOF
   rc-update add local boot
 
   # --- GUI layer: cage + foot + seatd over the virtio-gpu/input devices ---
-  # cage/foot/seatd live in the alpine community repo; enable it.
-  echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories
+  # cage/foot/seatd live in the alpine community repo; enable it. 3.21 ships cage
+  # 0.2.0, which (DRM backend) survives destroying the sole output, so a virtio-gpu
+  # connector-cycle re-modesets the kiosk on host window resize. 3.19's cage 0.1.5
+  # terminates instead — do not downgrade below 3.21.
+  echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/community" >> /etc/apk/repositories
   apk update
   # pixman software path: no mesa/GL. cage pulls wlroots/libinput/wayland/pixman/libdrm.
   # libinput-tools: libinput list-devices / debug-events for bring-up diagnosis.

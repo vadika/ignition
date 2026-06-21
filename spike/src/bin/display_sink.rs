@@ -293,6 +293,9 @@ struct App {
     gpu: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
     pending_resize: Option<(u32, u32)>,
     last_resize: Option<std::time::Instant>,
+    // Phase 2 of the connector-cycle: (time the connector was disconnected, target
+    // dims to reconnect at). Set when the debounce fires phase 1 (disconnect).
+    reconnect: Option<(std::time::Instant, (u32, u32))>,
     min_dims: (u32, u32),
     max_dims: (u32, u32),
     /// Live modifier state, updated from `ModifiersChanged`, read to detect the
@@ -596,23 +599,35 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
-        // Debounce window resizes: push one modeset once the drag has settled.
-        // ponytail: this drives the standards-correct virtio-gpu path (config-change
-        // -> guest GET_DISPLAY_INFO reports new dims), verified end-to-end into the
-        // guest kernel. But cage (0.1.5) picks its output mode only at output
-        // creation and never re-picks on a mode-list change, so the guest does NOT
-        // reflow today — blit_frame just scales the fixed-size guest frame into the
-        // window. The modeset goes live for free if the kiosk ever runs a compositor
-        // that follows preferred-mode changes. Reflow-via-connector-cycle needs a
-        // cage patch (destroying the sole output terminates cage) — not worth it.
+        // Resize -> guest reflow via a virtio-gpu connector-cycle. cage picks its
+        // output mode only in handle_new_output (never re-picks on a mode-list
+        // change), so a plain mode change is ignored. Instead, once the drag settles
+        // (phase 1) we disconnect the connector; cage destroys the output. After a
+        // short gap (phase 2) we reconnect at the new mode; cage's handle_new_output
+        // picks the new preferred mode and firefox reflows. NB: needs cage >= 0.2.x
+        // (DRM backend) — 0.1.5 terminates when the sole output is destroyed.
         const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+        // Gap long enough for the guest to process the disconnect (kernel hotplug +
+        // cage output teardown) before we reconnect.
+        const RECONNECT_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+        // Phase 1: drag settled -> disconnect the connector, arm the reconnect.
         if let (Some(dims), Some(t)) = (self.pending_resize, self.last_resize) {
             if t.elapsed() >= RESIZE_DEBOUNCE {
                 if let Some(gpu) = &self.gpu {
-                    gpu.lock().unwrap_or_else(|p| p.into_inner()).display_set_mode(dims.0, dims.1);
+                    gpu.lock().unwrap_or_else(|p| p.into_inner()).display_set_enabled(false);
                 }
                 self.pending_resize = None;
                 self.last_resize = None;
+                self.reconnect = Some((std::time::Instant::now(), dims));
+            }
+        }
+        // Phase 2: gap elapsed -> reconnect at the new mode (re-enables + new dims).
+        if let Some((t, dims)) = self.reconnect {
+            if t.elapsed() >= RECONNECT_GAP {
+                if let Some(gpu) = &self.gpu {
+                    gpu.lock().unwrap_or_else(|p| p.into_inner()).display_set_mode(dims.0, dims.1);
+                }
+                self.reconnect = None;
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -661,6 +676,7 @@ pub fn run_event_loop(
         gpu,
         pending_resize: None,
         last_resize: None,
+        reconnect: None,
         min_dims,
         max_dims,
         modifiers: winit::keyboard::ModifiersState::empty(),

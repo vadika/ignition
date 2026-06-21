@@ -60,11 +60,24 @@ pub struct VirtioGpu {
     scanout_res: u32, // resource id bound to scanout 0; 0 = none
     sink: Box<dyn DisplaySink>,
     events_read: u32,
+    // Scanout-0 connector status reported in GET_DISPLAY_INFO. Toggled false->true
+    // (a connector-cycle) around a mode change so a wlroots kiosk (cage) that only
+    // picks its mode at output creation tears down and recreates the output at the
+    // new preferred mode. See display_sink.rs about_to_wait.
+    enabled: bool,
 }
 
 impl VirtioGpu {
     pub fn new(width: u32, height: u32, sink: Box<dyn DisplaySink>) -> Self {
-        VirtioGpu { width, height, resources: HashMap::new(), scanout_res: 0, sink, events_read: 0 }
+        VirtioGpu {
+            width,
+            height,
+            resources: HashMap::new(),
+            scanout_res: 0,
+            sink,
+            events_read: 0,
+            enabled: true,
+        }
     }
 }
 
@@ -344,7 +357,7 @@ impl VirtioGpu {
             if i == 0 {
                 one[8..12].copy_from_slice(&self.width.to_le_bytes());
                 one[12..16].copy_from_slice(&self.height.to_le_bytes());
-                one[16..20].copy_from_slice(&1u32.to_le_bytes()); // enabled
+                one[16..20].copy_from_slice(&(self.enabled as u32).to_le_bytes()); // enabled
             }
             resp.extend_from_slice(&one);
         }
@@ -474,6 +487,13 @@ impl VirtioDevice for VirtioGpu {
     fn set_display_mode(&mut self, w: u32, h: u32) -> bool {
         self.width = w;
         self.height = h;
+        self.enabled = true;
+        self.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
+        true
+    }
+
+    fn set_display_enabled(&mut self, en: bool) -> bool {
+        self.enabled = en;
         self.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
         true
     }
@@ -884,6 +904,28 @@ mod tests {
         let w = u32::from_le_bytes(resp[32..36].try_into().unwrap()); // hdr(24)+rect.x,y(8) -> w
         let h = u32::from_le_bytes(resp[36..40].try_into().unwrap());
         assert_eq!((w, h), (1024, 768));
+    }
+
+    #[test]
+    fn connector_cycle_toggles_enabled_in_display_info() {
+        let mut gpu = new_gpu();
+        let enabled = |g: &mut VirtioGpu| -> u32 {
+            let mut backing = vec![0u8; 0x4000];
+            let resp = submit(g, &mut backing, &hdr(GET_DISPLAY_INFO));
+            u32::from_le_bytes(resp[40..44].try_into().unwrap()) // hdr(24)+rect(16) -> enabled
+        };
+        assert_eq!(enabled(&mut gpu), 1, "starts connected");
+
+        // Phase 1: disconnect raises the event and reports enabled=0.
+        assert!(gpu.set_display_enabled(false));
+        let mut cfg = [0u8; 4];
+        gpu.config_read(0, &mut cfg);
+        assert_eq!(u32::from_le_bytes(cfg), VIRTIO_GPU_EVENT_DISPLAY);
+        assert_eq!(enabled(&mut gpu), 0, "disconnected");
+
+        // Phase 2: a mode change reconnects (enabled back to 1) at the new dims.
+        assert!(gpu.set_display_mode(1024, 768));
+        assert_eq!(enabled(&mut gpu), 1, "reconnected");
     }
 
     #[test]

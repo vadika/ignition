@@ -74,6 +74,12 @@ pub trait VirtioDevice: Send {
         false
     }
 
+    /// Toggle a display device's connector status (enabled = connected). Returns
+    /// true if this device is a display and handled it. Default: not a display.
+    fn set_display_enabled(&mut self, _en: bool) -> bool {
+        false
+    }
+
     /// Set link state for devices that have one (virtio-net). Default: no-op.
     fn set_link(&mut self, _up: bool) {}
 
@@ -379,6 +385,15 @@ impl VirtioMmio {
     /// GET_DISPLAY_INFO. No-op for non-display devices.
     pub fn display_set_mode(&mut self, w: u32, h: u32) {
         if self.dev.set_display_mode(w, h) {
+            self.signal_config_change();
+        }
+    }
+
+    /// Toggle a display device's connector (disconnect/reconnect) and raise a
+    /// config-change interrupt. Used to drive a connector-cycle around a mode
+    /// change. No-op for non-display devices.
+    pub fn display_set_enabled(&mut self, en: bool) {
+        if self.dev.set_display_enabled(en) {
             self.signal_config_change();
         }
     }
