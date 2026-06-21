@@ -290,8 +290,11 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     keyboard: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
     tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
-    gw: u32,
-    gh: u32,
+    gpu: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    pending_resize: Option<(u32, u32)>,
+    last_resize: Option<std::time::Instant>,
+    min_dims: (u32, u32),
+    max_dims: (u32, u32),
     /// Live modifier state, updated from `ModifiersChanged`, read to detect the
     /// Ctrl+Alt+<letter> host hotkey chords before forwarding keys to the guest.
     modifiers: winit::keyboard::ModifiersState,
@@ -440,7 +443,7 @@ impl ApplicationHandler for App {
             .with_title("ignition")
             .with_inner_size(LogicalSize::new(w, h))
             .with_visible(self.visible)
-            .with_resizable(false);
+            .with_resizable(true);
         if let Some(p) = pos {
             attrs = attrs.with_position(p);
         }
@@ -465,9 +468,22 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
                 self.resize_surface();
                 self.force_paint = true;
+                // Debounce: remember the target guest dims and when the drag last
+                // moved; about_to_wait pushes the modeset once it settles.
+                if self.gpu.is_some() {
+                    let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
+                    self.pending_resize = Some(target_dims(
+                        size.width.max(1),
+                        size.height.max(1),
+                        scale,
+                        self.min_dims,
+                        self.max_dims,
+                    ));
+                    self.last_resize = Some(std::time::Instant::now());
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -511,7 +527,15 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 use ignition_devices::virtio::input::InputEvent;
                 if let Some(tab) = &self.tablet {
-                    let (x, y) = scale_pos(position.x, position.y, self.surf_w, self.surf_h, self.gw, self.gh);
+                    use ignition_devices::virtio::input::TABLET_ABS_MAX;
+                    let (x, y) = scale_pos(
+                        position.x,
+                        position.y,
+                        self.surf_w,
+                        self.surf_h,
+                        TABLET_ABS_MAX + 1,
+                        TABLET_ABS_MAX + 1,
+                    );
                     let evs = [
                         InputEvent { etype: 3, code: 0, value: x }, // EV_ABS ABS_X
                         InputEvent { etype: 3, code: 1, value: y }, // EV_ABS ABS_Y
@@ -572,6 +596,17 @@ impl ApplicationHandler for App {
             event_loop.exit();
             return;
         }
+        // Debounce window resizes: push one modeset once the drag has settled.
+        const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
+        if let (Some(dims), Some(t)) = (self.pending_resize, self.last_resize) {
+            if t.elapsed() >= RESIZE_DEBOUNCE {
+                if let Some(gpu) = &self.gpu {
+                    gpu.lock().unwrap_or_else(|p| p.into_inner()).display_set_mode(dims.0, dims.1);
+                }
+                self.pending_resize = None;
+                self.last_resize = None;
+            }
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             std::time::Instant::now() + Duration::from_millis(16),
         ));
@@ -592,8 +627,9 @@ pub fn run_event_loop(
     height: u32,
     keyboard: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
     tablet: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
-    gw: u32,
-    gh: u32,
+    gpu: Option<std::sync::Arc<std::sync::Mutex<ignition_devices::virtio::mmio::VirtioMmio>>>,
+    min_dims: (u32, u32),
+    max_dims: (u32, u32),
     manager: Option<std::sync::Arc<ignition_vmm::vstate::vcpu_manager::VcpuManager>>,
     visible: bool,
 ) {
@@ -614,8 +650,11 @@ pub fn run_event_loop(
         surface: None,
         keyboard,
         tablet,
-        gw,
-        gh,
+        gpu,
+        pending_resize: None,
+        last_resize: None,
+        min_dims,
+        max_dims,
         modifiers: winit::keyboard::ModifiersState::empty(),
         guest_group: 0,
         manager,
