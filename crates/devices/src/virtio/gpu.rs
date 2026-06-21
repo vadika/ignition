@@ -32,6 +32,9 @@ const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 
 const CTRL_HDR_LEN: usize = 24;
+/// config events_read bit: scanout topology / mode changed; guest re-queries
+/// GET_DISPLAY_INFO. Matches VIRTIO_GPU_EVENT_DISPLAY.
+const VIRTIO_GPU_EVENT_DISPLAY: u32 = 0x0001;
 /// Cap on a single 2D resource's host pixel buffer — bounds a guest-driven
 /// allocation. 256 MiB dwarfs any real scanout (1280x800x4 = 4 MiB).
 const MAX_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
@@ -56,11 +59,12 @@ pub struct VirtioGpu {
     resources: HashMap<u32, Resource2D>,
     scanout_res: u32, // resource id bound to scanout 0; 0 = none
     sink: Box<dyn DisplaySink>,
+    events_read: u32,
 }
 
 impl VirtioGpu {
     pub fn new(width: u32, height: u32, sink: Box<dyn DisplaySink>) -> Self {
-        VirtioGpu { width, height, resources: HashMap::new(), scanout_res: 0, sink }
+        VirtioGpu { width, height, resources: HashMap::new(), scanout_res: 0, sink, events_read: 0 }
     }
 }
 
@@ -450,11 +454,28 @@ impl VirtioDevice for VirtioGpu {
         // config space (16 bytes): events_read(0), events_clear(4),
         // num_scanouts(8) = 1, num_capsets(12) = 0. Serve arbitrary widths.
         let mut cfg = [0u8; 16];
+        cfg[0..4].copy_from_slice(&self.events_read.to_le_bytes()); // events_read
         cfg[8..12].copy_from_slice(&1u32.to_le_bytes()); // num_scanouts = 1
         for (i, b) in data.iter_mut().enumerate() {
             let idx = (offset as usize).saturating_add(i);
             *b = if idx < cfg.len() { cfg[idx] } else { 0 };
         }
+    }
+
+    fn config_write(&mut self, offset: u64, data: &[u8]) {
+        // events_clear (offset 4, u32): the guest acks events by writing the bits
+        // to clear. Ignore writes elsewhere (events_read/num_scanouts are RO).
+        if offset == 4 && data.len() >= 4 {
+            let clear = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            self.events_read &= !clear;
+        }
+    }
+
+    fn set_display_mode(&mut self, w: u32, h: u32) -> bool {
+        self.width = w;
+        self.height = h;
+        self.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
+        true
     }
 
     fn queue_count(&self) -> usize {
@@ -845,6 +866,35 @@ mod tests {
         assert_eq!(frames.len(), 1, "one frame presented");
         assert_eq!((frames[0].width, frames[0].height), (4, 1));
         assert_eq!(&frames[0].pixels.lock().unwrap()[..], &pat[..], "scanout re-read from backing");
+    }
+
+    #[test]
+    fn set_display_mode_updates_dims_and_raises_event() {
+        let mut gpu = new_gpu();
+        assert!(gpu.set_display_mode(1024, 768));
+
+        // events_read (config offset 0) carries EVENT_DISPLAY.
+        let mut cfg = [0u8; 4];
+        gpu.config_read(0, &mut cfg);
+        assert_eq!(u32::from_le_bytes(cfg), VIRTIO_GPU_EVENT_DISPLAY);
+
+        // GET_DISPLAY_INFO now reports the new scanout-0 dimensions.
+        let mut backing = vec![0u8; 0x4000];
+        let resp = submit(&mut gpu, &mut backing, &hdr(GET_DISPLAY_INFO));
+        let w = u32::from_le_bytes(resp[32..36].try_into().unwrap()); // hdr(24)+rect.x,y(8) -> w
+        let h = u32::from_le_bytes(resp[36..40].try_into().unwrap());
+        assert_eq!((w, h), (1024, 768));
+    }
+
+    #[test]
+    fn config_write_events_clear_clears_event() {
+        let mut gpu = new_gpu();
+        gpu.set_display_mode(800, 600);
+        // Guest acks by writing the bit to events_clear (config offset 4).
+        gpu.config_write(4, &VIRTIO_GPU_EVENT_DISPLAY.to_le_bytes());
+        let mut cfg = [0u8; 4];
+        gpu.config_read(0, &mut cfg);
+        assert_eq!(u32::from_le_bytes(cfg), 0);
     }
 
     #[test]

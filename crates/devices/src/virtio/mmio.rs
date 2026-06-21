@@ -68,6 +68,12 @@ pub trait VirtioDevice: Send {
     /// Accept a host control client for vsock E2 (no-op for non-vsock devices).
     fn vsock_accept_control(&mut self, _stream: std::os::unix::net::UnixStream) {}
 
+    /// Push a new display mode (width/height) to a display device. Returns true if
+    /// this device is a display and handled it. Default: not a display.
+    fn set_display_mode(&mut self, _w: u32, _h: u32) -> bool {
+        false
+    }
+
     /// Set link state for devices that have one (virtio-net). Default: no-op.
     fn set_link(&mut self, _up: bool) {}
 
