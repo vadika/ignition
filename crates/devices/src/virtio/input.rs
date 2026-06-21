@@ -25,6 +25,10 @@ const REL_WHEEL: u16 = 8;
 const SYN_REPORT: u16 = 0;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
+/// Absolute tablet axis range max (QEMU virtio-tablet convention). libinput maps
+/// this fixed range onto the current guest output extent, so the pointer stays
+/// correct at any resolution — absinfo is probed once at boot and never changes.
+pub const TABLET_ABS_MAX: u32 = 32767;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
@@ -57,7 +61,7 @@ impl InputEvent {
 
 enum Flavor {
     Keyboard,
-    Tablet { w: u32, h: u32 },
+    Tablet,
 }
 
 /// virtio-input device (keyboard or absolute tablet).
@@ -71,8 +75,9 @@ impl VirtioInput {
     pub fn keyboard() -> Self {
         VirtioInput { flavor: Flavor::Keyboard, select: 0, subsel: 0 }
     }
-    pub fn tablet(width: u32, height: u32) -> Self {
-        VirtioInput { flavor: Flavor::Tablet { w: width, h: height }, select: 0, subsel: 0 }
+    pub fn tablet(_width: u32, _height: u32) -> Self {
+        // ponytail: dims no longer affect the device; signature kept so call sites in boot.rs don't churn
+        VirtioInput { flavor: Flavor::Tablet, select: 0, subsel: 0 }
     }
 }
 
@@ -106,7 +111,7 @@ impl VirtioInput {
             CFG_ID_NAME => {
                 let name: &[u8] = match self.flavor {
                     Flavor::Keyboard => b"ignition-keyboard",
-                    Flavor::Tablet { .. } => b"ignition-tablet",
+                    Flavor::Tablet => b"ignition-tablet",
                 };
                 u[..name.len()].copy_from_slice(name);
                 name.len()
@@ -118,30 +123,31 @@ impl VirtioInput {
                     }
                     16
                 }
-                (EV_KEY, Flavor::Tablet { .. }) => {
+                (EV_KEY, Flavor::Tablet) => {
                     set_bit(u, BTN_LEFT);
                     set_bit(u, BTN_RIGHT);
                     set_bit(u, BTN_MIDDLE);
                     35
                 }
-                (EV_ABS, Flavor::Tablet { .. }) => {
+                (EV_ABS, Flavor::Tablet) => {
                     set_bit(u, ABS_X);
                     set_bit(u, ABS_Y);
                     1
                 }
-                (EV_REL, Flavor::Tablet { .. }) => {
+                (EV_REL, Flavor::Tablet) => {
                     set_bit(u, REL_WHEEL);
                     2
                 }
                 _ => 0,
             },
             CFG_ABS_INFO => match &self.flavor {
-                Flavor::Tablet { w, h } => {
+                Flavor::Tablet => {
                     // Only the advertised axes (ABS_X/ABS_Y) have absinfo; any other
                     // axis returns size 0 so the guest doesn't see a phantom [0,0] axis.
+                    // Range is fixed (resolution-independent); libinput maps it onto the
+                    // current output extent at runtime.
                     let max = match self.subsel as u16 {
-                        ABS_X => Some(w.saturating_sub(1)),
-                        ABS_Y => Some(h.saturating_sub(1)),
+                        ABS_X | ABS_Y => Some(TABLET_ABS_MAX),
                         _ => None,
                     };
                     match max {
@@ -310,7 +316,7 @@ mod tests {
     fn dev_clone_with_sel(dev: &VirtioInput, select: u8, subsel: u8) -> VirtioInput {
         let mut d = match dev.flavor {
             Flavor::Keyboard => VirtioInput::keyboard(),
-            Flavor::Tablet { w, h } => VirtioInput::tablet(w, h),
+            Flavor::Tablet => VirtioInput::tablet(0, 0),
         };
         d.config_write(0, &[select]);
         d.config_write(1, &[subsel]);
@@ -370,9 +376,9 @@ mod tests {
         let (size, u) = read_cfg(&tab, CFG_ABS_INFO, ABS_X as u8);
         assert_eq!(size, 20);
         assert_eq!(u32::from_le_bytes(u[0..4].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 1279);
+        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), TABLET_ABS_MAX);
         let (_size, u) = read_cfg(&tab, CFG_ABS_INFO, ABS_Y as u8);
-        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), 799);
+        assert_eq!(u32::from_le_bytes(u[4..8].try_into().unwrap()), TABLET_ABS_MAX);
     }
 
     #[test]
@@ -409,6 +415,18 @@ mod tests {
         kbd2.restore(&saved).expect("restore ok");
         assert_eq!(kbd2.select, CFG_EV_BITS);
         assert_eq!(kbd2.subsel, EV_KEY as u8);
+    }
+
+    #[test]
+    fn tablet_abs_range_is_resolution_independent() {
+        // Range is the fixed normalized max regardless of the constructor dims.
+        let tab = VirtioInput::tablet(1400, 880);
+        let (size_x, ux) = read_cfg(&tab, CFG_ABS_INFO, ABS_X as u8);
+        let (size_y, uy) = read_cfg(&tab, CFG_ABS_INFO, ABS_Y as u8);
+        assert_eq!(size_x, 20);
+        assert_eq!(size_y, 20);
+        assert_eq!(u32::from_le_bytes(ux[4..8].try_into().unwrap()), TABLET_ABS_MAX);
+        assert_eq!(u32::from_le_bytes(uy[4..8].try_into().unwrap()), TABLET_ABS_MAX);
     }
 
     #[test]

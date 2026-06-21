@@ -58,6 +58,8 @@ const CTRL_A: u8 = 0x01;
 /// the base when moving to a different screen.
 const GUI_W: u32 = 1400;
 const GUI_H: u32 = 880;
+const MIN_W: u32 = 320;
+const MIN_H: u32 = 240;
 
 /// State of the host-side escape sequence. Ctrl-A then `x` quits the harness;
 /// Ctrl-A then anything else forwards a literal Ctrl-A plus that byte.
@@ -1387,7 +1389,7 @@ fn main() {
         dirty: dirty_tracker.clone(),
         rx_stop: rx_stop_reset,
         net_mmio: net_mmio_reset,
-        gpu: gpu_handle,
+        gpu: gpu_handle.clone(),
     });
 
     // Raw terminal + host stdin reader for the interactive console. The guard
@@ -1454,8 +1456,9 @@ fn main() {
             GUI_H,
             kbd_handle,
             tab_handle,
-            GUI_W,
-            GUI_H,
+            gpu_handle.clone(),
+            (MIN_W, MIN_H),
+            (GUI_W, GUI_H),
             Some(manager.clone()),
             !gui_hidden,
         );
@@ -2449,8 +2452,9 @@ fn run_restore(
             GUI_H,
             kbd_handle,
             tab_handle,
-            GUI_W,
-            GUI_H,
+            gpu_handle.clone(),
+            (MIN_W, MIN_H),
+            (GUI_W, GUI_H),
             Some(manager.clone()),
             true, // restored sessions are always visible (--gui-hidden is first-run only)
         );
