@@ -597,6 +597,14 @@ impl ApplicationHandler for App {
             return;
         }
         // Debounce window resizes: push one modeset once the drag has settled.
+        // ponytail: this drives the standards-correct virtio-gpu path (config-change
+        // -> guest GET_DISPLAY_INFO reports new dims), verified end-to-end into the
+        // guest kernel. But cage (0.1.5) picks its output mode only at output
+        // creation and never re-picks on a mode-list change, so the guest does NOT
+        // reflow today — blit_frame just scales the fixed-size guest frame into the
+        // window. The modeset goes live for free if the kiosk ever runs a compositor
+        // that follows preferred-mode changes. Reflow-via-connector-cycle needs a
+        // cage patch (destroying the sole output terminates cage) — not worth it.
         const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(150);
         if let (Some(dims), Some(t)) = (self.pending_resize, self.last_resize) {
             if t.elapsed() >= RESIZE_DEBOUNCE {
