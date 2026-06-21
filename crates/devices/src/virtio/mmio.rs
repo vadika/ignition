@@ -374,6 +374,15 @@ impl VirtioMmio {
         self.signal_config_change();
     }
 
+    /// Push a new display mode to a display device and raise a config-change
+    /// interrupt so the guest re-reads config events_read and re-queries
+    /// GET_DISPLAY_INFO. No-op for non-display devices.
+    pub fn display_set_mode(&mut self, w: u32, h: u32) {
+        if self.dev.set_display_mode(w, h) {
+            self.signal_config_change();
+        }
+    }
+
     /// Capture the transport register + queue state for snapshot.
     pub fn save_state(&self) -> VirtioMmioState {
         let queues = self
@@ -791,6 +800,35 @@ mod tests {
         t.net_set_link(false);
         let saved = t.save_state();
         assert_ne!(saved.interrupt_status & 2, 0, "config-change interrupt must be raised");
+    }
+
+    #[test]
+    fn display_set_mode_signals_config_change() {
+        use crate::display::NoopSink;
+        use crate::virtio::gpu::VirtioGpu;
+
+        #[derive(Default)]
+        struct RecIrq { level: Mutex<Option<bool>> }
+        impl crate::virtio::IrqLine for RecIrq {
+            fn set_spi(&self, level: bool) { *self.level.lock().unwrap() = Some(level); }
+        }
+
+        let backing = Box::leak(vec![0u8; 0x1000].into_boxed_slice());
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0x4000_0000);
+        let irq = Arc::new(RecIrq::default());
+        let mut t = VirtioMmio::new(
+            "virtio-gpu",
+            Box::new(VirtioGpu::new(1280, 800, Box::new(NoopSink))),
+            mem,
+            irq.clone(),
+        );
+
+        t.display_set_mode(1024, 768);
+
+        let mut b = [0u8; 4];
+        t.read(0, 0x060, &mut b); // InterruptStatus
+        assert_eq!(u32::from_le_bytes(b) & 0b10, 0b10, "config-change bit set");
+        assert_eq!(*irq.level.lock().unwrap(), Some(true), "irq asserted");
     }
 
     #[test]
