@@ -62,6 +62,10 @@ impl GuestRam {
         }
     }
 
+    pub(crate) fn contains(&self, gpa: u64, len: usize) -> bool {
+        self.offset(gpa, len).is_some()
+    }
+
     pub fn read_slice(&self, gpa: u64, out: &mut [u8]) -> bool {
         match self.offset(gpa, out.len()) {
             Some(off) => {

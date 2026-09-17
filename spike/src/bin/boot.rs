@@ -38,7 +38,7 @@ use ignition_vmm::dirty::DirtyTracker;
 use ignition_vmm::fuzz::controller::FuzzController;
 use ignition_vmm::fuzz::controller::ResetMode;
 use ignition_vmm::names;
-use ignition_vmm::snapshot::{self, SnapshotManifest, VcpuCheckpoint, VmConfig, VmSnapshot};
+use ignition_vmm::snapshot::{self, SnapshotWriter, VmConfig, VmSnapshot};
 use ignition_vmm::vstate::vcpu_manager::{mpidr_for, DirtyConfig, VcpuManager};
 use ignition_vmm::vstate::hvf_vm::Vm;
 use ignition_hvf::bindings::{HV_MEMORY_EXEC, HV_MEMORY_READ};
@@ -184,7 +184,6 @@ impl Drop for TermiosGuard {
 struct ResetWiring {
     host_usize: usize,
     ram_size: u64,
-    gic: Arc<HvfGicV3>,
     frozen: Arc<FrozenDevices>,
     dirty: Option<DirtyTracker>,
     rx_stop: Option<Arc<AtomicBool>>,
@@ -195,48 +194,30 @@ struct ResetWiring {
 fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
     let point = manager.reset_point();
 
-    // --- checkpoint: capture current RAM + gic + devices into a new ResetPoint ---
+    // Capture RAM and device state while vCPUs and host device writers are stopped.
     {
         let point = point.clone();
         let host_usize = w.host_usize;
         let ram_size = w.ram_size;
-        let gic = w.gic.clone();
         let frozen = w.frozen.clone();
         let dirty = w.dirty.clone();
-        let rx_stop = w.rx_stop.clone();
-        manager.set_checkpoint_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, _req_name: Option<String>| {
-            // vCPUs parked. Quiesce the vmnet RX feeder during the RAM clone.
-            if let Some(stop) = &rx_stop { stop.store(true, Ordering::Release); }
-            let live: &[u8] = unsafe {
-                std::slice::from_raw_parts(host_usize as *const u8, ram_size as usize)
-            };
-            // Always an owned heap copy of current RAM. Under MAP_PRIVATE restore
-            // there is no file backing live RAM to clonefile; under MAP_ANON fresh
-            // boot there never was. One uniform path.
-            let pristine = ignition_vmm::reset::PristineRam::from_copy(live);
-            let gic_blob = match gic.save_state() {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[checkpoint] gic save_state failed: {e}; reset point not updated");
-                    if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
-                    return;
+        manager.set_checkpoint_handler(Box::new(move |checkpoints, _| {
+            frozen.with_saved(|devices| {
+                let live = unsafe {
+                    std::slice::from_raw_parts(host_usize as *const u8, ram_size as usize)
+                };
+                let pristine = ignition_vmm::reset::PristineRam::from_copy(live);
+                if let Some(t) = &dirty {
+                    ignition_hvf::vm_protect_memory(
+                        layout::RAM_BASE, ram_size, (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                    ).map_err(|e| e.to_string())?;
+                    t.drain();
                 }
-            };
-            let devices = frozen.save();
-            // Discard dirty pages accumulated up to now and re-arm, so the next
-            // reset rolls back only changes AFTER this checkpoint. (Interleaving a
-            // Ctrl-A s diff-snapshot between checkpoint and reset is out of scope.)
-            if let Some(t) = &dirty {
-                let _ = t.drain();
-                let _ = ignition_hvf::vm_protect_memory(
-                    layout::RAM_BASE, ram_size,
-                    (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
-                );
-            }
-            *point.lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
-                pristine, vcpus: checkpoints, gic_blob, devices,
-            });
-            if let Some(stop) = &rx_stop { stop.store(false, Ordering::Release); }
+                *point.lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
+                    pristine, vcpus: checkpoints, devices,
+                });
+                Ok(())
+            })
         }));
     }
 
@@ -288,7 +269,6 @@ fn install_reset_handlers(manager: &mut Arc<VcpuManager>, w: ResetWiring) {
             // distributor/redistributor already match the checkpoint; leaving them
             // untouched keeps interrupt delivery alive. Each vCPU still restores its
             // own ICC (CPU-interface) state via restore_state at the reset barrier.
-            // rp.gic_blob stays captured for the disk-snapshot path; unused here.
             frozen.restore(&rp.devices);
             if let Some(gpu) = &gpu { gpu.lock().unwrap().present_scanout(); }
             // The synchronous in-place reset (RAM rollback + device restore + repaint)
@@ -419,7 +399,7 @@ fn dispatch_control(
             if manager.request_snapshot(name) {
                 "{\"ok\":true}".to_string()
             } else {
-                "{\"ok\":false,\"error\":\"snapshot did not run (no handler or rendezvous busy)\"}".to_string()
+                "{\"ok\":false,\"error\":\"snapshot failed (capture/write error, no handler, or rendezvous busy)\"}".to_string()
             }
         }
         Some("checkpoint") => { manager.request_checkpoint(); "{\"ok\":true}".to_string() }
@@ -780,66 +760,50 @@ fn setup_devices(mgr: &mut DeviceManager, ctx: &mut DeviceContext, mode: Mode) -
     Ok(())
 }
 
-/// Write a named base snapshot into `<store>/snapshots/<write_name>/`, plus its
-/// manifest, and print the resolved name. Shared by the boot and restore handlers.
-#[allow(clippy::too_many_arguments)]
-fn write_named_snapshot(
-    store: &Path,
-    write_name: &str,
-    ram: &[u8],
-    gic_blob: &[u8],
-    disk_src: &Path,
-    checkpoints: Vec<VcpuCheckpoint>,
-    devices: Vec<DeviceRecord>,
-    mem_size: u64,
-) -> io::Result<()> {
-    let base = snapshot::base_dir(store, write_name);
-    let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
-    let vcpu_count = config.vcpu_count;
-    let snap = VmSnapshot::new(config, checkpoints, devices);
-    let t0 = std::time::Instant::now();
-    snapshot::write_snapshot(&base, &snap, ram, gic_blob, disk_src)?;
-    let manifest = SnapshotManifest::new_full(write_name.to_string(), mem_size, vcpu_count);
-    snapshot::write_manifest(&base, &manifest)?;
-    eprintln!("Snapshot-write-time = {} ms", t0.elapsed().as_millis());
-    eprintln!("[snapshot] full '{write_name}' written to {}", base.display());
-    Ok(())
+struct SnapshotWiring {
+    writer: SnapshotWriter,
+    disk: Option<PathBuf>,
+    host_usize: usize,
+    ram_size: u64,
+    gic: Arc<HvfGicV3>,
+    frozen: Arc<FrozenDevices>,
+    dirty: Option<DirtyTracker>,
 }
 
-/// Write a Diff layer into `<store>/snapshots/<write_name>/`: full GIC / vmstate /
-/// disk (clonefile of the live `disk_src`) plus only the drained dirty pages for
-/// memory (packed `memory.bin` + `dirty.idx`), with a `new_diff` manifest pointing
-/// at `parent`. Shares the GIC / vmstate / disk write with the Full path; only the
-/// memory write and manifest constructor differ.
-#[allow(clippy::too_many_arguments)]
-fn write_named_diff(
-    store: &Path,
-    write_name: &str,
-    parent: &str,
-    ram: &[u8],
-    dirty: &[u64],
-    gic_blob: &[u8],
-    disk_src: &Path,
-    checkpoints: Vec<VcpuCheckpoint>,
-    devices: Vec<DeviceRecord>,
-    mem_size: u64,
-) -> io::Result<()> {
-    let base = snapshot::base_dir(store, write_name);
-    let config = VmConfig { mem_size, vcpu_count: checkpoints.len() as u64 };
-    let vcpu_count = config.vcpu_count;
-    let snap = VmSnapshot::new(config, checkpoints, devices);
-    let t0 = std::time::Instant::now();
-    snapshot::write_diff_snapshot(&base, &snap, dirty, ram, gic_blob, disk_src)?;
-    let manifest =
-        SnapshotManifest::new_diff(write_name.to_string(), parent.to_string(), mem_size, vcpu_count);
-    snapshot::write_manifest(&base, &manifest)?;
-    eprintln!("Snapshot-write-time = {} ms", t0.elapsed().as_millis());
-    eprintln!(
-        "[snapshot] diff '{write_name}' (parent '{parent}', {} dirty pages) written to {}",
-        dirty.len(),
-        base.display()
-    );
-    Ok(())
+fn install_snapshot_handler(manager: &mut Arc<VcpuManager>, w: SnapshotWiring) {
+    let writer = Mutex::new(w.writer);
+    manager.set_snapshot_handler(Box::new(move |checkpoints, name| {
+        let result: io::Result<()> = w.frozen.with_saved(|devices| {
+            // The rendezvous parks vCPUs; with_saved holds every device lock so
+            // host RX/input threads cannot mutate RAM or IRQs during capture.
+            let gic = w.gic.save_state().map_err(io::Error::other)?;
+            let ram = unsafe {
+                std::slice::from_raw_parts(w.host_usize as *const u8, w.ram_size as usize)
+            };
+            let disk = match &w.disk {
+                Some(path) => path.clone(),
+                None => {
+                    let path = std::env::temp_dir().join(format!("ignition-empty-disk-{}", process::id()));
+                    fs::write(&path, b"")?;
+                    path
+                }
+            };
+            let config = VmConfig { mem_size: w.ram_size, vcpu_count: checkpoints.len() as u64 };
+            let snap = VmSnapshot::new(config, checkpoints, devices);
+            let pages = w.dirty.as_ref().map(DirtyTracker::pages);
+            writer.lock().unwrap().write(name.as_deref(), &snap, ram, &gic, &disk, pages.as_deref())?;
+            // Preserve the dirty set on any error. Clear only after publication
+            // and successful reprotection, while all memory writers are stopped.
+            if let Some(tracker) = &w.dirty {
+                ignition_hvf::vm_protect_memory(
+                    layout::RAM_BASE, w.ram_size, (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
+                ).map_err(io::Error::other)?;
+                tracker.drain();
+            }
+            Ok(())
+        });
+        result.map_err(|e| e.to_string())
+    }));
 }
 
 fn main() {
@@ -1069,7 +1033,7 @@ fn main() {
     let fdt_off = (fdt_addr - layout::RAM_BASE) as usize;
 
     // VM, then the in-kernel GIC (must be created before any vCPU).
-    let mut vm = Vm::new(false).expect("hv_vm_create failed (entitlement?)");
+    let mut vm = Vm::new().expect("hv_vm_create failed (entitlement?)");
     let gic = Arc::new(HvfGicV3::new(smp, layout::RAM_BASE).expect("hv_gic_create failed"));
 
     // Device manager: bump-allocates MMIO windows + SPIs, mints GIC IRQs.
@@ -1208,164 +1172,22 @@ fn main() {
 
     let write_name = name.clone().unwrap_or_else(names::generate);
 
-    let rx_stop_snap = ctx.rx_stop.clone();
-    let net_mmio_snap = ctx.net_mmio.clone();
-    // Reset-handler copies: rx_stop_snap/net_mmio_snap are moved into the snapshot
-    // closure below, so capture independent clones here for install_reset_handlers.
     let rx_stop_reset = ctx.rx_stop.clone();
     let net_mmio_reset = ctx.net_mmio.clone();
     let gpu_handle = ctx.gpu_mmio.clone();
 
-    // The "current parent" carried across Ctrl-A s invocations. None on a fresh
-    // boot, so the first snapshot is a Full root even with tracking armed (nothing
-    // to diff against yet). After any write, the handler stores the just-written
-    // name here, so the NEXT Ctrl-A s is a Diff against it. The handler is a
-    // `Fn` (Box<dyn Fn + Send + Sync>), so this mutable-across-calls state lives
-    // behind an Arc<Mutex<_>>. Task 9 (restore) seeds it with the restored leaf by
-    // handing the restore handler an equivalent Arc primed to Some(leaf).
-    let current_parent: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Install the snapshot handler for any vCPU count. The manager rendezvouses
-    // every vCPU and hands us their checkpoints; we capture the global state
-    // (GIC + RAM + device records) and write the snapshot.
-    {
-        let gic_snap = gic.clone();
-        let snap_devices = frozen.clone();
-        let disk_path_snap = disk_path.clone();
-        let store_snap = store.clone();
-        let write_name_snap = write_name.clone();
-        // The guest RAM base pointer captured as usize: raw *const u8 is neither
-        // Send nor Sync, but usize is. Sound because the closure only reads the
-        // slice at the rendezvous, when every vCPU is parked at the barrier. The
-        // vmnet RX feeder is quiesced below before RAM is read. usize avoids the
-        // 2021+ partial-capture seeing through a newtype to the *const u8 field.
-        let host_usize = host as usize;
-        let ram_size_snap = ram_size;
-        // The dirty tracker (Some iff --track-dirty). A Diff requires it; the
-        // handler `drain()`s it for the dirty page set and re-protects RAM after.
-        let dirty_snap = dirty_tracker.clone();
-        let parent_snap = current_parent.clone();
-        // --force gates the same-name-as-parent guard below, mirroring the
-        // restore-path guard. Captured by value (bool is Copy) so the closure owns it.
-        let force_snap = force;
-
-        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, req_name: Option<String>| {
-            // Runs on the leader vCPU thread with all vCPUs parked.
-            //
-            // Layer type is decided by the carried current_parent:
-            //   None    -> Full root (first snapshot; nothing to diff against).
-            //   Some(p) -> Diff against p; requires the tracker to be armed.
-            // Control-socket snapshots carry their own name; serial Ctrl-A passes
-            // None and keeps the launch-time write_name.
-            let write_name_snap = req_name.unwrap_or_else(|| write_name_snap.clone());
-            let parent = parent_snap.lock().unwrap().clone();
-
-            // A Diff is only possible with a tracker. Refuse rather than silently
-            // writing a Full under a name the user expects to chain off a parent.
-            if parent.is_some() && dirty_snap.is_none() {
-                eprintln!("dirty tracking not enabled; restart with --track-dirty for diffs");
-                return;
-            }
-
-            // Same-name-as-parent guard (spec §4): a Diff whose name equals its
-            // parent would atomically rename into base_dir(store, name) — the very
-            // dir holding the Full root the chain depends on — clobbering it (and
-            // forming a self-cycle). Refuse unless --force. Runs BEFORE drain so a
-            // refused diff keeps its accumulated dirty set for the next attempt.
-            if let Some(p) = &parent
-                && *p == write_name_snap
-                && !force_snap
-            {
-                eprintln!(
-                    "[snapshot] refusing to overwrite parent snapshot '{p}'; \
-                     pass --force or use a different --name"
-                );
-                return;
-            }
-
-            let gic_blob = match gic_snap.save_state() {
-                Ok(b) => b,
-                Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
-            };
-
-            let devices = snap_devices.save();
-
-            // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
-            if let Some(stop) = &rx_stop_snap {
-                stop.store(true, Ordering::Release);
-                if let Some(net) = &net_mmio_snap {
-                    drop(net.lock().unwrap()); // drain any in-flight inject
-                }
-            }
-
-            // The RAM slice — host_usize round-trip avoids capturing *const u8.
-            let ram_slice: &[u8] = unsafe {
-                std::slice::from_raw_parts(host_usize as *const u8, ram_size_snap as usize)
-            };
-
-            let disk_src = match &disk_path_snap {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    let placeholder = std::env::temp_dir()
-                        .join(format!("ignition-empty-disk-{}", process::id()));
-                    let _ = std::fs::write(&placeholder, b"");
-                    placeholder
-                }
-            };
-
-            let result = match &parent {
-                // Full root: write exactly as before (whole RAM, new_full manifest).
-                None => {
-                    // Full captures whole RAM, so any pages dirtied since boot are
-                    // already in it. Clear the bitmap (if armed) so the re-protect
-                    // below starts the next interval clean and the next Diff carries
-                    // only pages dirtied after THIS snapshot.
-                    if let Some(t) = &dirty_snap {
-                        let _ = t.drain();
-                    }
-                    write_named_snapshot(
-                        &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
-                        checkpoints, devices, ram_size_snap,
-                    )
-                }
-                // Diff: drain the dirty set (tracker presence checked above) and
-                // write only those pages, with a new_diff manifest pointing at p.
-                Some(p) => {
-                    let dirty = dirty_snap.as_ref().expect("tracker checked above").drain();
-                    write_named_diff(
-                        &store_snap, &write_name_snap, p, ram_slice, &dirty, &gic_blob,
-                        &disk_src, checkpoints, devices, ram_size_snap,
-                    )
-                }
-            };
-
-            match result {
-                Ok(()) => {
-                    // Carry the just-written layer forward: the next Ctrl-A s diffs
-                    // against it.
-                    *parent_snap.lock().unwrap() = Some(write_name_snap.clone());
-                    // Re-protect ALL RAM (drop WRITE) so the next interval starts
-                    // clean. drain() already cleared the bitmap; this rearms the
-                    // write-protect faults via the same process-global path used at
-                    // boot. No-op when tracking is off.
-                    if dirty_snap.is_some()
-                        && let Err(e) = ignition_hvf::vm_protect_memory(
-                            layout::RAM_BASE,
-                            ram_size_snap,
-                            (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
-                        )
-                    {
-                        eprintln!("[snapshot] re-protect RAM failed: {e}");
-                    }
-                }
-                Err(e) => eprintln!("[snapshot] write failed: {e}"),
-            }
-
-            if let Some(stop) = &rx_stop_snap {
-                stop.store(false, Ordering::Release);
-            }
-        }));
-    }
+    install_snapshot_handler(&mut manager, SnapshotWiring {
+        writer: SnapshotWriter {
+            store: store.clone(), name: write_name.clone(), parent: None,
+            restored_from: None, force,
+        },
+        disk: disk_path.as_ref().map(PathBuf::from),
+        host_usize: host as usize,
+        ram_size,
+        gic: gic.clone(),
+        frozen: frozen.clone(),
+        dirty: dirty_tracker.clone(),
+    });
 
     // Arm dirty tracking on the manager BEFORE it is cloned (set_dirty_config,
     // like set_snapshot_handler, needs sole Arc ownership). Each vCPU thread
@@ -1384,7 +1206,6 @@ fn main() {
     install_reset_handlers(&mut manager, ResetWiring {
         host_usize: host as usize,
         ram_size,
-        gic: gic.clone(),
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
         rx_stop: rx_stop_reset,
@@ -1635,7 +1456,7 @@ fn run_fuzz_mode(
     ram[initrd_off..initrd_off + initramfs.len()].copy_from_slice(&initramfs);
 
     // VM, then the in-kernel GIC (must be created before any vCPU). Single vCPU.
-    let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
+    let mut vm = Vm::new().map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
     let gic = Arc::new(
         HvfGicV3::new(1, layout::RAM_BASE).map_err(|e| io::Error::other(format!("GIC create: {e}")))?,
     );
@@ -2041,7 +1862,7 @@ fn run_restore(
     let t_diff = restore_start.elapsed();
 
     // 3. Create the HVF VM (must precede GIC and vCPU creation).
-    let mut vm = Vm::new(false).map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
+    let mut vm = Vm::new().map_err(|e| io::Error::other(format!("Vm::new: {e}")))?;
     let t_vm = restore_start.elapsed();
 
     // 4. Create the in-kernel GIC (same placement as a fresh boot). Its saved
@@ -2155,9 +1976,6 @@ fn run_restore(
         }
     }
     let net_mmio_restore = ctx.net_mmio.clone();
-    let rx_stop_snap = ctx.rx_stop.clone();
-    let net_mmio_snap = ctx.net_mmio.clone();
-    // Reset-handler copies: snap clones are moved into the re-snapshot closure below.
     let rx_stop_reset = ctx.rx_stop.clone();
     let net_mmio_reset = ctx.net_mmio.clone();
     let q_vsock = restore_start.elapsed();
@@ -2170,151 +1988,20 @@ fn run_restore(
     let mut manager = VcpuManager::new(snap.config.vcpu_count, bus);
     let q_console = restore_start.elapsed();
 
-    // Re-snapshot: a restored guest can be snapshotted into a NEW base. An omitted
-    // --name generates a fresh one (never collides with the source). The handler
-    // mirrors the boot path's Full/Diff logic (Task 8): the carried current_parent
-    // decides the layer type. We SEED it with the restored LEAF (restore_name) so the
-    // first Ctrl-A s writes a Diff with parent=leaf — only possible when --track-dirty
-    // armed the tracker above; without it the handler falls back to refusing the diff.
-    // Must be installed before `manager` is cloned (spawn_stdin_reader / run_restored),
-    // because set_snapshot_handler requires sole ownership of the Arc.
     let write_name = name.unwrap_or_else(names::generate);
-    // Seed the parent with the leaf so the first re-snapshot diffs against it. None when
-    // tracking is off, so the first re-snapshot is a self-contained Full (no parent to
-    // diff against, and a Diff would be impossible without a tracker anyway).
-    let current_parent: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(
-        if track_dirty { Some(restore_name.to_string()) } else { None },
-    ));
-    {
-        let store_snap = store.to_path_buf();
-        let write_name_snap = write_name.clone();
-        // The restored-from leaf, captured INDEPENDENTLY of dirty tracking. Guards
-        // the immutable source layer below: a restored guest must never silently
-        // clobber the snapshot it was restored from, whether or not --track-dirty
-        // seeded current_parent. (Without tracking the seed is None, so the
-        // same-name-as-parent guard alone would not catch it.)
-        let restored_from = restore_name.to_string();
-        let gic_snap = gic.clone();
-        let snap_devices = frozen.clone();
-        let disk_snap = disk.clone();
-        let host_usize = host as usize;
-        let mem_size_snap = mem_size;
-        let dirty_snap = dirty_tracker.clone();
-        let parent_snap = current_parent.clone();
-        let force_snap = force;
-        manager.set_snapshot_handler(Box::new(move |checkpoints: Vec<VcpuCheckpoint>, req_name: Option<String>| {
-            // Runs on the leader vCPU thread with all vCPUs parked. Layer type is
-            // decided by the carried current_parent (seeded to the leaf on restore):
-            //   None    -> Full root (only when tracking is off).
-            //   Some(p) -> Diff against p; requires the tracker to be armed.
-            // Control-socket snapshots carry their own name; serial Ctrl-A passes
-            // None and keeps the launch-time write_name.
-            let write_name_snap = req_name.unwrap_or_else(|| write_name_snap.clone());
-            let parent = parent_snap.lock().unwrap().clone();
-
-            // Restored-from guard (independent of dirty tracking): refuse to overwrite
-            // the snapshot this guest was restored from. Applies to BOTH Full and Diff
-            // branches — without --track-dirty current_parent is None, so the
-            // same-name-as-parent guard below would let a `--name <source>` Full clobber
-            // the immutable source layer. Runs BEFORE drain so a refused write keeps any
-            // accumulated dirty set for the next attempt.
-            if write_name_snap == restored_from && !force_snap {
-                eprintln!(
-                    "[snapshot] refusing to overwrite the base '{write_name_snap}' you are \
-                     restored from; pass --force or --name <other>"
-                );
-                return;
-            }
-
-            if parent.is_some() && dirty_snap.is_none() {
-                eprintln!("dirty tracking not enabled; restart with --track-dirty for diffs");
-                return;
-            }
-
-            // Same-name-as-parent guard: a Diff whose name equals its parent would
-            // rename over the dir holding that layer, clobbering it and forming a
-            // self-cycle. Refuse unless --force. Runs BEFORE drain so a refused diff
-            // keeps its accumulated dirty set for the next attempt.
-            if let Some(p) = &parent
-                && *p == write_name_snap
-                && !force_snap
-            {
-                eprintln!(
-                    "[snapshot] refusing to overwrite parent snapshot '{p}'; \
-                     pass --force or use a different --name"
-                );
-                return;
-            }
-
-            let gic_blob = match gic_snap.save_state() {
-                Ok(b) => b,
-                Err(e) => { eprintln!("[snapshot] gic save_state failed: {e}"); return; }
-            };
-            let devices = snap_devices.save();
-
-            // Quiesce the vmnet RX feeder so it can't write guest RAM mid-read.
-            if let Some(stop) = &rx_stop_snap {
-                stop.store(true, Ordering::Release);
-                if let Some(net) = &net_mmio_snap {
-                    drop(net.lock().unwrap()); // drain any in-flight inject
-                }
-            }
-
-            let ram_slice: &[u8] = unsafe {
-                std::slice::from_raw_parts(host_usize as *const u8, mem_size_snap as usize)
-            };
-            let disk_src = match &disk_snap {
-                Some(p) => p.clone(),
-                None => {
-                    let placeholder = std::env::temp_dir()
-                        .join(format!("ignition-empty-disk-{}", process::id()));
-                    let _ = std::fs::write(&placeholder, b"");
-                    placeholder
-                }
-            };
-
-            let result = match &parent {
-                None => {
-                    // Full captures whole RAM; clear the bitmap (if armed) so the
-                    // re-protect below starts the next interval clean.
-                    if let Some(t) = &dirty_snap {
-                        let _ = t.drain();
-                    }
-                    write_named_snapshot(
-                        &store_snap, &write_name_snap, ram_slice, &gic_blob, &disk_src,
-                        checkpoints, devices, mem_size_snap,
-                    )
-                }
-                Some(p) => {
-                    let dirty = dirty_snap.as_ref().expect("tracker checked above").drain();
-                    write_named_diff(
-                        &store_snap, &write_name_snap, p, ram_slice, &dirty, &gic_blob,
-                        &disk_src, checkpoints, devices, mem_size_snap,
-                    )
-                }
-            };
-
-            match result {
-                Ok(()) => {
-                    *parent_snap.lock().unwrap() = Some(write_name_snap.clone());
-                    if dirty_snap.is_some()
-                        && let Err(e) = ignition_hvf::vm_protect_memory(
-                            layout::RAM_BASE,
-                            mem_size_snap,
-                            (HV_MEMORY_READ | HV_MEMORY_EXEC) as u64,
-                        )
-                    {
-                        eprintln!("[snapshot] re-protect RAM failed: {e}");
-                    }
-                }
-                Err(e) => eprintln!("[snapshot] write failed: {e}"),
-            }
-
-            if let Some(stop) = &rx_stop_snap {
-                stop.store(false, Ordering::Release);
-            }
-        }));
-    }
+    install_snapshot_handler(&mut manager, SnapshotWiring {
+        writer: SnapshotWriter {
+            store: store.to_path_buf(), name: write_name.clone(),
+            parent: track_dirty.then(|| restore_name.to_owned()),
+            restored_from: Some(restore_name.to_owned()), force,
+        },
+        disk: disk.clone(),
+        host_usize: host as usize,
+        ram_size: mem_size,
+        gic: gic.clone(),
+        frozen: frozen.clone(),
+        dirty: dirty_tracker.clone(),
+    });
     let q_handler = restore_start.elapsed();
 
     // Arm dirty tracking on the manager BEFORE it is cloned (set_dirty_config, like
@@ -2346,7 +2033,6 @@ fn run_restore(
         *manager.reset_point().lock().unwrap() = Some(ignition_vmm::reset::ResetPoint {
             pristine,
             vcpus: snap.vcpus.clone(),
-            gic_blob: gic_blob.clone(),
             devices: snap.devices.clone(),
         });
     }
@@ -2355,7 +2041,6 @@ fn run_restore(
     install_reset_handlers(&mut manager, ResetWiring {
         host_usize: host as usize,
         ram_size: mem_size,
-        gic: gic.clone(),
         frozen: frozen.clone(),
         dirty: dirty_tracker.clone(),
         rx_stop: rx_stop_reset,
@@ -2623,7 +2308,7 @@ mod control_tests {
         // no-ops and reports false; dispatch_control surfaces that as an error reply.
         let r = dispatch_control("{\"action\":\"snapshot\",\"name\":\"s1\"}", &m);
         assert!(r.contains("\"ok\":false"), "got: {r}");
-        assert!(r.contains("did not run"), "got: {r}");
+        assert!(r.contains("snapshot failed"), "got: {r}");
     }
     #[test]
     fn bad_json_and_unknown_action_error() {

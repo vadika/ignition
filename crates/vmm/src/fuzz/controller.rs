@@ -10,6 +10,7 @@ use ignition_hvf::{HvfVcpu, VcpuState};
 
 use crate::dirty::{DirtyTracker, PAGE};
 use crate::fuzz::metrics::Metrics;
+use crate::reset::{rollback_full as restore_ram, rollback_pages as restore_pages};
 
 /// Deterministic xorshift64* PRNG. A fixed seed makes a fuzz run reproducible,
 /// which the determinism requirements (spec §7) depend on.
@@ -78,30 +79,6 @@ pub fn mutate(seed: &[u8], rng: &mut Rng, max_len: usize) -> Vec<u8> {
         }
     }
     out
-}
-
-/// Reset guest RAM to the captured base by overwriting every byte. v0 of the
-/// spec's §6 reset: correct and simple, no dirty tracking. `base` and `live`
-/// must be the same length (full guest RAM).
-pub fn restore_ram(base: &[u8], live: &mut [u8]) {
-    debug_assert_eq!(base.len(), live.len(), "base and live RAM must match in size");
-    live.copy_from_slice(base);
-}
-
-/// Restore only the pages in `pages` (page indices into a region based at offset
-/// 0) from `base` to `live`, clamping the last page to the region length. v1 of
-/// the spec §6 reset: the dirty set replaces the full-RAM copy. `base`/`live`
-/// must be the same length.
-pub fn restore_pages(base: &[u8], live: &mut [u8], pages: &[u64], page: usize) {
-    debug_assert_eq!(base.len(), live.len(), "base and live RAM must match in size");
-    for &p in pages {
-        let start = (p as usize) * page;
-        if start >= live.len() {
-            continue;
-        }
-        let end = (start + page).min(live.len());
-        live[start..end].copy_from_slice(&base[start..end]);
-    }
 }
 
 /// Copy a fixed input verbatim into the window (replay/determinism mode). No

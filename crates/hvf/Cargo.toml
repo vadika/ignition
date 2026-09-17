@@ -10,7 +10,6 @@ name = "ignition_hvf"
 path = "src/lib.rs"
 
 [dependencies]
-libloading = "0.8"
 log = "0.4"
 ignition_arch = { package = "ignition-arch", path = "../arch" }
 serde = { version = "1", features = ["derive"] }

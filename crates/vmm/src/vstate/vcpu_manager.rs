@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -57,6 +57,11 @@ pub enum Claim {
     Frozen,
 }
 
+struct SnapshotRequest {
+    name: Option<String>,
+    done: mpsc::Sender<bool>,
+}
+
 pub struct VcpuManager {
     bus: Arc<Bus>,
     mpidrs: HashSet<u64>,
@@ -70,10 +75,7 @@ pub struct VcpuManager {
     shutdown: AtomicBool,
     /// Set by `request_snapshot`; cleared by the leader inside `run_loop`.
     snapshot_req: AtomicBool,
-    /// Per-request snapshot name set by `request_snapshot(Some(..))` (the control
-    /// socket); `None` from the serial Ctrl-A path so the leader keeps the
-    /// launch-time `write_name`. Read-and-cleared by the snapshot leader.
-    snapshot_name: Mutex<Option<String>>,
+    snapshot_request: Mutex<Option<SnapshotRequest>>,
     /// Set by `request_checkpoint`; cleared by the checkpoint leader.
     checkpoint_req: AtomicBool,
     /// Set by `request_reset`; cleared by the reset leader.
@@ -114,12 +116,12 @@ pub struct VcpuManager {
 /// A snapshot handler: invoked on the elected leader vCPU thread once every
 /// vCPU has saved its register state. Receives the per-vCPU checkpoints and
 /// performs the global capture (RAM + GIC + device records) and file write.
-type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>;
+type SnapshotHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) -> Result<(), String> + Send + Sync>;
 
 /// Builds and stores a `ResetPoint` from the vCPU checkpoints collected at the
-/// barrier (clonefile pristine + capture gic/devices). Runs on the leader vCPU
+/// barrier (capture RAM and devices). Runs on the leader vCPU
 /// thread with all vCPUs parked.
-pub type CheckpointHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>;
+pub type CheckpointHandler = Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) -> Result<(), String> + Send + Sync>;
 
 /// Rolls live RAM/GIC/device state back to the current `ResetPoint`. Runs on the
 /// leader vCPU thread with all vCPUs parked. Per-vCPU register restore happens
@@ -138,7 +140,7 @@ impl VcpuManager {
             threads: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             snapshot_req: AtomicBool::new(false),
-            snapshot_name: Mutex::new(None),
+            snapshot_request: Mutex::new(None),
             checkpoint_req: AtomicBool::new(false),
             reset_req: AtomicBool::new(false),
             reset_vtimer_offset: AtomicU64::new(0),
@@ -167,7 +169,7 @@ impl VcpuManager {
     /// has rendezvoused and saved its state.
     pub fn set_snapshot_handler(
         self: &mut Arc<Self>,
-        handler: Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) + Send + Sync>,
+        handler: Box<dyn Fn(Vec<VcpuCheckpoint>, Option<String>) -> Result<(), String> + Send + Sync>,
     ) {
         let me = Arc::get_mut(self).expect("set_snapshot_handler must be called before run");
         me.snapshot_handler = Some(handler);
@@ -242,18 +244,14 @@ impl VcpuManager {
             return false;
         }
         let Some(ids) = self.begin_rendezvous() else { return false };
-        *self.snapshot_name.lock().unwrap() = name.map(str::to_string);
+        let (done, result) = mpsc::channel();
+        *self.snapshot_request.lock().unwrap() = Some(SnapshotRequest {
+            name: name.map(str::to_owned), done,
+        });
         self.collected.lock().unwrap().clear();
         self.snapshot_req.store(true, Ordering::Release);
         Self::broadcast_exit(ids);
-        // Block until the snapshot is written (the leader clears rendezvous_active
-        // at the end of run_collect_leader). Makes the call synchronous so a
-        // follow-up pause/resume cannot race the in-flight snapshot.
-        // ponytail: spin-wait — a snapshot completes well under a frame; not worth a condvar.
-        while self.rendezvous_active.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        true
+        result.recv().unwrap_or(false)
     }
 
     /// Request a checkpoint. Mirrors `request_snapshot`: freezes CPU_ON, latches
@@ -362,7 +360,7 @@ impl VcpuManager {
         gic_blob: Arc<Option<Vec<u8>>>,
         vtimer_offset: u64,
     ) -> Result<(), ignition_hvf::Error> {
-        let vcpu = HvfVcpu::new(cp.mpidr, false);
+        let vcpu = HvfVcpu::new(cp.mpidr);
         match &vcpu {
             Ok(v) => self.vcpuids.lock().unwrap().push(v.id()),
             Err(_) => self.shutdown.store(true, Ordering::Release),
@@ -398,7 +396,7 @@ impl VcpuManager {
     fn run_primary(self: &Arc<Self>, entry: u64, fdt_addr: u64) -> Result<(), ignition_hvf::Error> {
         let mpidr = mpidr_for(0);
         self.running.lock().unwrap().insert(mpidr);
-        let vcpu = HvfVcpu::new(mpidr, false)?;
+        let vcpu = HvfVcpu::new(mpidr)?;
         self.vcpuids.lock().unwrap().push(vcpu.id());
         vcpu.set_initial_state(entry, fdt_addr)?;
         self.run_loop(mpidr, vcpu)
@@ -424,7 +422,7 @@ impl VcpuManager {
             let mut controller = controller;
             let mpidr = mpidr_for(0);
             me.running.lock().unwrap().insert(mpidr);
-            let vcpu = HvfVcpu::new(mpidr, false)?;
+            let vcpu = HvfVcpu::new(mpidr)?;
             me.vcpuids.lock().unwrap().push(vcpu.id());
             vcpu.set_initial_state(entry, fdt_addr)?;
             me.fuzz_loop(vcpu, doorbell_gpa, ctrl_base, fuzz_dev, &mut controller)
@@ -522,7 +520,7 @@ impl VcpuManager {
     }
 
     fn run_secondary(self: &Arc<Self>, mpidr: u64, entry: u64, ctx: u64) -> Result<(), ignition_hvf::Error> {
-        let vcpu = HvfVcpu::new(mpidr, false)?;
+        let vcpu = HvfVcpu::new(mpidr)?;
         // Register before the first run() so a shutdown broadcast reaches us.
         self.vcpuids.lock().unwrap().push(vcpu.id());
         vcpu.set_secondary_state(entry, ctx)?;
@@ -753,27 +751,25 @@ impl VcpuManager {
             }
         }
 
-        match failed {
-            Some((mpidr, e)) => {
-                log::error!("{what} aborted: vcpu {mpidr:#x} save_state failed: {e}");
-            }
-            None => {
-                if let Some(h) = handler {
-                    // Snapshot-only slot: only request_snapshot sets it, and the rendezvous serializes snapshot vs checkpoint, so the checkpoint path observes None by construction.
-                    let name = self.snapshot_name.lock().unwrap().take();
-                    // A panic in the handler must not unwind the vCPU thread.
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        h(checkpoints, name)
-                    }));
-                    if r.is_err() {
-                        log::error!("{what} handler panicked; guest resumed");
-                    }
-                }
-            }
+        let request = self.snapshot_request.lock().unwrap().take();
+        let name = request.as_ref().and_then(|r| r.name.clone());
+        let result = match failed {
+            Some((mpidr, e)) => Err(format!("vcpu {mpidr:#x} save_state failed: {e}")),
+            None => match handler {
+                Some(h) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    h(checkpoints, name)
+                })).unwrap_or_else(|_| Err("handler panicked".into())),
+                None => Err("no handler installed".into()),
+            },
+        };
+        if let Err(e) = &result {
+            log::error!("{what} failed: {e}");
         }
-
         req.store(false, Ordering::Release);
-        self.rendezvous_active.store(false, Ordering::Relaxed);
+        self.rendezvous_active.store(false, Ordering::Release);
+        if let Some(request) = request {
+            let _ = request.done.send(result.is_ok());
+        }
     }
 
     /// Runs on the single leader thread at the first reset barrier, with every
@@ -843,6 +839,40 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_completion_reports_handler_errors_and_panics() {
+        for outcome in 0..3 {
+            let mut m = mgr(1);
+            m.set_snapshot_handler(Box::new(move |_, name| {
+                assert_eq!(name.as_deref(), Some("test"));
+                match outcome {
+                    0 => Ok(()),
+                    1 => Err("disk write failed".into()),
+                    _ => panic!("capture failed"),
+                }
+            }));
+            let (done, result) = mpsc::channel();
+            *m.snapshot_request.lock().unwrap() = Some(SnapshotRequest { name: Some("test".into()), done });
+            m.snapshot_req.store(true, Ordering::Release);
+            m.rendezvous_active.store(true, Ordering::Release);
+            m.run_collect_leader(&m.snapshot_handler, &m.snapshot_req, "snapshot");
+            assert_eq!(result.recv().unwrap(), outcome == 0);
+            assert!(!m.snapshot_req.load(Ordering::Acquire));
+            assert!(!m.rendezvous_active.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn vcpu_capture_failure_reports_failure_without_running_handler() {
+        let mut m = mgr(1);
+        m.set_snapshot_handler(Box::new(|_, _| panic!("must not run")));
+        m.collected.lock().unwrap().push((0, Err(ignition_hvf::Error::VcpuReadRegister)));
+        let (done, result) = mpsc::channel();
+        *m.snapshot_request.lock().unwrap() = Some(SnapshotRequest { name: None, done });
+        m.run_collect_leader(&m.snapshot_handler, &m.snapshot_req, "snapshot");
+        assert!(!result.recv().unwrap());
+    }
+
+    #[test]
     fn mpidr_is_linear() {
         assert_eq!(mpidr_for(0), 0);
         assert_eq!(mpidr_for(3), 3);
@@ -881,7 +911,7 @@ mod tests {
         let mgr = mgr(1);
         // No handler and no registered vCPU: returns early, no panic, name slot stays clear.
         mgr.request_snapshot(Some("snap-1"));
-        assert!(mgr.snapshot_name.lock().unwrap().is_none());
+        assert!(mgr.snapshot_request.lock().unwrap().is_none());
         assert!(!mgr.snapshot_req.load(Ordering::Acquire));
     }
 

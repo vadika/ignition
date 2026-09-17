@@ -1,5 +1,5 @@
 //! In-memory reset-to-checkpoint: an immutable RAM image plus the saved
-//! vcpu/GIC/device state, and the pure helpers that roll live RAM back to it.
+//! vcpu/device state, and the pure helpers that roll live RAM back to it.
 
 /// Copy the entire pristine image over live RAM. Used when no dirty tracker is
 /// armed, so every page may have changed.
@@ -37,8 +37,6 @@ pub struct ResetPoint {
     pub pristine: PristineRam,
     /// Per-vCPU registers/ICC/vtimer, keyed by mpidr.
     pub vcpus: Vec<VcpuCheckpoint>,
-    /// The hv_gic distributor/redistributor blob.
-    pub gic_blob: Vec<u8>,
     /// Each virtio device's saved state.
     pub devices: Vec<DeviceRecord>,
 }

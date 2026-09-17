@@ -44,10 +44,19 @@ impl DirtyTracker {
         self.bits[(p / 64) as usize].fetch_or(1u64 << (p % 64), Ordering::Relaxed);
     }
 
+    /// Inspect the dirty set while vCPUs and device writers are stopped.
+    pub fn pages(&self) -> Vec<u64> {
+        self.collect_pages(|word| word.load(Ordering::Relaxed))
+    }
+
     pub fn drain(&self) -> Vec<u64> {
+        self.collect_pages(|word| word.swap(0, Ordering::Relaxed))
+    }
+
+    fn collect_pages(&self, read: impl Fn(&AtomicU64) -> u64) -> Vec<u64> {
         let mut out = Vec::new();
-        for (wi, w) in self.bits.iter().enumerate() {
-            let v = w.swap(0, Ordering::Relaxed);
+        for (wi, word) in self.bits.iter().enumerate() {
+            let v = read(word);
             if v == 0 {
                 continue;
             }
@@ -57,7 +66,7 @@ impl DirtyTracker {
                 }
             }
         }
-        out // ascending by construction
+        out
     }
 }
 
@@ -84,6 +93,17 @@ impl ignition_devices::virtio::guest_ram::DirtySink for DirtyTracker {
 mod tests {
     use super::*;
     use ignition_devices::virtio::guest_ram::DirtySink;
+
+    #[test]
+    fn inspecting_pages_preserves_them_until_commit() {
+        let tracker = DirtyTracker::new(0, 4 * PAGE as u64);
+        tracker.mark(PAGE as u64);
+        assert_eq!(tracker.pages(), vec![1]);
+        tracker.mark(3 * PAGE as u64);
+        assert_eq!(tracker.pages(), vec![1, 3]);
+        assert_eq!(tracker.drain(), vec![1, 3]);
+        assert!(tracker.pages().is_empty());
+    }
 
     #[test]
     fn mark_dirty_splits_pages() {

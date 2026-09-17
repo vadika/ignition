@@ -22,6 +22,27 @@ pub struct DescChain {
     pub descriptors: Vec<Desc>,
 }
 
+impl DescChain {
+    /// Validate the complete readable payload before allocating or copying it.
+    pub fn read(&self, mem: &GuestRam, max_len: usize) -> Option<Vec<u8>> {
+        let mut len = 0usize;
+        for d in self.descriptors.iter().filter(|d| !d.writable) {
+            len = len.checked_add(d.len as usize)?;
+            if len > max_len || !mem.contains(d.addr, d.len as usize) {
+                return None;
+            }
+        }
+        let mut bytes = vec![0; len];
+        let mut offset = 0;
+        for d in self.descriptors.iter().filter(|d| !d.writable) {
+            let end = offset + d.len as usize;
+            mem.read_slice(d.addr, &mut bytes[offset..end]);
+            offset = end;
+        }
+        Some(bytes)
+    }
+}
+
 pub struct Virtqueue {
     size: u16,
     desc_addr: u64,
@@ -127,6 +148,33 @@ mod tests {
         m.write_slice(d + 8, &len.to_le_bytes());
         m.write_slice(d + 12, &flags.to_le_bytes());
         m.write_slice(d + 14, &next.to_le_bytes());
+    }
+
+    #[test]
+    fn reads_scattered_payload_at_limit_and_ignores_writable_descriptors() {
+        let mut backing = vec![0; 16];
+        let m = mem(&mut backing);
+        m.write_slice(BASE, b"abcd");
+        let chain = DescChain { head: 0, descriptors: vec![
+            Desc { addr: BASE, len: 2, writable: false },
+            Desc { addr: 0, len: u32::MAX, writable: true },
+            Desc { addr: BASE + 2, len: 2, writable: false },
+        ] };
+        assert_eq!(chain.read(&m, 4), Some(b"abcd".to_vec()));
+        assert_eq!(chain.read(&m, 3), None);
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_payloads() {
+        let mut backing = vec![0; 16];
+        let m = mem(&mut backing);
+        for (addr, len) in [(BASE, u32::MAX), (BASE - 1, 1), (BASE + 15, 2), (u64::MAX, 2)] {
+            let chain = DescChain { head: 0, descriptors: vec![
+                Desc { addr: BASE, len: 1, writable: false },
+                Desc { addr, len, writable: false },
+            ] };
+            assert_eq!(chain.read(&m, 1024), None);
+        }
     }
 
     #[test]

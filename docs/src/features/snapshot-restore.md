@@ -146,13 +146,14 @@ Two console hotkeys let you capture a running guest's state as an in-memory
 "reset point" and roll the live guest back to it without tearing the VM down:
 
 - **`Ctrl-A c`** — mark the current moment as the reset point. The VMM captures
-  guest RAM (an owned heap copy of live RAM), vCPU registers, GIC state, and
+  guest RAM (an owned heap copy of live RAM), vCPU registers, and
   virtio-device state, then prints `[reset point marked]` and lets the guest
   continue.
 - **`Ctrl-A r`** — roll the running guest back IN PLACE to that reset point:
   guest RAM is restored (only the pages that changed when `--track-dirty` is
   armed, or a full copy without it — both produce a correct result), vCPU
-  registers, GIC state, and virtio-device state are all applied, and under
+  registers and virtio-device state are applied; the live GIC distributor and
+  redistributor are retained. Under
   `--gui` the rolled-back screen is repainted. The guest then resumes from the
   reset-point moment. Prints `[reset to checkpoint]`. If no reset point exists
   yet, prints `reset: no checkpoint - press Ctrl-A c first`.
@@ -195,15 +196,13 @@ disk (a full, persistent snapshot usable for future restores and fan-out clones)
 `Ctrl-A c`/`Ctrl-A r` operate entirely in memory and on the live guest; no
 directory is written.
 
-**GIC mid-run re-restore.** Applying GIC state to a running guest (`hv_gic_set_state`
-while the VM is live) is best-effort: all vCPUs are parked before the call and
-the state is applied atomically from their perspective. If HVF rejects the call
-mid-run the reset logs `[reset] gic_restore rejected mid-run ...` and continues;
-any in-flight interrupts re-settle within a tick or two. This is the designed
-fallback — the guest remains functional.
+**GIC during in-place reset.** The checkpoint does not capture a GIC blob.
+Reset retains the live distributor/redistributor because reapplying their state
+mid-run disrupts interrupt delivery. Each vCPU restores its saved CPU-interface
+registers. Disk snapshots still capture and restore the full GIC state.
 
 > **Disk non-divergence is required for correctness.** Reset rolls back guest
-> RAM, vCPU registers, GIC state, and virtio-device state, but the disk is
+> RAM, vCPU registers, and virtio-device state, but the disk is
 > NOT rewound. If the guest has written to a read-write rootfs between the
 > checkpoint and the reset, the rolled-back guest RAM (page cache, ext4
 > journal, inode cache) will describe a disk that has moved on, causing

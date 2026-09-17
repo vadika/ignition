@@ -10,9 +10,6 @@
 pub mod bindings;
 pub mod gic;
 
-#[macro_use]
-extern crate log;
-
 use bindings::*;
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +18,7 @@ use std::arch::asm;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The sysregs captured for snapshot/restore (EL1 guest-resume set + the EL2 regs
@@ -134,58 +131,11 @@ const TMR_CTL_IMASK: u64 = 1 << 1;
 const TMR_CTL_ISTATUS: u64 = 1 << 2;
 
 const PSR_MODE_EL1H: u64 = 0x0000_0005;
-const PSR_MODE_EL2H: u64 = 0x0000_0009;
 const PSR_F_BIT: u64 = 0x0000_0040;
 const PSR_I_BIT: u64 = 0x0000_0080;
 const PSR_A_BIT: u64 = 0x0000_0100;
 const PSR_D_BIT: u64 = 0x0000_0200;
 const PSTATE_EL1_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
-const PSTATE_EL2_FAULT_BITS_64: u64 = PSR_MODE_EL2H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
-
-const HCR_TLOR: u64 = 1 << 35;
-const HCR_RW: u64 = 1 << 31;
-const HCR_TSW: u64 = 1 << 22;
-const HCR_TACR: u64 = 1 << 21;
-const HCR_TIDCP: u64 = 1 << 20;
-const HCR_TSC: u64 = 1 << 19;
-const HCR_TID3: u64 = 1 << 18;
-const HCR_TWE: u64 = 1 << 14;
-const HCR_TWI: u64 = 1 << 13;
-const HCR_BSU_IS: u64 = 1 << 10;
-const HCR_FB: u64 = 1 << 9;
-const HCR_AMO: u64 = 1 << 5;
-const HCR_IMO: u64 = 1 << 4;
-const HCR_FMO: u64 = 1 << 3;
-const HCR_PTW: u64 = 1 << 2;
-const HCR_SWIO: u64 = 1 << 1;
-const HCR_VM: u64 = 1 << 0;
-// Use the same bits as KVM uses in vcpu reset.
-const HCR_EL2_BITS: u64 = HCR_TSC
-    | HCR_TSW
-    | HCR_TWE
-    | HCR_TWI
-    | HCR_VM
-    | HCR_BSU_IS
-    | HCR_FB
-    | HCR_TACR
-    | HCR_AMO
-    | HCR_SWIO
-    | HCR_TIDCP
-    | HCR_RW
-    | HCR_TLOR
-    | HCR_FMO
-    | HCR_IMO
-    | HCR_PTW
-    | HCR_TID3;
-
-const CNTHCTL_EL0VCTEN: u64 = 1 << 1;
-const CNTHCTL_EL0PCTEN: u64 = 1 << 0;
-// Trap accesses to both virtual and physical counter registers.
-const CNTHCTL_EL2_BITS: u64 = CNTHCTL_EL0VCTEN | CNTHCTL_EL0PCTEN;
-
-const AA64PFR0_EL1_EL2EN: u64 = 1 << 8;
-const AA64PFR0_EL1_GIC3EN: u64 = 1 << 24;
-const AA64PFR1_EL1_SMEMASK: u64 = 3 << 24;
 
 const EC_WFX_TRAP: u64 = 0x1;
 const EC_AA64_HVC: u64 = 0x16;
@@ -200,12 +150,9 @@ const PSCI_NOT_SUPPORTED: u64 = -1_i64 as u64;
 
 #[derive(Debug)]
 pub enum Error {
-    EnableEL2,
-    FindSymbol(libloading::Error),
     MemoryMap,
     MemoryProtect,
     MemoryUnmap,
-    NestedCheck,
     VcpuCreate,
     VcpuInitialRegisters,
     VcpuReadRegister,
@@ -228,15 +175,9 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
-            EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
-            FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryProtect => write!(f, "Error re-protecting memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
-            NestedCheck => write!(
-                f,
-                "Nested virtualization was requested but it's not support in this system"
-            ),
             VcpuCreate => write!(f, "Error creating HVF vCPU instance"),
             VcpuInitialRegisters => write!(f, "Error setting up initial HVF vCPU registers"),
             VcpuReadRegister => write!(f, "Error reading HVF vCPU register"),
@@ -341,59 +282,11 @@ pub fn vcpu_set_vtimer_mask(vcpuid: u64, masked: bool) -> Result<(), Error> {
     }
 }
 
-/// Checks if Nested Virtualization is supported on the current system. Only
-/// M3 or newer chips on macOS 15+ will satisfy the requirements.
-pub fn check_nested_virt() -> Result<bool, Error> {
-    type GetEL2Supported =
-        libloading::Symbol<'static, unsafe extern "C" fn(*mut bool) -> hv_return_t>;
-
-    let get_el2_supported: Result<GetEL2Supported, libloading::Error> =
-        unsafe { HVF.get(b"hv_vm_config_get_el2_supported") };
-    if get_el2_supported.is_err() {
-        info!("cannot find hv_vm_config_get_el2_supported symbol");
-        return Ok(false);
-    }
-
-    let mut el2_supported: bool = false;
-    let ret = unsafe { (get_el2_supported.unwrap())(&mut el2_supported) };
-    if ret != HV_SUCCESS {
-        error!("hv_vm_config_get_el2_supported failed: {ret:?}");
-        return Err(Error::NestedCheck);
-    }
-
-    Ok(el2_supported)
-}
-
 pub struct HvfVm {}
 
-static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
-    libloading::Library::new(
-        "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
-    )
-    .unwrap()
-});
-
 impl HvfVm {
-    // TODO(M3-nested): `nested_enabled` drives the EL2/dlopen path below —
-    // deliberately retained as a stub for the M3 nested-virt milestone
-    // (HVF M3+/macOS 15+). Always `false` today.
-    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
-        if nested_enabled {
-            let set_el2_enabled: libloading::Symbol<
-                'static,
-                unsafe extern "C" fn(hv_vm_config_t, bool) -> hv_return_t,
-            > = unsafe {
-                HVF.get(b"hv_vm_config_set_el2_enabled")
-                    .map_err(Error::FindSymbol)?
-            };
-
-            let ret = unsafe { (set_el2_enabled)(config, true) };
-            if ret != HV_SUCCESS {
-                return Err(Error::EnableEL2);
-            }
-        }
-
         let ret = unsafe { hv_vm_create(config) };
 
         if ret != HV_SUCCESS {
@@ -466,7 +359,6 @@ pub struct HvfVcpu<'a> {
     pending_mmio_read: Option<MmioRead>,
     pending_advance_pc: bool,
     vtimer_masked: bool,
-    nested_enabled: bool,
     dirty_tracking: bool,
     ram_base: u64,
     ram_size: u64,
@@ -507,9 +399,7 @@ pub fn shared_vtimer_offset(primary_host_counter: u64) -> u64 {
 }
 
 impl HvfVcpu<'_> {
-    // TODO(M3-nested): `nested_enabled` is an EL2 hook — deliberately retained as a
-    // stub for the M3 nested-virt milestone (HVF M3+/macOS 15+). Always `false` today.
-    pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(mpidr: u64) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
         let vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
@@ -554,7 +444,6 @@ impl HvfVcpu<'_> {
             pending_mmio_read: None,
             pending_advance_pc: false,
             vtimer_masked: false,
-            nested_enabled,
             dirty_tracking: false,
             ram_base: 0,
             ram_size: 0,
@@ -571,91 +460,14 @@ impl HvfVcpu<'_> {
 
     /// Full initial register/system-register setup shared by the primary
     /// (`set_initial_state`, X0 = FDT address) and secondaries
-    /// (`set_secondary_state`, X0 = PSCI context id). Sets EL2/GICv3/SME/CPSR,
+    /// (`set_secondary_state`, X0 = PSCI context id). Sets EL1 CPSR,
     /// `PC = entry_addr`, and `X0 = x0`.
     fn setup_registers(&self, entry_addr: u64, x0: u64) -> Result<(), Error> {
-        // TODO(M3-nested): EL2 hook — deliberately retained as a stub for the M3
-        // nested-virt milestone (HVF M3+/macOS 15+). `nested_enabled` is always
-        // false today, so this branch is never taken on the live path.
-        if self.nested_enabled {
-            let ret = unsafe {
-                hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(self.vcpuid, hv_sys_reg_t_HV_SYS_REG_HCR_EL2, HCR_EL2_BITS)
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_CNTHCTL_EL2,
-                    CNTHCTL_EL2_BITS,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-
-            // Enable EL2 and GICv3 in ID_AA64PFR0_EL1
-            let val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1,
-                    &val as *const _ as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1,
-                    val | AA64PFR0_EL1_EL2EN | AA64PFR0_EL1_GIC3EN,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-
-            // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
-            // break after enabling the MMU. Mask it out.
-            let val: u64 = 0;
-            let ret = unsafe {
-                hv_vcpu_get_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &val as *const _ as *mut _,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-            let ret = unsafe {
-                hv_vcpu_set_sys_reg(
-                    self.vcpuid,
-                    hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    val & !AA64PFR1_EL1_SMEMASK,
-                )
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
-        } else {
-            let ret = unsafe {
-                hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
-            };
-            if ret != HV_SUCCESS {
-                return Err(Error::VcpuInitialRegisters);
-            }
+        let ret = unsafe {
+            hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL1_FAULT_BITS_64)
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
         }
 
         let ret = unsafe { hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_PC, entry_addr) };

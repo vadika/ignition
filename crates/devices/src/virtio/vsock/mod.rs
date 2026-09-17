@@ -28,18 +28,10 @@ impl VsockDevice {
     fn handle_tx(&mut self, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
         let mut serviced = false;
         while let Some(chain) = vq.pop_avail(mem) {
-            let mut bytes = Vec::new();
-            for d in &chain.descriptors {
-                if !d.writable {
-                    let mut buf = vec![0u8; d.len as usize];
-                    if mem.read_slice(d.addr, &mut buf) {
-                        bytes.extend_from_slice(&buf);
-                    }
-                }
-            }
-            if let Some(hdr) = VsockHeader::from_bytes(&bytes) {
-                let payload: &[u8] = if bytes.len() > VSOCK_HDR_SIZE { &bytes[VSOCK_HDR_SIZE..] } else { &[] };
-                self.muxer.handle_tx(&hdr, payload);
+            if let Some(bytes) = chain.read(mem, VSOCK_HDR_SIZE + connection::BUF_ALLOC as usize)
+                && let Some(hdr) = VsockHeader::from_bytes(&bytes)
+            {
+                self.muxer.handle_tx(&hdr, &bytes[VSOCK_HDR_SIZE..]);
             }
             vq.push_used(mem, chain.head, 0);
             serviced = true;
@@ -150,6 +142,21 @@ impl VirtioDevice for VsockDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_tx_is_dropped_and_completed() {
+        let mut backing = vec![0; 0x4000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), 0);
+        mem.write_slice(0x1000, &0x100u64.to_le_bytes());
+        mem.write_u32(0x1008, u32::MAX);
+        mem.write_u16(0x2002, 1);
+        let mut queue = Virtqueue::new(8, 0x1000, 0x2000, 0x3000);
+        let mut dev = VsockDevice::new(PathBuf::from("/tmp/ign-oversized-vsock"));
+        assert!(dev.handle_notify(TXQ, &mut queue, &mem));
+        assert_eq!(mem.read_u16(0x3002), Some(1));
+        assert_eq!(mem.read_u32(0x3008), Some(0));
+        assert!(!dev.muxer_rx_pending_for_test());
+    }
 
     #[test]
     fn identity_and_config() {

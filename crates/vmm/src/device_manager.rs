@@ -41,32 +41,17 @@ pub struct DeviceRecord {
     pub state: serde_json::Value,
 }
 
-pub struct DeviceManager {
-    gic: Arc<HvfGicV3>,
-    bus: Bus,
+struct Resources {
     mmio_next: u64,
     mmio_end: u64,
     spi_next: u32,
     spi_end: u32,
-    records: Vec<Record>,
 }
 
-impl DeviceManager {
-    pub fn new(gic: Arc<HvfGicV3>, mmio_base: u64, mmio_len: u64, spi_base: u32, spi_count: u32) -> Self {
-        Self {
-            gic,
-            bus: Bus::new(),
-            mmio_next: mmio_base,
-            mmio_end: mmio_base + mmio_len,
-            spi_next: spi_base,
-            spi_end: spi_base + spi_count,
-            records: Vec::new(),
-        }
-    }
-
+impl Resources {
     fn alloc(&mut self, size: u64) -> Result<(u64, u32), DeviceMgrError> {
-        if self.mmio_next + size > self.mmio_end {
-            return Err(DeviceMgrError::WindowExhausted { need: size, remaining: self.mmio_end - self.mmio_next });
+        if size > self.mmio_end.saturating_sub(self.mmio_next) {
+            return Err(DeviceMgrError::WindowExhausted { need: size, remaining: self.mmio_end.saturating_sub(self.mmio_next) });
         }
         if self.spi_next >= self.spi_end {
             return Err(DeviceMgrError::SpiExhausted);
@@ -76,6 +61,29 @@ impl DeviceManager {
         self.mmio_next += size;
         self.spi_next += 1;
         Ok((base, spi))
+    }
+}
+
+pub struct DeviceManager {
+    gic: Arc<HvfGicV3>,
+    bus: Bus,
+    resources: Resources,
+    records: Vec<Record>,
+}
+
+impl DeviceManager {
+    pub fn new(gic: Arc<HvfGicV3>, mmio_base: u64, mmio_len: u64, spi_base: u32, spi_count: u32) -> Self {
+        Self {
+            gic,
+            bus: Bus::new(),
+            resources: Resources {
+                mmio_next: mmio_base,
+                mmio_end: mmio_base + mmio_len,
+                spi_next: spi_base,
+                spi_end: spi_base + spi_count,
+            },
+            records: Vec::new(),
+        }
     }
 
     fn irq_for(&self, spi: u32) -> Arc<dyn IrqLine> {
@@ -100,7 +108,7 @@ impl DeviceManager {
         D: MmioDevice + 'static,
         F: FnOnce(Arc<dyn IrqLine>) -> D,
     {
-        let (base, spi) = self.alloc(window_size)?;
+        let (base, spi) = self.resources.alloc(window_size)?;
         let typed = Arc::new(Mutex::new(build(self.irq_for(spi))));
         let dyn_dev: Arc<Mutex<dyn MmioDevice>> = typed.clone();
         self.place(base, window_size, spi, dyn_dev)?;
@@ -124,8 +132,8 @@ impl DeviceManager {
         // restored resources so a later add() won't collide. Bumping before place()
         // would leave the allocator advanced even on a failed (e.g. overlapping)
         // placement.
-        self.mmio_next = self.mmio_next.max(rec.base + rec.size);
-        self.spi_next = self.spi_next.max(rec.spi + 1);
+        self.resources.mmio_next = self.resources.mmio_next.max(rec.base + rec.size);
+        self.resources.spi_next = self.resources.spi_next.max(rec.spi + 1);
         Ok(typed)
     }
 
@@ -176,19 +184,21 @@ impl FrozenDevices {
     pub fn bus(&self) -> Arc<Bus> {
         self.bus.clone()
     }
-    /// Snapshot every device: self-describing records the restore path replays.
+    /// Snapshot every device while holding all device locks.
     pub fn save(&self) -> Vec<DeviceRecord> {
-        self.records
-            .iter()
-            .map(|r| DeviceRecord {
-                id: r.id.clone(),
-                base: r.base,
-                size: r.size,
-                spi: r.spi,
-                fdt_kind: r.fdt_kind,
-                state: r.dev.lock().unwrap().save(),
-            })
-            .collect()
+        self.with_saved(|records| records)
+    }
+
+    /// Keep host-side device writers stopped throughout a RAM/GIC capture.
+    pub fn with_saved<T>(&self, capture: impl FnOnce(Vec<DeviceRecord>) -> T) -> T {
+        let devices: Vec<_> = self.records.iter().map(|r| r.dev.lock().unwrap()).collect();
+        let records = self.records.iter().zip(&devices).map(|(r, dev)| DeviceRecord {
+            id: r.id.clone(), base: r.base, size: r.size, spi: r.spi,
+            fdt_kind: r.fdt_kind, state: dev.save(),
+        }).collect();
+        let result = capture(records);
+        drop(devices);
+        result
     }
 
     /// Push each saved record's state back into the matching live device,
@@ -248,6 +258,18 @@ mod tests {
     }
 
     #[test]
+    fn capture_holds_device_locks_until_completion() {
+        let frozen = make_frozen("serial", 0x900_0000, serde_json::json!({"scratch": 1}));
+        let result: Result<(), &str> = frozen.with_saved(|records| {
+            assert_eq!(records.len(), 1);
+            assert!(matches!(frozen.records[0].dev.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+            Err("capture failed")
+        });
+        assert_eq!(result, Err("capture failed"));
+        assert!(frozen.records[0].dev.try_lock().is_ok());
+    }
+
+    #[test]
     fn frozen_restore_reverts_live_device_state() {
         let frozen = make_frozen("serial", 0x900_0000, serde_json::json!({"scratch": 1}));
         let saved = frozen.save();
@@ -272,21 +294,25 @@ mod tests {
 
     #[test]
     fn alloc_is_sequential_and_bounds_checked() {
-        // Allocator logic mirrored without a GIC (HVF calls need the entitlement).
-        // region [0x1000, 0x1600): 3 windows of 0x200; SPIs 5..8.
-        let end = 0x1000 + 0x600u64;
-        let spi_end = 8u32;
-        let mut next = 0x1000u64;
-        let mut spi = 5u32;
-        let mut alloc = |size: u64| -> Result<(u64, u32), &'static str> {
-            if next + size > end { return Err("window"); }
-            if spi >= spi_end { return Err("spi"); }
-            let b = next; let s = spi; next += size; spi += 1; Ok((b, s))
+        let mut resources = Resources {
+            mmio_next: 0x1000, mmio_end: 0x1600, spi_next: 5, spi_end: 8,
         };
-        assert_eq!(alloc(0x200), Ok((0x1000, 5)));
-        assert_eq!(alloc(0x200), Ok((0x1200, 6)));
-        assert_eq!(alloc(0x200), Ok((0x1400, 7)));
-        assert_eq!(alloc(0x200), Err("window"));
+        assert_eq!(resources.alloc(0x200).unwrap(), (0x1000, 5));
+        assert_eq!(resources.alloc(0x200).unwrap(), (0x1200, 6));
+        assert_eq!(resources.alloc(0x200).unwrap(), (0x1400, 7));
+        assert!(matches!(resources.alloc(0x200), Err(DeviceMgrError::WindowExhausted { .. })));
+    }
+
+    #[test]
+    fn failed_allocations_leave_resources_available() {
+        let mut resources = Resources {
+            mmio_next: 0x1000, mmio_end: 0x1600, spi_next: 5, spi_end: 6,
+        };
+        assert!(matches!(resources.alloc(u64::MAX), Err(DeviceMgrError::WindowExhausted { .. })));
+        assert_eq!(resources.alloc(0x200).unwrap(), (0x1000, 5));
+        assert!(matches!(resources.alloc(0x200), Err(DeviceMgrError::SpiExhausted)));
+        assert_eq!(resources.mmio_next, 0x1200);
+        assert_eq!(resources.spi_next, 6);
     }
 
     #[test]

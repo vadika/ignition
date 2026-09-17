@@ -914,7 +914,6 @@ name = "ignition-hvf"
 version = "0.0.0"
 dependencies = [
  "ignition-arch",
- "libloading",
  "log",
  "serde",
  "serde_json",

@@ -38,6 +38,8 @@ const VIRTIO_GPU_EVENT_DISPLAY: u32 = 0x0001;
 /// Cap on a single 2D resource's host pixel buffer — bounds a guest-driven
 /// allocation. 256 MiB dwarfs any real scanout (1280x800x4 = 4 MiB).
 const MAX_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
+// Fits the backing entries for a 256 MiB resource split into 4 KiB pages.
+const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 #[allow(dead_code)] // referenced by guests/tests; documents the only accepted format.
 const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 
@@ -126,20 +128,6 @@ fn read_backing(sg: &[(u64, u32)], mem: &GuestRam, logical_start: u64, out: &mut
         }
         seg_base = seg_end;
     }
-}
-
-/// Concatenate all device-readable descriptors into one request byte vector.
-fn read_request(chain: &DescChain, mem: &GuestRam) -> Vec<u8> {
-    let mut req = Vec::new();
-    for d in &chain.descriptors {
-        if !d.writable {
-            let mut buf = vec![0u8; d.len as usize];
-            if mem.read_slice(d.addr, &mut buf) {
-                req.extend_from_slice(&buf);
-            }
-        }
-    }
-    req
 }
 
 /// Write `resp` across the device-writable descriptors in order; return bytes written.
@@ -511,8 +499,10 @@ impl VirtioDevice for VirtioGpu {
                 serviced = true;
                 continue;
             }
-            let req = read_request(&chain, mem);
-            let resp = self.dispatch(&req, mem);
+            let resp = match chain.read(mem, MAX_REQUEST_BYTES) {
+                Some(req) => self.dispatch(&req, mem),
+                None => resp_hdr(RESP_ERR_UNSPEC, 0, 0),
+            };
             let written = write_response(&chain, mem, &resp);
             vq.push_used(mem, chain.head, written);
             serviced = true;
@@ -573,6 +563,20 @@ mod tests {
 
     fn new_gpu() -> VirtioGpu {
         VirtioGpu::new(1280, 800, Box::new(NoopSink))
+    }
+
+    #[test]
+    fn oversized_request_returns_error_and_completes_queue_entry() {
+        let mut backing = vec![0; 0x4000];
+        let mem = GuestRam::new(backing.as_mut_ptr(), backing.len(), BASE);
+        write_desc(&mem, 0, REQ, u32::MAX, 1, 1);
+        write_desc(&mem, 1, RESP, CTRL_HDR_LEN as u32, 2, 0);
+        mem.write_u16(AVAIL + 2, 1);
+        let mut queue = Virtqueue::new(8, DESC, AVAIL, USED);
+        assert!(new_gpu().handle_notify(0, &mut queue, &mem));
+        assert_eq!(mem.read_u32(RESP), Some(RESP_ERR_UNSPEC));
+        assert_eq!(mem.read_u16(USED + 2), Some(1));
+        assert_eq!(mem.read_u32(USED + 8), Some(CTRL_HDR_LEN as u32));
     }
 
     #[test]

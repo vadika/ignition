@@ -67,6 +67,56 @@ impl SnapshotManifest {
     }
 }
 
+/// Naming and parent state shared by fresh-boot and restored snapshot writers.
+pub struct SnapshotWriter {
+    pub store: PathBuf,
+    pub name: String,
+    pub parent: Option<String>,
+    pub restored_from: Option<String>,
+    pub force: bool,
+}
+
+impl SnapshotWriter {
+    pub fn write(
+        &mut self,
+        requested_name: Option<&str>,
+        snap: &VmSnapshot,
+        ram: &[u8],
+        gic: &[u8],
+        disk: &Path,
+        dirty: Option<&[u64]>,
+    ) -> io::Result<()> {
+        let name = requested_name.unwrap_or(&self.name);
+        if !self.force && (self.parent.as_deref() == Some(name)
+            || self.restored_from.as_deref() == Some(name))
+        {
+            return Err(io::Error::other("refusing to overwrite source/parent snapshot; use a different name"));
+        }
+        let dir = base_dir(&self.store, name);
+        let t0 = std::time::Instant::now();
+        let manifest = match &self.parent {
+            Some(parent) => {
+                let pages = dirty.ok_or_else(|| io::Error::other("dirty tracking is required for diffs"))?;
+                write_diff_snapshot(&dir, snap, pages, ram, gic, disk)?;
+                SnapshotManifest::new_diff(name.to_owned(), parent.clone(), snap.config.mem_size, snap.config.vcpu_count)
+            }
+            None => {
+                write_snapshot(&dir, snap, ram, gic, disk)?;
+                SnapshotManifest::new_full(name.to_owned(), snap.config.mem_size, snap.config.vcpu_count)
+            }
+        };
+        write_manifest(&dir, &manifest)?;
+        // Without tracking, every capture is a self-contained full snapshot.
+        if dirty.is_some() {
+            self.parent = Some(name.to_owned());
+        }
+        eprintln!("Snapshot-write-time = {} ms", t0.elapsed().as_millis());
+        let kind = match manifest.snapshot_type { SnapshotType::Full => "full", SnapshotType::Diff => "diff" };
+        eprintln!("[snapshot] {kind} '{name}' written to {}", dir.display());
+        Ok(())
+    }
+}
+
 /// One vCPU's saved state plus the MPIDR identifying which core it is. A
 /// multi-vCPU snapshot carries one of these per online core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +377,78 @@ pub fn apply_diff(target: &mut [u8], idx: &[u64], packed: &[u8]) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_retries_failed_diff_without_advancing_parent_or_losing_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("live.img");
+        fs::write(&disk, b"disk").unwrap();
+        let page = crate::dirty::PAGE;
+        let mut ram = vec![0; 2 * page];
+        let snap = VmSnapshot::new(VmConfig { mem_size: ram.len() as u64, vcpu_count: 1 }, vec![], vec![]);
+        let mut writer = SnapshotWriter {
+            store: dir.path().into(), name: "root".into(), parent: None,
+            restored_from: None, force: false,
+        };
+        writer.write(None, &snap, &ram, b"gic", &disk, Some(&[])).unwrap();
+        let tracker = crate::dirty::DirtyTracker::new(0, ram.len() as u64);
+        ram[page] = 42;
+        tracker.mark(page as u64);
+        let missing_disk = dir.path().join("missing.img");
+        assert!(writer.write(Some("child"), &snap, &ram, b"gic", &missing_disk, Some(&tracker.pages())).is_err());
+        assert_eq!(writer.parent.as_deref(), Some("root"));
+        assert_eq!(tracker.pages(), vec![1]);
+        writer.write(Some("child"), &snap, &ram, b"gic", &disk, Some(&tracker.pages())).unwrap();
+        assert_eq!(writer.parent.as_deref(), Some("child"));
+        let chain = resolve_chain(dir.path(), "child").unwrap();
+        assert_eq!(chain.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["root", "child"]);
+        let mut restored = fs::read(paths(&base_dir(dir.path(), "root")).memory).unwrap();
+        let (indices, packed) = read_diff_pages(&base_dir(dir.path(), "child")).unwrap();
+        apply_diff(&mut restored, &indices, &packed).unwrap();
+        assert_eq!(restored, ram);
+    }
+
+    #[test]
+    fn untracked_captures_stay_full_and_protect_restore_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("live.img");
+        fs::write(&disk, b"disk").unwrap();
+        let snap = VmSnapshot::new(VmConfig { mem_size: 4, vcpu_count: 1 }, vec![], vec![]);
+        let mut writer = SnapshotWriter {
+            store: dir.path().into(), name: "first".into(), parent: None,
+            restored_from: Some("source".into()), force: false,
+        };
+        writer.write(None, &snap, b"one!", b"gic", &disk, None).unwrap();
+        writer.write(Some("second"), &snap, b"two!", b"gic", &disk, None).unwrap();
+        assert!(writer.parent.is_none());
+        for name in ["first", "second"] {
+            let manifest = read_manifest(&base_dir(dir.path(), name)).unwrap();
+            assert_eq!(manifest.snapshot_type, SnapshotType::Full);
+            assert_eq!(manifest.parent, None);
+        }
+        assert!(writer.write(Some("source"), &snap, b"bad!", b"gic", &disk, None).is_err());
+        assert!(!base_dir(dir.path(), "source").exists());
+    }
+
+    #[test]
+    fn restored_writer_diffs_against_leaf_and_rejects_parent_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("live.img");
+        fs::write(&disk, b"disk").unwrap();
+        let ram = vec![7; crate::dirty::PAGE];
+        let snap = VmSnapshot::new(VmConfig { mem_size: ram.len() as u64, vcpu_count: 1 }, vec![], vec![]);
+        let mut writer = SnapshotWriter {
+            store: dir.path().into(), name: "child".into(), parent: Some("leaf".into()),
+            restored_from: Some("leaf".into()), force: false,
+        };
+        assert!(writer.write(Some("leaf"), &snap, &ram, b"gic", &disk, Some(&[0])).is_err());
+        writer.write(None, &snap, &ram, b"gic", &disk, Some(&[0])).unwrap();
+        let manifest = read_manifest(&base_dir(dir.path(), "child")).unwrap();
+        assert_eq!(manifest.snapshot_type, SnapshotType::Diff);
+        assert_eq!(manifest.parent.as_deref(), Some("leaf"));
+        assert!(writer.write(None, &snap, &ram, b"gic", &disk, Some(&[0])).is_err());
+        assert_eq!(read_manifest(&base_dir(dir.path(), "child")).unwrap(), manifest);
+    }
 
     #[test]
     fn diff_pack_apply_roundtrip() {

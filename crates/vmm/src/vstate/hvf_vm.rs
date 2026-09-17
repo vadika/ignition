@@ -10,9 +10,9 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub fn new(nested_enabled: bool) -> Result<Self, ignition_hvf::Error> {
+    pub fn new() -> Result<Self, ignition_hvf::Error> {
         Ok(Self {
-            hvf: HvfVm::new(nested_enabled)?,
+            hvf: HvfVm::new()?,
         })
     }
 

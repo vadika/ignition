@@ -50,29 +50,14 @@ impl<B: NetBackend> VirtioNet<B> {
     fn drain_tx(&mut self, vq: &mut Virtqueue, mem: &GuestRam) -> bool {
         let mut serviced = false;
         while let Some(chain) = vq.pop_avail(mem) {
-            // Gather the chain's readable bytes into one frame buffer.
-            let mut buf = Vec::new();
-            let mut oversized = false;
-            for d in &chain.descriptors {
-                if d.writable {
-                    continue; // TX buffers are device-readable
+            match chain.read(mem, MAX_FRAME) {
+                Some(buf) if buf.len() > NET_HDR_LEN => {
+                    if let Err(e) = self.backend.write_frame(&buf[NET_HDR_LEN..]) {
+                        log::warn!("virtio-net TX write failed: {e}");
+                    }
                 }
-                if buf.len() + d.len as usize > MAX_FRAME {
-                    oversized = true;
-                    break;
-                }
-                let mut tmp = vec![0u8; d.len as usize];
-                if mem.read_slice(d.addr, &mut tmp) {
-                    buf.extend_from_slice(&tmp);
-                }
-            }
-            if oversized {
-                log::warn!("virtio-net: dropping oversized TX chain ({} bytes+)", buf.len());
-            } else if buf.len() > NET_HDR_LEN {
-                let frame = &buf[NET_HDR_LEN..];
-                if let Err(e) = self.backend.write_frame(frame) {
-                    log::warn!("virtio-net TX write failed: {e}");
-                }
+                None => log::warn!("virtio-net: dropping invalid or oversized TX chain"),
+                _ => {}
             }
             vq.push_used(mem, chain.head, 0);
             serviced = true;
